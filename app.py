@@ -24,7 +24,7 @@ with col2:
 with col3:
     boa_file = st.file_uploader("3. Upload Bank of America Statement", type=["csv", "xlsx"])
 
-# Target master filename inside your GitHub repository
+# Locate master database file in root directory
 def locate_master_file():
     target_base = "customer master account file"
     for f in os.listdir('.'):
@@ -46,7 +46,7 @@ def extract_text_from_pdf(uploaded_pdf):
     except Exception:
         return ""
 
-# Normalization function that cleans extra spacing and drops punctuation safely
+# Clean strings by flattening spaces and lowercase conversion
 def super_clean_string(text):
     if pd.isna(text) or text is None:
         return ""
@@ -62,17 +62,17 @@ if zoho_file and invoice_file and boa_file:
             available_files = os.listdir('.')
             st.error(f"❌ Error: Could not locate your Master Excel sheet. Current files found in repo: {available_files}")
         else:
-            # A. Load Master Reference Excel
+            # A. Load Master Reference Excel and force explicit naming match
             cust_df = pd.read_excel(MASTER_FILE_NAME, engine='openpyxl')
             cust_df.columns = [str(col).strip() for col in cust_df.columns]
             
-            # Detect dynamic columns
-            name_col = next((c for c in cust_df.columns if 'name' in c.lower() or 'customer' in c.lower() or 'business' in c.lower()), cust_df.columns[0])
-            acct_col = next((c for c in cust_df.columns if 'account' in c.lower() or 'acct' in c.lower() or 'code' in c.lower() or 'id' in c.lower()), cust_df.columns[1] if len(cust_df.columns) > 1 else cust_df.columns[0])
-            st_term_col = next((c for c in cust_df.columns if 'term' in c.lower() or 'pay' in c.lower()), None)
+            # Explicit master column assignments to avoid guesswork failures
+            name_col = "Account Name" if "Account Name" in cust_df.columns else cust_df.columns[2]
+            acct_col = "Account" if "Account" in cust_df.columns else cust_df.columns[1]
+            term_col = "Terms" if "Terms" in cust_df.columns else None
             
-            # Pre-calculate normalized search targets safely
-            cust_df['Account Name Clean'] = cust_df[name_col].apply(super_clean_string)
+            # Pre-calculate normalized search strings
+            cust_df['Account Name Clean'] = cust_df[name_col].astype(str).str.strip().apply(super_clean_string)
             
             # B. Extract Information from Invoice File
             invoice_customer_name = ""
@@ -106,11 +106,8 @@ if zoho_file and invoice_file and boa_file:
                     inv_df = pd.read_excel(invoice_file, engine='openpyxl')
                 inv_df.columns = [str(col).strip() for col in inv_df.columns]
                 inv_name_col = next((c for c in inv_df.columns if 'customer' in c.lower() or 'name' in c.lower()), None)
-                inv_term_col = next((c for c in inv_df.columns if 'term' in c.lower()), None)
                 if inv_name_col and not inv_df.empty:
                     invoice_customer_name = str(inv_df.iloc[0][inv_name_col]).strip()
-                if inv_term_col and not inv_df.empty:
-                    invoice_terms = str(inv_df.iloc[0][inv_term_col]).lower()
 
             # C. Load Daily Zoho File
             if zoho_file.name.endswith('.csv'):
@@ -172,34 +169,22 @@ if zoho_file and invoice_file and boa_file:
                 if 'monthly' in invoice_terms or 'mpp' in invoice_terms:
                     payment_term = "monthly"
                 
-                # Standardize comparison search variables cleanly with single spaces intact
                 search_key = super_clean_string(cust_name_raw)
                 
                 if search_key:
-                    # Look up master matching options using structural containment checks
-                    match_cust = cust_df[
-                        cust_df['Account Name Clean'].str.contains(search_key, na=False) |
-                        (search_key in cust_df['Account Name Clean'].to_string())
-                    ]
+                    # Precise database fallback lookups mapping the edited file row perfectly
+                    match_cust = cust_df[cust_df['Account Name Clean'] == search_key]
                     
                     if match_cust.empty:
-                        for idx_c, row_c in cust_df.iterrows():
-                            m_name = row_c['Account Name Clean']
-                            if not m_name:
-                                continue
-                            
-                            m_core = m_name.split(' dba ')[0].strip() if ' dba ' in m_name else m_name
-                            m_core_clean = super_clean_string(m_core)
-                            if search_key in m_core_clean or m_core_clean in search_key:
-                                match_cust = cust_df.iloc[[idx_c]]
-                                break
+                        match_cust = cust_df[cust_df['Account Name Clean'].str.contains(search_key, na=False) | 
+                                             (search_key in cust_df['Account Name Clean'].to_string())]
                     
                     if not match_cust.empty:
                         customer_account_num = str(match_cust.iloc[0][acct_col]).strip()
-                        # RULE ENFORCED: Always force final_account_name to match official MASTER list name layout
+                        # ALWAYS pull the official name value directly from the master spreadsheet file row
                         final_account_name = str(match_cust.iloc[0][name_col]).strip()
-                        if st_term_col:
-                            term_check = str(match_cust.iloc[0][st_term_col]).lower()
+                        if term_col and term_col in match_cust.columns:
+                            term_check = str(match_cust.iloc[0][term_col]).lower()
                             if 'monthly' in term_check or 'mpp' in term_check:
                                 payment_term = "monthly"
                 
