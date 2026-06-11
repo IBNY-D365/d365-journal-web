@@ -18,8 +18,8 @@ journal_name = st.sidebar.text_input("Journal Name", value="GEN-JRN")
 st.subheader("1. Upload Daily File")
 zoho_file = st.file_uploader("Drop today's Zoho Payments Export", type=["csv", "xlsx"])
 
-# Target filename EXACTLY as it looks in your GitHub screenshot
-CUSTOMER_MASTER_PATH = "Customer Master Account File"
+# Target filename EXACTLY as it looks in your GitHub repository
+CUSTOMER_MASTER_PATH = "Customer Master Account File.xlsx"
 
 def extract_invoice_number(description):
     if pd.isna(description):
@@ -36,11 +36,8 @@ if zoho_file:
         if not os.path.exists(CUSTOMER_MASTER_PATH):
             st.error(f"❌ Error: Could not find your master reference file '{CUSTOMER_MASTER_PATH}' in your GitHub repository. Please ensure it matches exactly.")
         else:
-            # Force it to read as a CSV since we know it's a CSV format under the hood
-            try:
-                cust_df = pd.read_csv(CUSTOMER_MASTER_PATH)
-            except Exception:
-                cust_df = pd.read_excel(CUSTOMER_MASTER_PATH)
+            # Read directly as an Excel file using openpyxl engine
+            cust_df = pd.read_excel(CUSTOMER_MASTER_PATH, engine='openpyxl')
                 
             cust_df['Account Name'] = cust_df['Account Name'].astype(str).str.strip().str.lower()
             
