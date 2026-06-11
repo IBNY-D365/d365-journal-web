@@ -46,12 +46,12 @@ def extract_text_from_pdf(uploaded_pdf):
     except Exception:
         return ""
 
-# Tokenizes strings into individual alphanumeric words to completely bypass punctuation or abbreviation variances
-def get_string_tokens(text):
+# Normalization function that cleans extra spacing and drops punctuation safely
+def super_clean_string(text):
     if pd.isna(text) or text is None:
-        return set()
+        return ""
     cleaned = re.sub(r'[.,\-_()\[\]]', ' ', str(text).lower())
-    return set(cleaned.split())
+    return " ".join(cleaned.split())
 
 # 3. AUTOMATED PARSING AND BALANCING PIPELINE
 if zoho_file and invoice_file and boa_file:
@@ -69,10 +69,10 @@ if zoho_file and invoice_file and boa_file:
             # Detect dynamic columns
             name_col = next((c for c in cust_df.columns if 'name' in c.lower() or 'customer' in c.lower() or 'business' in c.lower()), cust_df.columns[0])
             acct_col = next((c for c in cust_df.columns if 'account' in c.lower() or 'acct' in c.lower() or 'code' in c.lower() or 'id' in c.lower()), cust_df.columns[1] if len(cust_df.columns) > 1 else cust_df.columns[0])
-            term_col = next((c for c in cust_df.columns if 'term' in c.lower() or 'pay' in c.lower()), None)
+            st_term_col = next((c for c in cust_df.columns if 'term' in c.lower() or 'pay' in c.lower()), None)
             
-            # Pre-calculate token sets for matching rows
-            cust_df['Tokens'] = cust_df[name_col].apply(get_string_tokens)
+            # Pre-calculate normalized search targets safely
+            cust_df['Account Name Clean'] = cust_df[name_col].apply(super_clean_string)
             
             # B. Extract Information from Invoice File
             invoice_customer_name = ""
@@ -80,25 +80,23 @@ if zoho_file and invoice_file and boa_file:
             
             if invoice_file.name.endswith('.pdf'):
                 pdf_text = extract_text_from_pdf(invoice_file)
-                pdf_tokens = get_string_tokens(pdf_text)
-                pdf_text_lower = pdf_text.lower()
+                pdf_text_clean = super_clean_string(pdf_text)
                 
-                if 'monthly' in pdf_text_lower or 'mpp' in pdf_text_lower:
+                if 'monthly' in pdf_text_clean or 'mpp' in pdf_text_clean:
                     invoice_terms = "monthly"
-                if 'due on receipt' in pdf_text_lower or 'dueonreceipt' in pdf_text_lower:
+                if 'due on receipt' in pdf_text_clean or 'dueonreceipt' in pdf_text_clean:
                     invoice_terms = "receipt"
                 
-                # Broad overlapping validation match against master file
+                # Check normalized strings against the full text of the PDF
                 for _, row_cust in cust_df.iterrows():
-                    master_tokens = row_cust['Tokens']
-                    if not master_tokens:
+                    master_name_clean = row_cust['Account Name Clean']
+                    if not master_name_clean or not pdf_text_clean:
                         continue
-                    # Isolate core name up to any DBA elements
-                    clean_m_name = str(row_cust[name_col]).lower()
-                    core_part = clean_m_name.split(' dba ')[0].strip() if ' dba ' in clean_m_name else clean_m_name
-                    core_tokens = get_string_tokens(core_part)
                     
-                    if core_tokens.issubset(pdf_tokens) or master_tokens.issubset(pdf_tokens):
+                    core_part = master_name_clean.split(' dba ')[0].strip() if ' dba ' in master_name_clean else master_name_clean
+                    core_part_clean = super_clean_string(core_part)
+                    
+                    if (len(core_part_clean) > 4 and core_part_clean in pdf_text_clean) or master_name_clean in pdf_text_clean:
                         invoice_customer_name = str(row_cust[name_col]).strip()
                         break
             else:
@@ -161,7 +159,7 @@ if zoho_file and invoice_file and boa_file:
                 zoho_cust_name = str(row[zoho_cust_col]).strip() if zoho_cust_col else ""
                 cust_name_raw = zoho_cust_name if (zoho_cust_name and zoho_cust_name != "nan") else invoice_customer_name
                 
-                if not len(cust_name_raw) or cust_name_raw == "nan":
+                if not cust_name_raw or cust_name_raw == "nan":
                     continue
                     
                 gross_amt = abs(float(str(row[zoho_gross_col]).replace(',', ''))) if zoho_gross_col else 0.0
@@ -169,34 +167,39 @@ if zoho_file and invoice_file and boa_file:
                 
                 customer_account_num = "MISSING_ACCT"
                 payment_term = "receipt"
-                final_account_name = cust_name_raw # Fallback if no master row matches
+                final_account_name = cust_name_raw # Fallback
                 
                 if 'monthly' in invoice_terms or 'mpp' in invoice_terms:
                     payment_term = "monthly"
                 
-                # Tokenize the current row target name
-                row_tokens = get_string_tokens(cust_name_raw)
+                # Standardize comparison search variables cleanly with single spaces intact
+                search_key = super_clean_string(cust_name_raw)
                 
-                if row_tokens:
-                    # Scan token intersections to bypass period/spacing layout bugs completely
-                    best_match_row = None
-                    for idx_c, row_c in cust_df.iterrows():
-                        m_tokens = row_c['Tokens']
-                        clean_m_name = str(row_c[name_col]).lower()
-                        m_core_part = clean_m_name.split(' dba ')[0].strip() if ' dba ' in clean_m_name else clean_m_name
-                        m_core_tokens = get_string_tokens(m_core_part)
-                        
-                        # Verify if the tokens intersect or contain each other flexibly
-                        if row_tokens.issubset(m_tokens) or m_core_tokens.issubset(row_tokens) or row_tokens.issubset(m_core_tokens):
-                            best_match_row = row_c
-                            break
+                if search_key:
+                    # Look up master matching options using structural containment checks
+                    match_cust = cust_df[
+                        cust_df['Account Name Clean'].str.contains(search_key, na=False) |
+                        (search_key in cust_df['Account Name Clean'].to_string())
+                    ]
                     
-                    if best_match_row is not None:
-                        customer_account_num = str(best_match_row[acct_col]).strip()
-                        # CRITICAL RULE: Enforce using the official corporate MASTER database name text format
-                        final_account_name = str(best_match_row[name_col]).strip()
-                        if term_col:
-                            term_check = str(best_match_row[term_col]).lower()
+                    if match_cust.empty:
+                        for idx_c, row_c in cust_df.iterrows():
+                            m_name = row_c['Account Name Clean']
+                            if not m_name:
+                                continue
+                            
+                            m_core = m_name.split(' dba ')[0].strip() if ' dba ' in m_name else m_name
+                            m_core_clean = super_clean_string(m_core)
+                            if search_key in m_core_clean or m_core_clean in search_key:
+                                match_cust = cust_df.iloc[[idx_c]]
+                                break
+                    
+                    if not match_cust.empty:
+                        customer_account_num = str(match_cust.iloc[0][acct_col]).strip()
+                        # RULE ENFORCED: Always force final_account_name to match official MASTER list name layout
+                        final_account_name = str(match_cust.iloc[0][name_col]).strip()
+                        if st_term_col:
+                            term_check = str(match_cust.iloc[0][st_term_col]).lower()
                             if 'monthly' in term_check or 'mpp' in term_check:
                                 payment_term = "monthly"
                 
