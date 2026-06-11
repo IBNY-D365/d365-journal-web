@@ -6,7 +6,7 @@ import os
 # Set up page layout
 st.set_page_config(page_title="D365 Zoho Journal Generator", layout="centered")
 st.title("📊 D365 Zoho Journal Generator")
-st.write("Upload your daily Zoho Payments Export to generate a perfectly balanced D365 import CSV.")
+st.write("Upload your daily Zoho Payments Export (CSV or Excel) to generate a perfectly balanced D365 import CSV.")
 
 # 1. SIDEBAR SETTINGS (Matches D365 General Journal Setup)
 st.sidebar.header("⚙️ D365 Account Settings")
@@ -14,9 +14,9 @@ bank_account = st.sidebar.text_input("Bank Clearing Account", value="110100")
 fee_account = st.sidebar.text_input("Merchant Fee Account", value="615000")
 journal_name = st.sidebar.text_input("Journal Name", value="GEN-JRN")
 
-# 2. FILE UPLOADER 
+# 2. FILE UPLOADER (Accepts both CSV and XLSX now!)
 st.subheader("1. Upload Daily File")
-zoho_file = st.file_uploader("Drop today's Zoho Payments Export (CSV)", type=["csv"])
+zoho_file = st.file_uploader("Drop today's Zoho Payments Export", type=["csv", "xlsx"])
 
 # Target filename inside GitHub backend
 CUSTOMER_MASTER_PATH = "Account Type_Account_Account Name.xlsx - Customer Account_Account Name.csv"
@@ -24,7 +24,6 @@ CUSTOMER_MASTER_PATH = "Account Type_Account_Account Name.xlsx - Customer Accoun
 def extract_invoice_number(description):
     if pd.isna(description):
         return None
-    # Regular expression to catch patterns like INV-060326000343
     match = re.search(r'INV-\d+', str(description))
     return match.group(0) if match else None
 
@@ -41,8 +40,14 @@ if zoho_file:
             cust_df = pd.read_csv(CUSTOMER_MASTER_PATH)
             cust_df['Account Name'] = cust_df['Account Name'].astype(str).str.strip().str.lower()
             
-            # Load incoming daily transaction file
-            zoho_df = pd.read_csv(zoho_file)
+            # Load incoming daily transaction file safely depending on extension
+            if zoho_file.name.endswith('.csv'):
+                zoho_df = pd.read_csv(zoho_file)
+            else:
+                zoho_df = pd.read_excel(zoho_file)
+            
+            # Standardize column names to remove accidental hidden spaces
+            zoho_df.columns = [str(col).strip() for col in zoho_df.columns]
             
             journal_lines = []
             line_number = 1
@@ -139,4 +144,4 @@ if zoho_file:
     except Exception as e:
         st.error(f"❌ An error occurred during matching processing: {str(e)}")
 else:
-    st.info("💡 Drop your Zoho export file above to verify formatting and generate your import package.")
+    st.info("💡 Drop your Zoho export file (CSV or XLSX) above to verify formatting and generate your import package.")
