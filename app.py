@@ -24,7 +24,7 @@ with col2:
 with col3:
     boa_file = st.file_uploader("3. Upload Bank of America Statement", type=["csv", "xlsx"])
 
-# Locate master database file in root directory
+# Target master filename inside your GitHub repository
 def locate_master_file():
     target_base = "customer master account file"
     for f in os.listdir('.'):
@@ -46,7 +46,7 @@ def extract_text_from_pdf(uploaded_pdf):
     except Exception:
         return ""
 
-# Clean strings by flattening spaces and lowercase conversion
+# Standardizes string checks by reducing characters to simple space-separated lowercase tokens
 def super_clean_string(text):
     if pd.isna(text) or text is None:
         return ""
@@ -62,17 +62,17 @@ if zoho_file and invoice_file and boa_file:
             available_files = os.listdir('.')
             st.error(f"❌ Error: Could not locate your Master Excel sheet. Current files found in repo: {available_files}")
         else:
-            # A. Load Master Reference Excel and force explicit naming match
+            # A. Load Master Reference Excel
             cust_df = pd.read_excel(MASTER_FILE_NAME, engine='openpyxl')
             cust_df.columns = [str(col).strip() for col in cust_df.columns]
             
-            # Explicit master column assignments to avoid guesswork failures
+            # Explicitly target required master file headers
             name_col = "Account Name" if "Account Name" in cust_df.columns else cust_df.columns[2]
             acct_col = "Account" if "Account" in cust_df.columns else cust_df.columns[1]
             term_col = "Terms" if "Terms" in cust_df.columns else None
             
-            # Pre-calculate normalized search strings
-            cust_df['Account Name Clean'] = cust_df[name_col].astype(str).str.strip().apply(super_clean_string)
+            # Pre-calculate normalized search targets safely
+            cust_df['Account Name Clean'] = cust_df[name_col].apply(super_clean_string)
             
             # B. Extract Information from Invoice File
             invoice_customer_name = ""
@@ -87,7 +87,7 @@ if zoho_file and invoice_file and boa_file:
                 if 'due on receipt' in pdf_text_clean or 'dueonreceipt' in pdf_text_clean:
                     invoice_terms = "receipt"
                 
-                # Check normalized strings against the full text of the PDF
+                # Check cross-referenced normalized strings against the full text of the PDF
                 for _, row_cust in cust_df.iterrows():
                     master_name_clean = row_cust['Account Name Clean']
                     if not master_name_clean or not pdf_text_clean:
@@ -150,7 +150,8 @@ if zoho_file and invoice_file and boa_file:
             
             # E. Core Processing Loop
             for idx, row in zoho_df.iterrows():
-                if zoho_type_col and str(row[zoho_type_col]).strip().lower() == 'refund':
+                # RULE ENFORCED: Completely ignore standard refund rows or lines with no transaction type data
+                if zoho_type_col and str(row[zoho_type_col]).strip().lower() != 'charge':
                     continue
                     
                 zoho_cust_name = str(row[zoho_cust_col]).strip() if zoho_cust_col else ""
@@ -172,7 +173,7 @@ if zoho_file and invoice_file and boa_file:
                 search_key = super_clean_string(cust_name_raw)
                 
                 if search_key:
-                    # Precise database fallback lookups mapping the edited file row perfectly
+                    # Precise corporate match lookups matching the edited file row perfectly
                     match_cust = cust_df[cust_df['Account Name Clean'] == search_key]
                     
                     if match_cust.empty:
@@ -181,7 +182,7 @@ if zoho_file and invoice_file and boa_file:
                     
                     if not match_cust.empty:
                         customer_account_num = str(match_cust.iloc[0][acct_col]).strip()
-                        # ALWAYS pull the official name value directly from the master spreadsheet file row
+                        # Always override the raw text using the corporate database layout
                         final_account_name = str(match_cust.iloc[0][name_col]).strip()
                         if term_col and term_col in match_cust.columns:
                             term_check = str(match_cust.iloc[0][term_col]).lower()
