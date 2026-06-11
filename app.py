@@ -24,8 +24,16 @@ with col2:
 with col3:
     boa_file = st.file_uploader("3. Upload Bank of America Statement", type=["csv", "xlsx"])
 
-# Target master filename explicitly mapped to your exact filename
-CUSTOMER_MASTER_PATH = "Customer Master Account File.xlsx"
+# Self-correcting loop to locate your file regardless of path or casing hidden features
+def locate_master_file():
+    target_base = "customer master account file"
+    # Search current directory files
+    for f in os.listdir('.'):
+        if target_base in f.lower():
+            return f
+    return None
+
+MASTER_FILE_NAME = locate_master_file()
 
 def extract_text_from_pdf(uploaded_pdf):
     try:
@@ -44,11 +52,12 @@ if zoho_file and invoice_file and boa_file:
     st.subheader("4. Review & Generate")
     
     try:
-        if not os.path.exists(CUSTOMER_MASTER_PATH):
-            st.error(f"❌ Error: '{CUSTOMER_MASTER_PATH}' not found in your GitHub repository. Please verify your files match the name exactly.")
+        if not MASTER_FILE_NAME:
+            available_files = os.listdir('.')
+            st.error(f"❌ Error: Could not locate your Master Excel sheet. Current files found in repo: {available_files}")
         else:
             # A. Load Master Reference Excel
-            cust_df = pd.read_excel(CUSTOMER_MASTER_PATH, engine='openpyxl')
+            cust_df = pd.read_excel(MASTER_FILE_NAME, engine='openpyxl')
             cust_df.columns = [str(col).strip() for col in cust_df.columns]
             
             # Smart-detect columns in Master Sheet
@@ -98,7 +107,7 @@ if zoho_file and invoice_file and boa_file:
                 zoho_df = pd.read_excel(zoho_file, engine='openpyxl')
             zoho_df.columns = [str(col).strip() for col in zoho_df.columns]
             
-            # Smart-detect Zoho amount/fee columns
+            # Smart-detect Zoho columns
             zoho_gross_col = next((c for c in zoho_df.columns if 'gross' in c.lower() or 'total' in c.lower() or 'charged' in c.lower()), None)
             zoho_fee_col = next((c for c in zoho_df.columns if 'fee' in c.lower() or 'merchant' in c.lower() or 'processing' in c.lower()), None)
             zoho_net_col = next((c for c in zoho_df.columns if 'net' in c.lower() or 'settle' in c.lower() or 'amount' in c.lower()), None)
@@ -150,7 +159,7 @@ if zoho_file and invoice_file and boa_file:
                         boa_date = str(boa_match.iloc[0][boa_date_col]).strip()
                         boa_reference_desc = str(boa_match.iloc[0][boa_desc_col]).strip()
                 
-                # Build precise Credit/Debit descriptions
+                # Build descriptions per requirements
                 if payment_term == "monthly":
                     cash_code = "AR002"
                     credit_desc = f"MPP {customer_account_num} {cust_name_raw}_{boa_reference_desc}"
@@ -182,7 +191,7 @@ if zoho_file and invoice_file and boa_file:
                         "Reversing entry": "No", "Reversing date": ""
                     })
 
-            # Create final strictly structured 25-column D365 template DataFrame
+            # Exact ordered 25 columns matching template
             columns_25 = [
                 "Date", "Voucher", "Account name", "Company", "Account type", "Account",
                 "Posting profile", "Cash code", "Description", "Debit", "Credit",
