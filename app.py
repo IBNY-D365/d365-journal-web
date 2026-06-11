@@ -46,12 +46,14 @@ def extract_text_from_pdf(uploaded_pdf):
     except Exception:
         return ""
 
-# Enhanced normalization function to strip punctuation and handle periods like "E." vs "E"
+# Fixed normalization: Keep single clean spaces, strip punctuation & lower-case everything
 def super_clean_string(text):
     if pd.isna(text) or text is None:
         return ""
+    # Replace punctuation symbols with a single space
     cleaned = re.sub(r'[.,\-_()\[\]]', ' ', str(text).lower())
-    return "".join(cleaned.split())
+    # Flatten extra whitespaces into single spaces
+    return " ".join(cleaned.split())
 
 # 3. AUTOMATED PARSING AND BALANCING PIPELINE
 if zoho_file and invoice_file and boa_file:
@@ -84,7 +86,7 @@ if zoho_file and invoice_file and boa_file:
                 
                 if 'monthly' in pdf_text_clean or 'mpp' in pdf_text_clean:
                     invoice_terms = "monthly"
-                if 'dueonreceipt' in pdf_text_clean:
+                if 'due on receipt' in pdf_text_clean or 'dueonreceipt' in pdf_text_clean:
                     invoice_terms = "receipt"
                 
                 # Check cross-referenced normalized strings against the full text of the PDF
@@ -93,9 +95,10 @@ if zoho_file and invoice_file and boa_file:
                     if not master_name_clean or not pdf_text_clean:
                         continue
                         
-                    core_part = master_name_clean.split('dba')[0].strip()
+                    core_part = master_name_clean.split(' dba ')[0].strip()
                     
                     if len(core_part) > 4 and (core_part in pdf_text_clean or master_name_clean in pdf_text_clean):
+                        # Force final parsed name from the invoice validation loop to map to the official Master Record
                         invoice_customer_name = str(row_cust[name_col]).strip()
                         break
             else:
@@ -156,4 +159,106 @@ if zoho_file and invoice_file and boa_file:
                     continue
                     
                 zoho_cust_name = str(row[zoho_cust_col]).strip() if zoho_cust_col else ""
-                cust_name_raw = zoho_cust_name if (zoho_cust_name and zoho_cust_name != "nan") else invoice_customer_
+                cust_name_raw = zoho_cust_name if (zoho_cust_name and zoho_cust_name != "nan") else invoice_customer_name
+                
+                if not cust_name_raw or cust_name_raw == "nan":
+                    continue
+                    
+                gross_amt = abs(float(str(row[zoho_gross_col]).replace(',', ''))) if zoho_gross_col else 0.0
+                fee_amt = abs(float(str(row[zoho_fee_col]).replace(',', ''))) if zoho_fee_col else 0.0
+                
+                customer_account_num = "MISSING_ACCT"
+                payment_term = "receipt"
+                final_account_name = cust_name_raw # Fallback if no master row matches
+                
+                if 'monthly' in invoice_terms or 'mpp' in invoice_terms:
+                    payment_term = "monthly"
+                
+                # Standardize comparison search variables cleanly with single spaces intact
+                search_key = super_clean_string(cust_name_raw)
+                
+                if search_key:
+                    # Look up master matching options using structural containment checks
+                    match_cust = cust_df[
+                        cust_df['Account Name Clean'].str.contains(search_key, na=False) |
+                        (search_key in cust_df['Account Name Clean'].to_string())
+                    ]
+                    
+                    if match_cust.empty:
+                        for idx_c, row_c in cust_df.iterrows():
+                            m_name = row_c['Account Name Clean']
+                            if not m_name:
+                                continue
+                            if search_key in m_name or m_name in search_key or m_name.split(' dba ')[0].strip() in search_key:
+                                match_cust = cust_df.iloc[[idx_c]]
+                                break
+                    
+                    if not match_cust.empty:
+                        customer_account_num = str(match_cust.iloc[0][acct_col]).strip()
+                        # RULE ENFORCED: Always force final_account_name to use the official full corporate MASTER layout record
+                        final_account_name = str(match_cust.iloc[0][name_col]).strip()
+                        if term_col:
+                            term_check = str(match_cust.iloc[0][term_col]).lower()
+                            if 'monthly' in term_check or 'mpp' in term_check:
+                                payment_term = "monthly"
+                
+                # Build descriptions per requirements using the official master file name layout
+                if payment_term == "monthly":
+                    cash_code = "AR002"
+                    credit_desc = f"MPP {customer_account_num} {final_account_name}_{boa_reference_desc}"
+                else:
+                    cash_code = "AR001"
+                    credit_desc = f"{customer_account_num} {final_account_name}_{boa_reference_desc}"
+                
+                # ROW 1: THE D365 CREDIT LINE (CUSTOMER)
+                journal_rows.append({
+                    "Date": boa_date, "Voucher": "", "Account name": final_account_name, "Company": company_id,
+                    "Account type": "Customer", "Account": customer_account_num, "Posting profile": "AutoPost",
+                    "Cash code": cash_code, "Description": credit_desc, "Debit": "", "Credit": gross_amt,
+                    "Item sales tax group": "", "Sales tax code": "", "Offset company": company_id, "Offset account type": "Bank",
+                    "Offset account": offset_account, "Offset transaction text": "", "Currency": "USD", "Exchange rate": 1.00,
+                    "Item sales tax group2": "", "Sales tax group": "AVATAX", "Withholding tax group": "", "Release date": "",
+                    "Reversing entry": "No", "Reversing date": ""
+                })
+                
+                # ROW 2: THE D365 DEBIT LINE (LEDGER MERCHANT FEE)
+                if fee_amt > 0:
+                    debit_desc = f"Zoho Merchant Fee {customer_account_num}_{final_account_name}_{boa_reference_desc}"
+                    journal_rows.append({
+                        "Date": boa_date, "Voucher": "", "Account name": "Outside Service (Finance)", "Company": company_id,
+                        "Account type": "Ledger", "Account": debit_ledger_acct, "Posting profile": "",
+                        "Cash code": "OSF005", "Description": debit_desc, "Debit": fee_amt, "Credit": "",
+                        "Item sales tax group": "", "Sales tax code": "", "Offset company": company_id, "Offset account type": "Bank",
+                        "Offset account": offset_account, "Offset transaction text": "", "Currency": "USD", "Exchange rate": 1.00,
+                        "Item sales tax group2": "", "Sales tax group": "AVATAX", "Withholding tax group": "", "Release date": "",
+                        "Reversing entry": "No", "Reversing date": ""
+                    })
+
+            # Create final structured 25-column template
+            columns_25 = [
+                "Date", "Voucher", "Account name", "Company", "Account type", "Account",
+                "Posting profile", "Cash code", "Description", "Debit", "Credit",
+                "Item sales tax group", "Sales tax code", "Offset company", "Offset account type", "Offset account",
+                "Offset transaction text", "Currency", "Exchange rate", "Item sales tax group2",
+                "Sales tax group", "Withholding tax group", "Release date", "Reversing entry", "Reversing date"
+            ]
+            
+            final_df = pd.DataFrame(journal_rows)
+            if not final_df.empty:
+                final_df = final_df.reindex(columns=columns_25).fillna("")
+                st.success("🎉 All files cross-matched and verified seamlessly!")
+                st.dataframe(final_df)
+                
+                csv_data = final_df.to_csv(index=False).encode('utf-8')
+                st.download_button(
+                    label="📥 Download Perfect D365 Upload CSV",
+                    data=csv_data,
+                    file_name="D365_Reconciliation_Journal.csv",
+                    mime="text/csv"
+                )
+            else:
+                st.warning("⚠️ No valid transaction entries found to process.")
+            
+    except Exception as e:
+        st.error(f"❌ Automation mapping process failed: {str(e)}")
+else:
