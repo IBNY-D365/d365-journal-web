@@ -24,10 +24,9 @@ with col2:
 with col3:
     boa_file = st.file_uploader("3. Upload Bank of America Statement", type=["csv", "xlsx"])
 
-# Self-correcting loop to locate your file regardless of path or casing hidden features
+# Self-correcting loop to locate your master file regardless of path or extension casing
 def locate_master_file():
     target_base = "customer master account file"
-    # Search current directory files
     for f in os.listdir('.'):
         if target_base in f.lower():
             return f
@@ -56,7 +55,7 @@ if zoho_file and invoice_file and boa_file:
             available_files = os.listdir('.')
             st.error(f"❌ Error: Could not locate your Master Excel sheet. Current files found in repo: {available_files}")
         else:
-            # A. Load Master Reference Excel
+            # A. Load Master Reference Excel Safely
             cust_df = pd.read_excel(MASTER_FILE_NAME, engine='openpyxl')
             cust_df.columns = [str(col).strip() for col in cust_df.columns]
             
@@ -86,15 +85,11 @@ if zoho_file and invoice_file and boa_file:
             else:
                 if invoice_file.name.endswith('.csv'):
                     inv_df = pd.read_csv(invoice_file)
-                elif invoice_file.name.endswith('.txt'):
-                    inv_df = pd.read_csv(invoice_file, sep="\t")
                 else:
                     inv_df = pd.read_excel(invoice_file, engine='openpyxl')
                 inv_df.columns = [str(col).strip() for col in inv_df.columns]
-                
-                inv_name_col = next((c for c in inv_df.columns if 'customer' in c.lower() or 'business' in c.lower() or 'name' in c.lower()), None)
-                inv_term_col = next((c for c in inv_df.columns if 'term' in c.lower() or 'due' in c.lower()), None)
-                
+                inv_name_col = next((c for c in inv_df.columns if 'customer' in c.lower() or 'name' in c.lower()), None)
+                inv_term_col = next((c for c in inv_df.columns if 'term' in c.lower()), None)
                 if inv_name_col and not inv_df.empty:
                     invoice_customer_name = str(inv_df.iloc[0][inv_name_col]).strip()
                 if inv_term_col and not inv_df.empty:
@@ -108,28 +103,56 @@ if zoho_file and invoice_file and boa_file:
             zoho_df.columns = [str(col).strip() for col in zoho_df.columns]
             
             # Smart-detect Zoho columns
-            zoho_gross_col = next((c for c in zoho_df.columns if 'gross' in c.lower() or 'total' in c.lower() or 'charged' in c.lower()), None)
-            zoho_fee_col = next((c for c in zoho_df.columns if 'fee' in c.lower() or 'merchant' in c.lower() or 'processing' in c.lower()), None)
-            zoho_net_col = next((c for c in zoho_df.columns if 'net' in c.lower() or 'settle' in c.lower() or 'amount' in c.lower()), None)
-            zoho_cust_col = next((c for c in zoho_df.columns if 'customer' in c.lower() or 'name' in c.lower() or 'account' in c.lower()), None)
-            
-            # D. Load Bank of America File
+            zoho_gross_col = next((c for c in zoho_df.columns if 'gross' in c.lower() or 'amount' in c.lower() or 'total' in c.lower()), zoho_df.columns[3] if len(zoho_df.columns) > 3 else zoho_df.columns[0])
+            zoho_fee_col = next((c for c in zoho_df.columns if 'fee' in c.lower() or 'processing' in c.lower()), zoho_df.columns[4] if len(zoho_df.columns) > 4 else zoho_df.columns[0])
+            zoho_cust_col = next((c for c in zoho_df.columns if 'customer' in c.lower() or 'name' in c.lower()), zoho_df.columns[9] if len(zoho_df.columns) > 9 else zoho_df.columns[0])
+            zoho_type_col = next((c for c in zoho_df.columns if 'type' in c.lower()), None)
+
+            # D. Load Bank of America File (Robust handling for metadata/summary headers)
             if boa_file.name.endswith('.csv'):
-                boa_df = pd.read_csv(boa_file)
+                # Read all text to find where the actual table headers start
+                boa_lines = boa_file.getvalue().decode('utf-8', errors='ignore').splitlines()
+                skip_count = 0
+                for line in boa_lines:
+                    if 'Date,Description,Amount' in line or 'date,description,amount' in line.lower():
+                        break
+                    skip_count += 1
+                boa_file.seek(0)
+                boa_df = pd.read_csv(boa_file, skiprows=skip_count)
             else:
                 boa_df = pd.read_excel(boa_file, engine='openpyxl')
+                
             boa_df.columns = [str(col).strip() for col in boa_df.columns]
+            
+            # Isolate the Zoho Payment text string inside the BOA file
+            boa_match_row = boa_df[boa_df['Description'].astype(str).str.contains('ZOHO PAYMENTS', case=False, na=False)]
+            
+            boa_date = ""
+            boa_reference_desc = "NO BOA MATCH FOUND"
+            
+            if not boa_match_row.empty:
+                boa_date_col = next((c for c in boa_df.columns if 'date' in c.lower() or 'post' in c.lower()), boa_df.columns[0])
+                boa_desc_col = next((c for c in boa_df.columns if 'desc' in c.lower() or 'text' in c.lower()), boa_df.columns[1])
+                boa_date = str(boa_match_row.iloc[0][boa_date_col]).strip()
+                boa_reference_desc = str(boa_match_row.iloc[0][boa_desc_col]).strip()
             
             journal_rows = []
             
             # E. Core Processing Loop
             for idx, row in zoho_df.iterrows():
+                # Skip refund layout balances to explicitly match target parameters
+                if zoho_type_col and str(row[zoho_type_col]).strip().lower() == 'refund':
+                    continue
+                    
                 zoho_cust_name = str(row[zoho_cust_col]).strip() if zoho_cust_col else ""
                 cust_name_raw = zoho_cust_name if (zoho_cust_name and zoho_cust_name != "nan") else invoice_customer_name
                 
-                gross_amt = float(row[zoho_gross_col]) if zoho_gross_col else 0.0
-                fee_amt = float(row[zoho_fee_col]) if zoho_fee_col else 0.0
-                net_amt = float(row[zoho_net_col]) if zoho_net_col else (gross_amt - fee_amt)
+                # Check for explicit empty loops
+                if not cust_name_raw or cust_name_raw == "nan":
+                    continue
+                    
+                gross_amt = abs(float(str(row[zoho_gross_col]).replace(',', ''))) if zoho_gross_col else 0.0
+                fee_amt = abs(float(str(row[zoho_fee_col]).replace(',', ''))) if zoho_fee_col else 0.0
                 
                 customer_account_num = "MISSING_ACCT"
                 payment_term = "receipt"
@@ -145,21 +168,7 @@ if zoho_file and invoice_file and boa_file:
                         if 'monthly' in term_check or 'mpp' in term_check:
                             payment_term = "monthly"
                 
-                # Extract Bank of America Details
-                boa_date = ""
-                boa_reference_desc = "NO BOA MATCH FOUND"
-                
-                boa_amt_col = next((c for c in boa_df.columns if 'amount' in c.lower() or 'credit' in c.lower() or 'value' in c.lower()), None)
-                boa_desc_col = next((c for c in boa_df.columns if 'desc' in c.lower() or 'text' in c.lower() or 'ref' in c.lower() or 'memo' in c.lower()), None)
-                boa_date_col = next((c for c in boa_df.columns if 'date' in c.lower() or 'post' in c.lower()), None)
-                
-                if boa_amt_col and boa_desc_col and boa_date_col:
-                    boa_match = boa_df[pd.to_numeric(boa_df[boa_amt_col], errors='coerce') == net_amt]
-                    if not boa_match.empty:
-                        boa_date = str(boa_match.iloc[0][boa_date_col]).strip()
-                        boa_reference_desc = str(boa_match.iloc[0][boa_desc_col]).strip()
-                
-                # Build descriptions per requirements
+                # Build precise Credit/Debit descriptions matching templates
                 if payment_term == "monthly":
                     cash_code = "AR002"
                     credit_desc = f"MPP {customer_account_num} {cust_name_raw}_{boa_reference_desc}"
@@ -191,7 +200,7 @@ if zoho_file and invoice_file and boa_file:
                         "Reversing entry": "No", "Reversing date": ""
                     })
 
-            # Exact ordered 25 columns matching template
+            # Create final strictly structured 25-column D365 template DataFrame
             columns_25 = [
                 "Date", "Voucher", "Account name", "Company", "Account type", "Account",
                 "Posting profile", "Cash code", "Description", "Debit", "Credit",
@@ -200,18 +209,21 @@ if zoho_file and invoice_file and boa_file:
                 "Sales tax group", "Withholding tax group", "Release date", "Reversing entry", "Reversing date"
             ]
             
-            final_df = pd.DataFrame(journal_rows).reindex(columns=columns_25).fillna("")
-            
-            st.success("🎉 All files cross-matched and verified seamlessly!")
-            st.dataframe(final_df)
-            
-            csv_data = final_df.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                label="📥 Download Perfect D365 Upload CSV",
-                data=csv_data,
-                file_name="D365_Reconciliation_Journal.csv",
-                mime="text/csv"
-            )
+            final_df = pd.DataFrame(journal_rows)
+            if not final_df.empty:
+                final_df = final_df.reindex(columns=columns_25).fillna("")
+                st.success("🎉 All files cross-matched and verified seamlessly!")
+                st.dataframe(final_df)
+                
+                csv_data = final_df.to_csv(index=False).encode('utf-8')
+                st.download_button(
+                    label="📥 Download Perfect D365 Upload CSV",
+                    data=csv_data,
+                    file_name="D365_Reconciliation_Journal.csv",
+                    mime="text/csv"
+                )
+            else:
+                st.warning("⚠️ No valid charge lines found to process after applying data rules.")
             
     except Exception as e:
         st.error(f"❌ Automation mapping process failed: {str(e)}")
