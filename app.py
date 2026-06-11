@@ -46,13 +46,12 @@ def extract_text_from_pdf(uploaded_pdf):
     except Exception:
         return ""
 
-# Helper function to remove punctuation, periods, and standardize string comparisons
+# Enhanced normalization function to strip punctuation and handle periods like "E." vs "E"
 def super_clean_string(text):
     if pd.isna(text):
         return ""
-    # Strip periods, commas, hyphens, and force lowercase with uniform spacing
     cleaned = re.sub(r'[.,\-_()\[\]]', ' ', str(text).lower())
-    return " ".join(cleaned.split())
+    return "".join(cleaned.split())
 
 # 3. AUTOMATED PARSING AND BALANCING PIPELINE
 if zoho_file and invoice_file and boa_file:
@@ -85,16 +84,13 @@ if zoho_file and invoice_file and boa_file:
                 
                 if 'monthly' in pdf_text_clean or 'mpp' in pdf_text_clean:
                     invoice_terms = "monthly"
-                
-                # Use standard fallback terms validation check
-                if 'due on receipt' in pdf_text_clean:
+                if 'dueonreceipt' in pdf_text_clean:
                     invoice_terms = "receipt"
                 
-                # Check normalized strings against the full text of the PDF
+                # Check cross-referenced normalized strings against the full text of the PDF
                 for _, row_cust in cust_df.iterrows():
                     master_name_clean = row_cust['Account Name Clean']
-                    # Look for core structural parts of the name (e.g. up to DBA parts)
-                    core_part = master_name_clean.split(' dba ')[0].strip()
+                    core_part = master_name_clean.split('dba')[0].strip()
                     
                     if len(core_part) > 4 and (core_part in pdf_text_clean or master_name_clean in pdf_text_clean):
                         invoice_customer_name = str(row_cust[name_col]).strip()
@@ -105,149 +101,4 @@ if zoho_file and invoice_file and boa_file:
                 else:
                     inv_df = pd.read_excel(invoice_file, engine='openpyxl')
                 inv_df.columns = [str(col).strip() for col in inv_df.columns]
-                inv_name_col = next((c for c in inv_df.columns if 'customer' in c.lower() or 'name' in c.lower()), None)
-                inv_term_col = next((c for c in inv_df.columns if 'term' in c.lower()), None)
-                if inv_name_col and not inv_df.empty:
-                    invoice_customer_name = str(inv_df.iloc[0][inv_name_col]).strip()
-                if inv_term_col and not inv_df.empty:
-                    invoice_terms = str(inv_df.iloc[0][inv_term_col]).lower()
-
-            # C. Load Daily Zoho File
-            if zoho_file.name.endswith('.csv'):
-                zoho_df = pd.read_csv(zoho_file)
-            else:
-                zoho_df = pd.read_excel(zoho_file, engine='openpyxl')
-            zoho_df.columns = [str(col).strip() for col in zoho_df.columns]
-            
-            zoho_gross_col = next((c for c in zoho_df.columns if 'gross' in c.lower() or 'amount' in c.lower() or 'total' in c.lower()), zoho_df.columns[3] if len(zoho_df.columns) > 3 else zoho_df.columns[0])
-            zoho_fee_col = next((c for c in zoho_df.columns if 'fee' in c.lower() or 'processing' in c.lower()), zoho_df.columns[4] if len(zoho_df.columns) > 4 else zoho_df.columns[0])
-            zoho_cust_col = next((c for c in zoho_df.columns if 'customer' in c.lower() or 'name' in c.lower()), zoho_df.columns[9] if len(zoho_df.columns) > 9 else zoho_df.columns[0])
-            zoho_type_col = next((c for c in zoho_df.columns if 'type' in c.lower()), None)
-
-            # D. Load Bank of America File
-            if boa_file.name.endswith('.csv'):
-                boa_lines = boa_file.getvalue().decode('utf-8', errors='ignore').splitlines()
-                skip_count = 0
-                for line in boa_lines:
-                    if 'Date,Description,Amount' in line or 'date,description,amount' in line.lower():
-                        break
-                    skip_count += 1
-                boa_file.seek(0)
-                boa_df = pd.read_csv(boa_file, skiprows=skip_count)
-            else:
-                boa_df = pd.read_excel(boa_file, engine='openpyxl')
-                
-            boa_df.columns = [str(col).strip() for col in boa_df.columns]
-            
-            boa_match_row = boa_df[boa_df['Description'].astype(str).str.contains('ZOHO PAYMENTS', case=False, na=False)]
-            boa_date = ""
-            boa_reference_desc = "NO BOA MATCH FOUND"
-            
-            if not boa_match_row.empty:
-                boa_date_col = next((c for c in boa_df.columns if 'date' in c.lower() or 'post' in c.lower()), boa_df.columns[0])
-                boa_desc_col = next((c for c in boa_df.columns if 'desc' in c.lower() or 'text' in c.lower()), boa_df.columns[1])
-                boa_date = str(boa_match_row.iloc[0][boa_date_col]).strip()
-                boa_reference_desc = str(boa_match_row.iloc[0][boa_desc_col]).strip()
-            
-            journal_rows = []
-            
-            # E. Core Processing Loop
-            for idx, row in zoho_df.iterrows():
-                if zoho_type_col and str(row[zoho_type_col]).strip().lower() == 'refund':
-                    continue
-                    
-                zoho_cust_name = str(row[zoho_cust_col]).strip() if zoho_cust_col else ""
-                cust_name_raw = zoho_cust_name if (zoho_cust_name and zoho_cust_name != "nan") else invoice_customer_name
-                
-                if not cust_name_raw or cust_name_raw == "nan":
-                    continue
-                    
-                gross_amt = abs(float(str(row[zoho_gross_col]).replace(',', ''))) if zoho_gross_col else 0.0
-                fee_amt = abs(float(str(row[zoho_fee_col]).replace(',', ''))) if zoho_fee_col else 0.0
-                
-                customer_account_num = "MISSING_ACCT"
-                payment_term = "receipt"
-                final_account_name = cust_name_raw # Fallback
-                
-                if 'monthly' in invoice_terms or 'mpp' in invoice_terms:
-                    payment_term = "monthly"
-                
-                # Standardize customer search comparison strings
-                search_key = super_clean_string(cust_name_raw)
-                core_search_key = search_key.split(' dba ')[0].strip()
-                
-                # Advanced robust cross-lookup pattern
-                match_cust = cust_df[
-                    cust_df['Account Name Clean'].str.contains(core_search_key, na=False) |
-                    cust_df['Account Name Clean'].apply(lambda x: core_search_key in str(x) or str(x) in core_search_key)
-                ]
-                
-                if not match_cust.empty:
-                    customer_account_num = str(match_cust.iloc[0][acct_col]).strip()
-                    final_account_name = str(match_cust.iloc[0][name_col]).strip()
-                    if term_col:
-                        term_check = str(match_cust.iloc[0][term_col]).lower()
-                        if 'monthly' in term_check or 'mpp' in term_check:
-                            payment_term = "monthly"
-                
-                # Build descriptions per workflow criteria
-                if payment_term == "monthly":
-                    cash_code = "AR002"
-                    credit_desc = f"MPP {customer_account_num} {final_account_name}_{boa_reference_desc}"
-                else:
-                    cash_code = "AR001"
-                    credit_desc = f"{customer_account_num} {final_account_name}_{boa_reference_desc}"
-                
-                # ROW 1: THE D365 CREDIT LINE (CUSTOMER)
-                journal_rows.append({
-                    "Date": boa_date, "Voucher": "", "Account name": final_account_name, "Company": company_id,
-                    "Account type": "Customer", "Account": customer_account_num, "Posting profile": "AutoPost",
-                    "Cash code": cash_code, "Description": credit_desc, "Debit": "", "Credit": gross_amt,
-                    "Item sales tax group": "", "Sales tax code": "", "Offset company": company_id, "Offset account type": "Bank",
-                    "Offset account": offset_account, "Offset transaction text": "", "Currency": "USD", "Exchange rate": 1.00,
-                    "Item sales tax group2": "", "Sales tax group": "AVATAX", "Withholding tax group": "", "Release date": "",
-                    "Reversing entry": "No", "Reversing date": ""
-                })
-                
-                # ROW 2: THE D365 DEBIT LINE (LEDGER MERCHANT FEE)
-                if fee_amt > 0:
-                    debit_desc = f"Zoho Merchant Fee {customer_account_num}_{final_account_name}_{boa_reference_desc}"
-                    journal_rows.append({
-                        "Date": boa_date, "Voucher": "", "Account name": "Outside Service (Finance)", "Company": company_id,
-                        "Account type": "Ledger", "Account": debit_ledger_acct, "Posting profile": "",
-                        "Cash code": "OSF005", "Description": debit_desc, "Debit": fee_amt, "Credit": "",
-                        "Item sales tax group": "", "Sales tax code": "", "Offset company": company_id, "Offset account type": "Bank",
-                        "Offset account": offset_account, "Offset transaction text": "", "Currency": "USD", "Exchange rate": 1.00,
-                        "Item sales tax group2": "", "Sales tax group": "AVATAX", "Withholding tax group": "", "Release date": "",
-                        "Reversing entry": "No", "Reversing date": ""
-                    })
-
-            # Create final strictly structured 25-column template
-            columns_25 = [
-                "Date", "Voucher", "Account name", "Company", "Account type", "Account",
-                "Posting profile", "Cash code", "Description", "Debit", "Credit",
-                "Item sales tax group", "Sales tax code", "Offset company", "Offset account type", "Offset account",
-                "Offset transaction text", "Currency", "Exchange rate", "Item sales tax group2",
-                "Sales tax group", "Withholding tax group", "Release date", "Reversing entry", "Reversing date"
-            ]
-            
-            final_df = pd.DataFrame(journal_rows)
-            if not final_df.empty:
-                final_df = final_df.reindex(columns=columns_25).fillna("")
-                st.success("🎉 All files cross-matched and verified seamlessly!")
-                st.dataframe(final_df)
-                
-                csv_data = final_df.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    label="📥 Download Perfect D365 Upload CSV",
-                    data=csv_data,
-                    file_name="D365_Reconciliation_Journal.csv",
-                    mime="text/csv"
-                )
-            else:
-                st.warning("⚠️ No valid transaction entries found to process.")
-            
-    except Exception as e:
-        st.error(f"❌ Automation mapping process failed: {str(e)}")
-else:
-    st.info("💡 Please upload your Zoho File, Invoice File (PDF/Excel), and Bank of America statement above to activate the automated alignment mapping engine.")
+                inv_name_col = next((c for c in inv_df.columns
