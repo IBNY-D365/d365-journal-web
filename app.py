@@ -19,7 +19,7 @@ st.subheader("1. Upload Daily File")
 zoho_file = st.file_uploader("Drop today's Zoho Payments Export", type=["csv", "xlsx"])
 
 # Target filename inside GitHub backend
-CUSTOMER_MASTER_PATH = "Account Type_Account_Account Name.xlsx - Customer Account_Account Name.csv"
+CUSTOMER_MASTER_PATH = "Customer Master Account File.csv"
 
 def extract_invoice_number(description):
     if pd.isna(description):
