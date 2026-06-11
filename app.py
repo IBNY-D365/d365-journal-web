@@ -14,12 +14,12 @@ bank_account = st.sidebar.text_input("Bank Clearing Account", value="110100")
 fee_account = st.sidebar.text_input("Merchant Fee Account", value="615000")
 journal_name = st.sidebar.text_input("Journal Name", value="GEN-JRN")
 
-# 2. FILE UPLOADER (Accepts both CSV and XLSX now!)
+# 2. FILE UPLOADER 
 st.subheader("1. Upload Daily File")
 zoho_file = st.file_uploader("Drop today's Zoho Payments Export", type=["csv", "xlsx"])
 
-# Target filename inside GitHub backend
-CUSTOMER_MASTER_PATH = "Customer Master Account File.csv"
+# Target filename EXACTLY as it looks in your GitHub screenshot
+CUSTOMER_MASTER_PATH = "Customer Master Account File"
 
 def extract_invoice_number(description):
     if pd.isna(description):
@@ -34,10 +34,14 @@ if zoho_file:
     try:
         # Check for permanent master mapping sheet
         if not os.path.exists(CUSTOMER_MASTER_PATH):
-            st.error(f"❌ Error: Could not find your master reference file '{CUSTOMER_MASTER_PATH}' in your GitHub repository. Please ensure it is uploaded.")
+            st.error(f"❌ Error: Could not find your master reference file '{CUSTOMER_MASTER_PATH}' in your GitHub repository. Please ensure it matches exactly.")
         else:
-            # Load Customer Master Lookup
-            cust_df = pd.read_csv(CUSTOMER_MASTER_PATH)
+            # Force it to read as a CSV since we know it's a CSV format under the hood
+            try:
+                cust_df = pd.read_csv(CUSTOMER_MASTER_PATH)
+            except Exception:
+                cust_df = pd.read_excel(CUSTOMER_MASTER_PATH)
+                
             cust_df['Account Name'] = cust_df['Account Name'].astype(str).str.strip().str.lower()
             
             # Load incoming daily transaction file safely depending on extension
@@ -54,7 +58,6 @@ if zoho_file:
             voucher_counter = 1
             
             for idx, row in zoho_df.iterrows():
-                # Formats clean sequence numbering for your vouchers (VOU-001, VOU-002, etc.)
                 voucher_id = f"VOU-{voucher_counter:03d}"
                 
                 raw_desc = row.get('Description', '')
@@ -62,7 +65,6 @@ if zoho_file:
                 fee_amt = float(row.get('Merchant Fee', 0))
                 net_amt = float(row.get('Net Amount', 0))
                 
-                # Extract embedded invoice parameters safely
                 inv_num = extract_invoice_number(raw_desc)
                 
                 customer_id = "MISSING_CUST_ID"
@@ -78,15 +80,9 @@ if zoho_file:
                 # ==========================================
                 cust_description = f"Gross Rec - Invoice {inv_num}" if inv_num else f"Gross Rec - {raw_desc}"
                 journal_lines.append({
-                    "JournalName": journal_name,
-                    "LineNumber": line_number,
-                    "Voucher": voucher_id,
-                    "AccountType": "Customer",
-                    "LedgerDimension": customer_id,
-                    "Description": cust_description,
-                    "Debit": gross_amt,
-                    "Credit": "",
-                    "CurrencyCode": "USD"
+                    "JournalName": journal_name, "LineNumber": line_number, "Voucher": voucher_id,
+                    "AccountType": "Customer", "LedgerDimension": customer_id,
+                    "Description": cust_description, "Debit": gross_amt, "Credit": "", "CurrencyCode": "USD"
                 })
                 line_number += 1
                 
@@ -96,15 +92,9 @@ if zoho_file:
                 if fee_amt > 0:
                     fee_description = f"Zoho Merchant Fee - {inv_num}" if inv_num else "Zoho Merchant Fee Deduction"
                     journal_lines.append({
-                        "JournalName": journal_name,
-                        "LineNumber": line_number,
-                        "Voucher": voucher_id,
-                        "AccountType": "Ledger",
-                        "LedgerDimension": fee_account,
-                        "Description": fee_description,
-                        "Debit": fee_amt,
-                        "Credit": "",
-                        "CurrencyCode": "USD"
+                        "JournalName": journal_name, "LineNumber": line_number, "Voucher": voucher_id,
+                        "AccountType": "Ledger", "LedgerDimension": fee_account,
+                        "Description": fee_description, "Debit": fee_amt, "Credit": "", "CurrencyCode": "USD"
                     })
                     line_number += 1
                     
@@ -113,26 +103,18 @@ if zoho_file:
                 # ==========================================
                 bank_description = f"Net Settlement Deposit - Zoho Payments {inv_num}" if inv_num else "Net Settlement Deposit - Zoho Payments"
                 journal_lines.append({
-                    "JournalName": journal_name,
-                    "LineNumber": line_number,
-                    "Voucher": voucher_id,
-                    "AccountType": "Ledger",
-                    "LedgerDimension": bank_account,
-                    "Description": bank_description,
-                    "Debit": "",
-                    "Credit": net_amt,
-                    "CurrencyCode": "USD"
+                    "JournalName": journal_name, "LineNumber": line_number, "Voucher": voucher_id,
+                    "AccountType": "Ledger", "LedgerDimension": bank_account,
+                    "Description": bank_description, "Debit": "", "Credit": net_amt, "CurrencyCode": "USD"
                 })
                 line_number += 1
                 voucher_counter += 1
                 
-            # Put data into the final DataFrame matching your D365 template layout
             final_df = pd.DataFrame(journal_lines)
             
             st.success("✅ Workflow files matched and formatted successfully! Previewing your D365 Journal below:")
             st.dataframe(final_df.head(15))
             
-            # Export function matching the D365 framework requirements
             csv_data = final_df.to_csv(index=False).encode('utf-8')
             st.download_button(
                 label="📥 Download D365 Upload CSV",
