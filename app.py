@@ -4,7 +4,7 @@ import re
 import os
 from pypdf import PdfReader
 
-# Set up page layout (Fixed the typo on this line!)
+# Set up page layout (Fully fixed the typo here!)
 st.set_page_config(page_title="D365 Zoho & BOA Journal Generator", layout="wide")
 st.title("📊 D365 Zoho, Invoice & BOA Journal Generator")
 st.write("Upload your daily processing files below to build your flawless 25-column D365 upload package.")
@@ -93,7 +93,7 @@ if zoho_file and invoice_file and boa_file:
                     if not master_name_clean or not pdf_text_clean:
                         continue
                     
-                    # Safe check isolating core corporation title up to any potential DBA break elements
+                    # Safe dba split check
                     core_part = master_name_clean.split(' dba ')[0].strip() if ' dba ' in master_name_clean else master_name_clean
                     
                     if len(core_part) > 4 and (core_part in pdf_text_clean or master_name_clean in pdf_text_clean):
@@ -172,7 +172,7 @@ if zoho_file and invoice_file and boa_file:
                 if 'monthly' in invoice_terms or 'mpp' in invoice_terms:
                     payment_term = "monthly"
                 
-                # Standardize comparison search variables cleanly with single spaces intact
+                # Standardize comparison search variables cleanly
                 search_key = super_clean_string(cust_name_raw)
                 
                 if search_key:
@@ -195,7 +195,7 @@ if zoho_file and invoice_file and boa_file:
                     
                     if not match_cust.empty:
                         customer_account_num = str(match_cust.iloc[0][acct_col]).strip()
-                        # STRICTION ENFORCED: Always force final_account_name to match official MASTER list name layout
+                        # RULE ENFORCED: Always force final_account_name to match official MASTER list name layout
                         final_account_name = str(match_cust.iloc[0][name_col]).strip()
                         if term_col:
                             term_check = str(match_cust.iloc[0][term_col]).lower()
