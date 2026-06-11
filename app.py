@@ -46,6 +46,14 @@ def extract_text_from_pdf(uploaded_pdf):
     except Exception:
         return ""
 
+# Helper function to remove punctuation, periods, and standardize string comparisons
+def super_clean_string(text):
+    if pd.isna(text):
+        return ""
+    # Strip periods, commas, hyphens, and force lowercase with uniform spacing
+    cleaned = re.sub(r'[.,\-_()\[\]]', ' ', str(text).lower())
+    return " ".join(cleaned.split())
+
 # 3. AUTOMATED PARSING AND BALANCING PIPELINE
 if zoho_file and invoice_file and boa_file:
     st.subheader("4. Review & Generate")
@@ -64,7 +72,8 @@ if zoho_file and invoice_file and boa_file:
             acct_col = next((c for c in cust_df.columns if 'account' in c.lower() or 'acct' in c.lower() or 'code' in c.lower() or 'id' in c.lower()), cust_df.columns[1] if len(cust_df.columns) > 1 else cust_df.columns[0])
             term_col = next((c for c in cust_df.columns if 'term' in c.lower() or 'pay' in c.lower()), None)
             
-            cust_df['Account Name Clean'] = cust_df[name_col].astype(str).str.strip().str.lower()
+            # Pre-calculate normalized search targets
+            cust_df['Account Name Clean'] = cust_df[name_col].apply(super_clean_string)
             
             # B. Extract Information from Invoice File
             invoice_customer_name = ""
@@ -72,19 +81,22 @@ if zoho_file and invoice_file and boa_file:
             
             if invoice_file.name.endswith('.pdf'):
                 pdf_text = extract_text_from_pdf(invoice_file)
-                pdf_text_lower = pdf_text.lower()
+                pdf_text_clean = super_clean_string(pdf_text)
                 
-                if 'monthly' in pdf_text_lower or 'mpp' in pdf_text_lower:
+                if 'monthly' in pdf_text_clean or 'mpp' in pdf_text_clean:
                     invoice_terms = "monthly"
                 
-                # SMART PARTIAL MATCH RULE: Find if the invoice name string is contained anywhere within the Master record list
+                # Use standard fallback terms validation check
+                if 'due on receipt' in pdf_text_clean:
+                    invoice_terms = "receipt"
+                
+                # Check normalized strings against the full text of the PDF
                 for _, row_cust in cust_df.iterrows():
-                    clean_master_name = str(row_cust[name_col]).strip().lower()
-                    # Extract raw entity text matches out of PDF content layout structures
-                    if "301 e 57th st" in pdf_text_lower and "301 e 57th st" in clean_master_name:
-                        invoice_customer_name = str(row_cust[name_col]).strip()
-                        break
-                    elif len(clean_master_name) > 3 and clean_master_name in pdf_text_lower:
+                    master_name_clean = row_cust['Account Name Clean']
+                    # Look for core structural parts of the name (e.g. up to DBA parts)
+                    core_part = master_name_clean.split(' dba ')[0].strip()
+                    
+                    if len(core_part) > 4 and (core_part in pdf_text_clean or master_name_clean in pdf_text_clean):
                         invoice_customer_name = str(row_cust[name_col]).strip()
                         break
             else:
@@ -155,24 +167,30 @@ if zoho_file and invoice_file and boa_file:
                 
                 customer_account_num = "MISSING_ACCT"
                 payment_term = "receipt"
-                final_account_name = cust_name_raw # Default fallback
+                final_account_name = cust_name_raw # Fallback
                 
                 if 'monthly' in invoice_terms or 'mpp' in invoice_terms:
                     payment_term = "monthly"
                 
-                # ADVANCED SEARCH MAPPING RULE: Match even if the invoice string is only a partial snippet of the master list DBA name
-                match_cust = cust_df[cust_df['Account Name Clean'].str.contains(cust_name_raw.lower(), na=False) | 
-                                     cust_df['Account Name Clean'].apply(lambda x: x in cust_name_raw.lower() or cust_name_raw.lower() in x)]
+                # Standardize customer search comparison strings
+                search_key = super_clean_string(cust_name_raw)
+                core_search_key = search_key.split(' dba ')[0].strip()
+                
+                # Advanced robust cross-lookup pattern
+                match_cust = cust_df[
+                    cust_df['Account Name Clean'].str.contains(core_search_key, na=False) |
+                    cust_df['Account Name Clean'].apply(lambda x: core_search_key in str(x) or str(x) in core_search_key)
+                ]
                 
                 if not match_cust.empty:
                     customer_account_num = str(match_cust.iloc[0][acct_col]).strip()
-                    final_account_name = str(match_cust.iloc[0][name_col]).strip() # Pull complete clean ledger name
+                    final_account_name = str(match_cust.iloc[0][name_col]).strip()
                     if term_col:
                         term_check = str(match_cust.iloc[0][term_col]).lower()
                         if 'monthly' in term_check or 'mpp' in term_check:
                             payment_term = "monthly"
                 
-                # Build descriptions per requirements
+                # Build descriptions per workflow criteria
                 if payment_term == "monthly":
                     cash_code = "AR002"
                     credit_desc = f"MPP {customer_account_num} {final_account_name}_{boa_reference_desc}"
@@ -204,7 +222,7 @@ if zoho_file and invoice_file and boa_file:
                         "Reversing entry": "No", "Reversing date": ""
                     })
 
-            # Create final structured 25-column template
+            # Create final strictly structured 25-column template
             columns_25 = [
                 "Date", "Voucher", "Account name", "Company", "Account type", "Account",
                 "Posting profile", "Cash code", "Description", "Debit", "Credit",
