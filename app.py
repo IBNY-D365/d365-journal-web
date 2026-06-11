@@ -48,7 +48,7 @@ def extract_text_from_pdf(uploaded_pdf):
 
 # Enhanced normalization function to strip punctuation and handle periods like "E." vs "E"
 def super_clean_string(text):
-    if pd.isna(text):
+    if pd.isna(text) or text is None:
         return ""
     cleaned = re.sub(r'[.,\-_()\[\]]', ' ', str(text).lower())
     return "".join(cleaned.split())
@@ -71,7 +71,7 @@ if zoho_file and invoice_file and boa_file:
             acct_col = next((c for c in cust_df.columns if 'account' in c.lower() or 'acct' in c.lower() or 'code' in c.lower() or 'id' in c.lower()), cust_df.columns[1] if len(cust_df.columns) > 1 else cust_df.columns[0])
             term_col = next((c for c in cust_df.columns if 'term' in c.lower() or 'pay' in c.lower()), None)
             
-            # Pre-calculate normalized search targets
+            # Pre-calculate normalized search targets safely
             cust_df['Account Name Clean'] = cust_df[name_col].apply(super_clean_string)
             
             # B. Extract Information from Invoice File
@@ -90,6 +90,9 @@ if zoho_file and invoice_file and boa_file:
                 # Check cross-referenced normalized strings against the full text of the PDF
                 for _, row_cust in cust_df.iterrows():
                     master_name_clean = row_cust['Account Name Clean']
+                    if not master_name_clean or not pdf_text_clean:
+                        continue
+                        
                     core_part = master_name_clean.split('dba')[0].strip()
                     
                     if len(core_part) > 4 and (core_part in pdf_text_clean or master_name_clean in pdf_text_clean):
@@ -101,4 +104,56 @@ if zoho_file and invoice_file and boa_file:
                 else:
                     inv_df = pd.read_excel(invoice_file, engine='openpyxl')
                 inv_df.columns = [str(col).strip() for col in inv_df.columns]
-                inv_name_col = next((c for c in inv_df.columns
+                inv_name_col = next((c for c in inv_df.columns if 'customer' in c.lower() or 'name' in c.lower()), None)
+                inv_term_col = next((c for c in inv_df.columns if 'term' in c.lower()), None)
+                if inv_name_col and not inv_df.empty:
+                    invoice_customer_name = str(inv_df.iloc[0][inv_name_col]).strip()
+                if inv_term_col and not inv_df.empty:
+                    invoice_terms = str(inv_df.iloc[0][inv_term_col]).lower()
+
+            # C. Load Daily Zoho File
+            if zoho_file.name.endswith('.csv'):
+                zoho_df = pd.read_csv(zoho_file)
+            else:
+                zoho_df = pd.read_excel(zoho_file, engine='openpyxl')
+            zoho_df.columns = [str(col).strip() for col in zoho_df.columns]
+            
+            zoho_gross_col = next((c for c in zoho_df.columns if 'gross' in c.lower() or 'amount' in c.lower() or 'total' in c.lower()), zoho_df.columns[3] if len(zoho_df.columns) > 3 else zoho_df.columns[0])
+            zoho_fee_col = next((c for c in zoho_df.columns if 'fee' in c.lower() or 'processing' in c.lower()), zoho_df.columns[4] if len(zoho_df.columns) > 4 else zoho_df.columns[0])
+            zoho_cust_col = next((c for c in zoho_df.columns if 'customer' in c.lower() or 'name' in c.lower()), zoho_df.columns[9] if len(zoho_df.columns) > 9 else zoho_df.columns[0])
+            zoho_type_col = next((c for c in zoho_df.columns if 'type' in c.lower()), None)
+
+            # D. Load Bank of America File
+            if boa_file.name.endswith('.csv'):
+                boa_lines = boa_file.getvalue().decode('utf-8', errors='ignore').splitlines()
+                skip_count = 0
+                for line in boa_lines:
+                    if 'Date,Description,Amount' in line or 'date,description,amount' in line.lower():
+                        break
+                    skip_count += 1
+                boa_file.seek(0)
+                boa_df = pd.read_csv(boa_file, skiprows=skip_count)
+            else:
+                boa_df = pd.read_excel(boa_file, engine='openpyxl')
+                
+            boa_df.columns = [str(col).strip() for col in boa_df.columns]
+            
+            boa_match_row = boa_df[boa_df['Description'].astype(str).str.contains('ZOHO PAYMENTS', case=False, na=False)]
+            boa_date = ""
+            boa_reference_desc = "NO BOA MATCH FOUND"
+            
+            if not boa_match_row.empty:
+                boa_date_col = next((c for c in boa_df.columns if 'date' in c.lower() or 'post' in c.lower()), boa_df.columns[0])
+                boa_desc_col = next((c for c in boa_df.columns if 'desc' in c.lower() or 'text' in c.lower()), boa_df.columns[1])
+                boa_date = str(boa_match_row.iloc[0][boa_date_col]).strip()
+                boa_reference_desc = str(boa_match_row.iloc[0][boa_desc_col]).strip()
+            
+            journal_rows = []
+            
+            # E. Core Processing Loop
+            for idx, row in zoho_df.iterrows():
+                if zoho_type_col and str(row[zoho_type_col]).strip().lower() == 'refund':
+                    continue
+                    
+                zoho_cust_name = str(row[zoho_cust_col]).strip() if zoho_cust_col else ""
+                cust_name_raw = zoho_cust_name if (zoho_cust_name and zoho_cust_name != "nan") else invoice_customer_
