@@ -11,7 +11,6 @@ st.write("Upload your daily Zoho Payments Export (CSV or Excel) to generate a pe
 # 1. SIDEBAR SETTINGS (Matches D365 General Journal Setup)
 st.sidebar.header("⚙️ D365 Account Settings")
 bank_account = st.sidebar.text_input("Bank Clearing Account", value="110100")
-fee_account = st.sidebar.text_input("Merchant Fee Account", value="615000")
 journal_name = st.sidebar.text_input("Journal Name", value="GEN-JRN")
 
 # 2. FILE UPLOADER 
@@ -23,9 +22,9 @@ CUSTOMER_MASTER_PATH = "Customer Master Account File.xlsx"
 
 def extract_invoice_number(description):
     if pd.isna(description):
-        return None
+        return ""
     match = re.search(r'INV-\d+', str(description))
-    return match.group(0) if match else None
+    return match.group(0) if match else ""
 
 # 3. PROCESSING AUTOMATION PIPELINE
 if zoho_file:
@@ -58,14 +57,16 @@ if zoho_file:
                 voucher_id = f"VOU-{voucher_counter:03d}"
                 
                 raw_desc = row.get('Description', '')
+                cust_name_raw = str(row.get('Customer Name', '')).strip()
+                
                 gross_amt = float(row.get('Gross Amount', 0))
-                fee_amt = float(row.get('Merchant Fee', 0))
                 net_amt = float(row.get('Net Amount', 0))
                 
+                # Extract embedded invoice parameters safely
                 inv_num = extract_invoice_number(raw_desc)
                 
                 customer_id = "MISSING_CUST_ID"
-                cust_name_clean = str(row.get('Customer Name', '')).strip().lower()
+                cust_name_clean = cust_name_raw.lower()
                 
                 # Match company records dynamically
                 match = cust_df[cust_df['Account Name'] == cust_name_clean]
@@ -73,41 +74,56 @@ if zoho_file:
                     customer_id = match.iloc[0]['Account']
                 
                 # ==========================================
-                # LINE 1: CUSTOMER REVENUE LINE (GROSS DEBIT)
+                # LINE 1: DEBIT LINE (LEDGER - BANK NET AMOUNT)
                 # ==========================================
-                cust_description = f"Gross Rec - Invoice {inv_num}" if inv_num else f"Gross Rec - {raw_desc}"
+                debit_description = f"{cust_name_raw} - Net Deposit"
+                if inv_num:
+                    debit_description += f" - {inv_num}"
+                    
                 journal_lines.append({
-                    "JournalName": journal_name, "LineNumber": line_number, "Voucher": voucher_id,
-                    "AccountType": "Customer", "LedgerDimension": customer_id,
-                    "Description": cust_description, "Debit": gross_amt, "Credit": "", "CurrencyCode": "USD"
+                    "JournalName": journal_name,
+                    "LineNumber": line_number,
+                    "Voucher": voucher_id,
+                    "AccountType": "Ledger",
+                    "LedgerDimension": bank_account,
+                    "Description": debit_description,
+                    "Debit": net_amt,
+                    "Credit": "",
+                    "CurrencyCode": "USD",
+                    "OffsetAccountType": "",
+                    "OffsetLedgerDimension": ""
                 })
                 line_number += 1
                 
                 # ==========================================
-                # LINE 2: MERCHANT EXPENSE LINE (FEE DEBIT)
+                # LINE 2: CREDIT LINE (CUSTOMER - GROSS AMOUNT)
                 # ==========================================
-                if fee_amt > 0:
-                    fee_description = f"Zoho Merchant Fee - {inv_num}" if inv_num else "Zoho Merchant Fee Deduction"
-                    journal_lines.append({
-                        "JournalName": journal_name, "LineNumber": line_number, "Voucher": voucher_id,
-                        "AccountType": "Ledger", "LedgerDimension": fee_account,
-                        "Description": fee_description, "Debit": fee_amt, "Credit": "", "CurrencyCode": "USD"
-                    })
-                    line_number += 1
+                credit_description = f"{cust_name_raw} - Gross Receipt"
+                if inv_num:
+                    credit_description += f" - {inv_num}"
                     
-                # ==========================================
-                # LINE 3: SETTLEMENT CASH LINE (NET CREDIT)
-                # ==========================================
-                bank_description = f"Net Settlement Deposit - Zoho Payments {inv_num}" if inv_num else "Net Settlement Deposit - Zoho Payments"
                 journal_lines.append({
-                    "JournalName": journal_name, "LineNumber": line_number, "Voucher": voucher_id,
-                    "AccountType": "Ledger", "LedgerDimension": bank_account,
-                    "Description": bank_description, "Debit": "", "Credit": net_amt, "CurrencyCode": "USD"
+                    "JournalName": journal_name,
+                    "LineNumber": line_number,
+                    "Voucher": voucher_id,
+                    "AccountType": "Customer",
+                    "LedgerDimension": customer_id,
+                    "Description": credit_description,
+                    "Debit": "",
+                    "Credit": gross_amt,
+                    "CurrencyCode": "USD",
+                    "OffsetAccountType": "",
+                    "OffsetLedgerDimension": ""
                 })
                 line_number += 1
                 voucher_counter += 1
                 
-            final_df = pd.DataFrame(journal_lines)
+            # Put data into the final DataFrame matching your D365 template layout exactly
+            columns_order = [
+                "JournalName", "LineNumber", "Voucher", "AccountType", "LedgerDimension",
+                "Description", "Debit", "Credit", "CurrencyCode", "OffsetAccountType", "OffsetLedgerDimension"
+            ]
+            final_df = pd.DataFrame(journal_lines)[columns_order]
             
             st.success("✅ Workflow files matched and formatted successfully! Previewing your D365 Journal below:")
             st.dataframe(final_df.head(15))
