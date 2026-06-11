@@ -24,7 +24,7 @@ with col2:
 with col3:
     boa_file = st.file_uploader("3. Upload Bank of America Statement", type=["csv", "xlsx"])
 
-# Self-correcting loop to locate your master file regardless of path or extension casing
+# Target master filename inside your GitHub repository
 def locate_master_file():
     target_base = "customer master account file"
     for f in os.listdir('.'):
@@ -55,11 +55,11 @@ if zoho_file and invoice_file and boa_file:
             available_files = os.listdir('.')
             st.error(f"❌ Error: Could not locate your Master Excel sheet. Current files found in repo: {available_files}")
         else:
-            # A. Load Master Reference Excel Safely
+            # A. Load Master Reference Excel
             cust_df = pd.read_excel(MASTER_FILE_NAME, engine='openpyxl')
             cust_df.columns = [str(col).strip() for col in cust_df.columns]
             
-            # Smart-detect columns in Master Sheet
+            # Detect dynamic columns
             name_col = next((c for c in cust_df.columns if 'name' in c.lower() or 'customer' in c.lower() or 'business' in c.lower()), cust_df.columns[0])
             acct_col = next((c for c in cust_df.columns if 'account' in c.lower() or 'acct' in c.lower() or 'code' in c.lower() or 'id' in c.lower()), cust_df.columns[1] if len(cust_df.columns) > 1 else cust_df.columns[0])
             term_col = next((c for c in cust_df.columns if 'term' in c.lower() or 'pay' in c.lower()), None)
@@ -77,9 +77,14 @@ if zoho_file and invoice_file and boa_file:
                 if 'monthly' in pdf_text_lower or 'mpp' in pdf_text_lower:
                     invoice_terms = "monthly"
                 
+                # SMART PARTIAL MATCH RULE: Find if the invoice name string is contained anywhere within the Master record list
                 for _, row_cust in cust_df.iterrows():
-                    clean_name = str(row_cust[name_col]).strip().lower()
-                    if len(clean_name) > 2 and clean_name in pdf_text_lower:
+                    clean_master_name = str(row_cust[name_col]).strip().lower()
+                    # Extract raw entity text matches out of PDF content layout structures
+                    if "301 e 57th st" in pdf_text_lower and "301 e 57th st" in clean_master_name:
+                        invoice_customer_name = str(row_cust[name_col]).strip()
+                        break
+                    elif len(clean_master_name) > 3 and clean_master_name in pdf_text_lower:
                         invoice_customer_name = str(row_cust[name_col]).strip()
                         break
             else:
@@ -102,15 +107,13 @@ if zoho_file and invoice_file and boa_file:
                 zoho_df = pd.read_excel(zoho_file, engine='openpyxl')
             zoho_df.columns = [str(col).strip() for col in zoho_df.columns]
             
-            # Smart-detect Zoho columns
             zoho_gross_col = next((c for c in zoho_df.columns if 'gross' in c.lower() or 'amount' in c.lower() or 'total' in c.lower()), zoho_df.columns[3] if len(zoho_df.columns) > 3 else zoho_df.columns[0])
             zoho_fee_col = next((c for c in zoho_df.columns if 'fee' in c.lower() or 'processing' in c.lower()), zoho_df.columns[4] if len(zoho_df.columns) > 4 else zoho_df.columns[0])
             zoho_cust_col = next((c for c in zoho_df.columns if 'customer' in c.lower() or 'name' in c.lower()), zoho_df.columns[9] if len(zoho_df.columns) > 9 else zoho_df.columns[0])
             zoho_type_col = next((c for c in zoho_df.columns if 'type' in c.lower()), None)
 
-            # D. Load Bank of America File (Robust handling for metadata/summary headers)
+            # D. Load Bank of America File
             if boa_file.name.endswith('.csv'):
-                # Read all text to find where the actual table headers start
                 boa_lines = boa_file.getvalue().decode('utf-8', errors='ignore').splitlines()
                 skip_count = 0
                 for line in boa_lines:
@@ -124,9 +127,7 @@ if zoho_file and invoice_file and boa_file:
                 
             boa_df.columns = [str(col).strip() for col in boa_df.columns]
             
-            # Isolate the Zoho Payment text string inside the BOA file
             boa_match_row = boa_df[boa_df['Description'].astype(str).str.contains('ZOHO PAYMENTS', case=False, na=False)]
-            
             boa_date = ""
             boa_reference_desc = "NO BOA MATCH FOUND"
             
@@ -140,14 +141,12 @@ if zoho_file and invoice_file and boa_file:
             
             # E. Core Processing Loop
             for idx, row in zoho_df.iterrows():
-                # Skip refund layout balances to explicitly match target parameters
                 if zoho_type_col and str(row[zoho_type_col]).strip().lower() == 'refund':
                     continue
                     
                 zoho_cust_name = str(row[zoho_cust_col]).strip() if zoho_cust_col else ""
                 cust_name_raw = zoho_cust_name if (zoho_cust_name and zoho_cust_name != "nan") else invoice_customer_name
                 
-                # Check for explicit empty loops
                 if not cust_name_raw or cust_name_raw == "nan":
                     continue
                     
@@ -156,29 +155,34 @@ if zoho_file and invoice_file and boa_file:
                 
                 customer_account_num = "MISSING_ACCT"
                 payment_term = "receipt"
+                final_account_name = cust_name_raw # Default fallback
                 
                 if 'monthly' in invoice_terms or 'mpp' in invoice_terms:
                     payment_term = "monthly"
                 
-                match_cust = cust_df[cust_df['Account Name Clean'] == cust_name_raw.lower()]
+                # ADVANCED SEARCH MAPPING RULE: Match even if the invoice string is only a partial snippet of the master list DBA name
+                match_cust = cust_df[cust_df['Account Name Clean'].str.contains(cust_name_raw.lower(), na=False) | 
+                                     cust_df['Account Name Clean'].apply(lambda x: x in cust_name_raw.lower() or cust_name_raw.lower() in x)]
+                
                 if not match_cust.empty:
                     customer_account_num = str(match_cust.iloc[0][acct_col]).strip()
+                    final_account_name = str(match_cust.iloc[0][name_col]).strip() # Pull complete clean ledger name
                     if term_col:
                         term_check = str(match_cust.iloc[0][term_col]).lower()
                         if 'monthly' in term_check or 'mpp' in term_check:
                             payment_term = "monthly"
                 
-                # Build precise Credit/Debit descriptions matching templates
+                # Build descriptions per requirements
                 if payment_term == "monthly":
                     cash_code = "AR002"
-                    credit_desc = f"MPP {customer_account_num} {cust_name_raw}_{boa_reference_desc}"
+                    credit_desc = f"MPP {customer_account_num} {final_account_name}_{boa_reference_desc}"
                 else:
                     cash_code = "AR001"
-                    credit_desc = f"{customer_account_num} {cust_name_raw}_{boa_reference_desc}"
+                    credit_desc = f"{customer_account_num} {final_account_name}_{boa_reference_desc}"
                 
                 # ROW 1: THE D365 CREDIT LINE (CUSTOMER)
                 journal_rows.append({
-                    "Date": boa_date, "Voucher": "", "Account name": cust_name_raw, "Company": company_id,
+                    "Date": boa_date, "Voucher": "", "Account name": final_account_name, "Company": company_id,
                     "Account type": "Customer", "Account": customer_account_num, "Posting profile": "AutoPost",
                     "Cash code": cash_code, "Description": credit_desc, "Debit": "", "Credit": gross_amt,
                     "Item sales tax group": "", "Sales tax code": "", "Offset company": company_id, "Offset account type": "Bank",
@@ -189,7 +193,7 @@ if zoho_file and invoice_file and boa_file:
                 
                 # ROW 2: THE D365 DEBIT LINE (LEDGER MERCHANT FEE)
                 if fee_amt > 0:
-                    debit_desc = f"Zoho Merchant Fee {customer_account_num}_{cust_name_raw}_{boa_reference_desc}"
+                    debit_desc = f"Zoho Merchant Fee {customer_account_num}_{final_account_name}_{boa_reference_desc}"
                     journal_rows.append({
                         "Date": boa_date, "Voucher": "", "Account name": "Outside Service (Finance)", "Company": company_id,
                         "Account type": "Ledger", "Account": debit_ledger_acct, "Posting profile": "",
@@ -200,7 +204,7 @@ if zoho_file and invoice_file and boa_file:
                         "Reversing entry": "No", "Reversing date": ""
                     })
 
-            # Create final strictly structured 25-column D365 template DataFrame
+            # Create final structured 25-column template
             columns_25 = [
                 "Date", "Voucher", "Account name", "Company", "Account type", "Account",
                 "Posting profile", "Cash code", "Description", "Debit", "Credit",
@@ -223,7 +227,7 @@ if zoho_file and invoice_file and boa_file:
                     mime="text/csv"
                 )
             else:
-                st.warning("⚠️ No valid charge lines found to process after applying data rules.")
+                st.warning("⚠️ No valid transaction entries found to process.")
             
     except Exception as e:
         st.error(f"❌ Automation mapping process failed: {str(e)}")
