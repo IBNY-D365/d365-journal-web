@@ -46,11 +46,13 @@ def extract_text_from_pdf(uploaded_pdf):
     except Exception:
         return ""
 
-# Standardizes string checks by reducing characters to simple space-separated lowercase tokens
+# Comprehensive standardization helper
 def super_clean_string(text):
     if pd.isna(text) or text is None:
         return ""
+    # Strip common punctuation and convert to lowercase
     cleaned = re.sub(r'[.,\-_()\[\]]', ' ', str(text).lower())
+    # Remove extra spaces
     return " ".join(cleaned.split())
 
 # 3. AUTOMATED PARSING AND BALANCING PIPELINE
@@ -66,48 +68,30 @@ if zoho_file and invoice_file and boa_file:
             cust_df = pd.read_excel(MASTER_FILE_NAME, engine='openpyxl')
             cust_df.columns = [str(col).strip() for col in cust_df.columns]
             
-            # Explicitly target required master file headers
+            # Explicit master column targets
             name_col = "Account Name" if "Account Name" in cust_df.columns else cust_df.columns[2]
             acct_col = "Account" if "Account" in cust_df.columns else cust_df.columns[1]
             term_col = "Terms" if "Terms" in cust_df.columns else None
             
-            # Pre-calculate normalized search targets safely
+            # Pre-calculate normalized search targets cleanly
             cust_df['Account Name Clean'] = cust_df[name_col].apply(super_clean_string)
             
-            # B. Extract Information from Invoice File
-            invoice_customer_name = ""
-            invoice_terms = ""
-            
+            # B. Extract Terms Information from Invoice File
+            invoice_terms = "receipt" # Default fallback
             if invoice_file.name.endswith('.pdf'):
                 pdf_text = extract_text_from_pdf(invoice_file)
                 pdf_text_clean = super_clean_string(pdf_text)
-                
                 if 'monthly' in pdf_text_clean or 'mpp' in pdf_text_clean:
                     invoice_terms = "monthly"
-                if 'due on receipt' in pdf_text_clean or 'dueonreceipt' in pdf_text_clean:
-                    invoice_terms = "receipt"
-                
-                # Check cross-referenced normalized strings against the full text of the PDF
-                for _, row_cust in cust_df.iterrows():
-                    master_name_clean = row_cust['Account Name Clean']
-                    if not master_name_clean or not pdf_text_clean:
-                        continue
-                    
-                    core_part = master_name_clean.split(' dba ')[0].strip() if ' dba ' in master_name_clean else master_name_clean
-                    core_part_clean = super_clean_string(core_part)
-                    
-                    if (len(core_part_clean) > 4 and core_part_clean in pdf_text_clean) or master_name_clean in pdf_text_clean:
-                        invoice_customer_name = str(row_cust[name_col]).strip()
-                        break
             else:
                 if invoice_file.name.endswith('.csv'):
                     inv_df = pd.read_csv(invoice_file)
                 else:
                     inv_df = pd.read_excel(invoice_file, engine='openpyxl')
                 inv_df.columns = [str(col).strip() for col in inv_df.columns]
-                inv_name_col = next((c for c in inv_df.columns if 'customer' in c.lower() or 'name' in c.lower()), None)
-                if inv_name_col and not inv_df.empty:
-                    invoice_customer_name = str(inv_df.iloc[0][inv_name_col]).strip()
+                inv_term_col = next((c for c in inv_df.columns if 'term' in c.lower()), None)
+                if inv_term_col and not inv_df.empty:
+                    invoice_terms = str(inv_df.iloc[0][inv_term_col]).lower()
 
             # C. Load Daily Zoho File
             if zoho_file.name.endswith('.csv'):
@@ -116,10 +100,11 @@ if zoho_file and invoice_file and boa_file:
                 zoho_df = pd.read_excel(zoho_file, engine='openpyxl')
             zoho_df.columns = [str(col).strip() for col in zoho_df.columns]
             
-            zoho_gross_col = next((c for c in zoho_df.columns if 'gross' in c.lower() or 'amount' in c.lower() or 'total' in c.lower()), zoho_df.columns[3] if len(zoho_df.columns) > 3 else zoho_df.columns[0])
-            zoho_fee_col = next((c for c in zoho_df.columns if 'fee' in c.lower() or 'processing' in c.lower()), zoho_df.columns[4] if len(zoho_df.columns) > 4 else zoho_df.columns[0])
-            zoho_cust_col = next((c for c in zoho_df.columns if 'customer' in c.lower() or 'name' in c.lower()), zoho_df.columns[9] if len(zoho_df.columns) > 9 else zoho_df.columns[0])
-            zoho_type_col = next((c for c in zoho_df.columns if 'type' in c.lower()), None)
+            # Lock explicit positions based on your target file layout
+            zoho_gross_col = "Amount" if "Amount" in zoho_df.columns else zoho_df.columns[3]
+            zoho_fee_col = "Fee" if "Fee" in zoho_df.columns else zoho_df.columns[4]
+            zoho_cust_col = "CustomerName" if "CustomerName" in zoho_df.columns else zoho_df.columns[9]
+            zoho_type_col = "TransactionType" if "TransactionType" in zoho_df.columns else None
 
             # D. Load Bank of America File
             if boa_file.name.endswith('.csv'):
@@ -150,18 +135,16 @@ if zoho_file and invoice_file and boa_file:
             
             # E. Core Processing Loop
             for idx, row in zoho_df.iterrows():
-                # RULE ENFORCED: Completely ignore standard refund rows or lines with no transaction type data
-                if zoho_type_col and str(row[zoho_type_col]).strip().lower() != 'charge':
+                # Filter out raw refund lines to avoid empty master mapping lookups
+                if zoho_type_col and str(row[zoho_type_col]).strip().lower() == 'refund':
                     continue
                     
-                zoho_cust_name = str(row[zoho_cust_col]).strip() if zoho_cust_col else ""
-                cust_name_raw = zoho_cust_name if (zoho_cust_name and zoho_cust_name != "nan") else invoice_customer_name
-                
-                if not cust_name_raw or cust_name_raw == "nan":
+                cust_name_raw = str(row[zoho_cust_col]).strip()
+                if not cust_name_raw or cust_name_raw == "nan" or cust_name_raw == "":
                     continue
                     
-                gross_amt = abs(float(str(row[zoho_gross_col]).replace(',', ''))) if zoho_gross_col else 0.0
-                fee_amt = abs(float(str(row[zoho_fee_col]).replace(',', ''))) if zoho_fee_col else 0.0
+                gross_amt = abs(float(str(row[zoho_gross_col]).replace(',', '')))
+                fee_amt = abs(float(str(row[zoho_fee_col]).replace(',', '')))
                 
                 customer_account_num = "MISSING_ACCT"
                 payment_term = "receipt"
@@ -170,10 +153,11 @@ if zoho_file and invoice_file and boa_file:
                 if 'monthly' in invoice_terms or 'mpp' in invoice_terms:
                     payment_term = "monthly"
                 
+                # Normalize clean key directly from the uncorrupted Zoho column
                 search_key = super_clean_string(cust_name_raw)
                 
                 if search_key:
-                    # Precise corporate match lookups matching the edited file row perfectly
+                    # Execute exact string mapping
                     match_cust = cust_df[cust_df['Account Name Clean'] == search_key]
                     
                     if match_cust.empty:
@@ -182,7 +166,7 @@ if zoho_file and invoice_file and boa_file:
                     
                     if not match_cust.empty:
                         customer_account_num = str(match_cust.iloc[0][acct_col]).strip()
-                        # Always override the raw text using the corporate database layout
+                        # Always override output with the official clean Master Database corporate text string
                         final_account_name = str(match_cust.iloc[0][name_col]).strip()
                         if term_col and term_col in match_cust.columns:
                             term_check = str(match_cust.iloc[0][term_col]).lower()
@@ -244,7 +228,7 @@ if zoho_file and invoice_file and boa_file:
                     mime="text/csv"
                 )
             else:
-                st.warning("⚠️ No valid transaction entries found to process.")
+                st.warning("⚠️ No valid transaction charge entries found to process.")
             
     except Exception as e:
         st.error(f"❌ Automation mapping process failed: {str(e)}")
