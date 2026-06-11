@@ -2,29 +2,43 @@ import streamlit as st
 import pandas as pd
 import re
 import os
+from pypdf import PdfReader
 
 # Set up page layout
 st.set_page_config(page_title="D365 Zoho & BOA Journal Generator", layout="wide")
 st.title("📊 D365 Zoho, Invoice & BOA Journal Generator")
 st.write("Upload your daily processing files below to build your flawless 25-column D365 upload package.")
 
-# 1. SIDEBAR FIXED CONFIGURATION (Matches your precise D365 rules)
+# 1. SIDEBAR FIXED CONFIGURATION
 st.sidebar.header("⚙️ Fixed D365 Settings")
 company_id = st.sidebar.text_input("Company", value="bwa")
 offset_account = st.sidebar.text_input("Offset Account", value="B1000002")
 debit_ledger_acct = st.sidebar.text_input("Debit Line Account", value="43170111-U26C05001-B735350-UOA003")
 
-# 2. THREE-FILE UPLOADERS
+# 2. THREE-FILE UPLOADERS (Invoice now accepts PDF, CSV, XLSX, TXT)
 col1, col2, col3 = st.columns(3)
 with col1:
     zoho_file = st.file_uploader("1. Upload Zoho Payments File", type=["csv", "xlsx"])
 with col2:
-    invoice_file = st.file_uploader("2. Upload Invoice File (For Name/Terms Validation)", type=["csv", "xlsx", "txt"])
+    invoice_file = st.file_uploader("2. Upload Invoice File (PDF, Excel, or CSV)", type=["pdf", "csv", "xlsx", "txt"])
 with col3:
     boa_file = st.file_uploader("3. Upload Bank of America Statement", type=["csv", "xlsx"])
 
 # Target master filename exactly as it is saved in your GitHub repository
 CUSTOMER_MASTER_PATH = "Customer Master Account File.xlsx"
+
+# Helper function to extract text cleanly from a PDF file
+def extract_text_from_pdf(uploaded_pdf):
+    try:
+        reader = PdfReader(uploaded_pdf)
+        full_text = ""
+        for page in reader.pages:
+            text = page.extract_text()
+            if text:
+                full_text += text + "\n"
+        return full_text
+    except Exception as e:
+        return ""
 
 # 3. AUTOMATED PARSING AND BALANCING PIPELINE
 if zoho_file and invoice_file and boa_file:
@@ -39,27 +53,42 @@ if zoho_file and invoice_file and boa_file:
             cust_df.columns = [str(col).strip() for col in cust_df.columns]
             cust_df['Account Name Clean'] = cust_df['Account Name'].astype(str).str.strip().str.lower()
             
-            # B. Load Invoice File Data
-            if invoice_file.name.endswith('.csv'):
-                inv_df = pd.read_csv(invoice_file)
-            elif invoice_file.name.endswith('.txt'):
-                inv_df = pd.read_csv(invoice_file, sep="\t")
-            else:
-                inv_df = pd.read_excel(invoice_file, engine='openpyxl')
-            inv_df.columns = [str(col).strip() for col in inv_df.columns]
-            
-            # Extract first customer name or term attribute present in the invoice file
+            # B. Extract Information from Invoice File (Handles PDF vs Spreadsheet)
             invoice_customer_name = ""
             invoice_terms = ""
             
-            # Common column name checks for your invoices
-            inv_name_col = next((c for c in inv_df.columns if 'customer' in c.lower() or 'business' in c.lower() or 'name' in c.lower()), None)
-            inv_term_col = next((c for c in inv_df.columns if 'term' in c.lower() or 'due' in c.lower()), None)
-            
-            if inv_name_col and not inv_df.empty:
-                invoice_customer_name = str(inv_df.iloc[0][inv_name_col]).strip()
-            if inv_term_col and not inv_df.empty:
-                invoice_terms = str(inv_df.iloc[0][inv_term_col]).lower()
+            if invoice_file.name.endswith('.pdf'):
+                # Read the text out of the PDF
+                pdf_text = extract_text_from_pdf(invoice_file)
+                pdf_text_lower = pdf_text.lower()
+                
+                # Check for payment terms context directly in the PDF text
+                if 'monthly' in pdf_text_lower or 'mpp' in pdf_text_lower:
+                    invoice_terms = "monthly"
+                
+                # Search for the customer name by cross-referencing Master Database names directly against the PDF text
+                for _, row_cust in cust_df.iterrows():
+                    clean_name = str(row_cust['Account Name']).strip().lower()
+                    if clean_name in pdf_text_lower:
+                        invoice_customer_name = str(row_cust['Account Name']).strip()
+                        break
+            else:
+                # Handle standard spreadsheet formats if an Excel invoice is dropped
+                if invoice_file.name.endswith('.csv'):
+                    inv_df = pd.read_csv(invoice_file)
+                elif invoice_file.name.endswith('.txt'):
+                    inv_df = pd.read_csv(invoice_file, sep="\t")
+                else:
+                    inv_df = pd.read_excel(invoice_file, engine='openpyxl')
+                inv_df.columns = [str(col).strip() for col in inv_df.columns]
+                
+                inv_name_col = next((c for c in inv_df.columns if 'customer' in c.lower() or 'business' in c.lower() or 'name' in c.lower()), None)
+                inv_term_col = next((c for c in inv_df.columns if 'term' in c.lower() or 'due' in c.lower()), None)
+                
+                if inv_name_col and not inv_df.empty:
+                    invoice_customer_name = str(inv_df.iloc[0][inv_name_col]).strip()
+                if inv_term_col and not inv_df.empty:
+                    invoice_terms = str(inv_df.iloc[0][inv_term_col]).lower()
 
             # C. Load Daily Zoho File
             if zoho_file.name.endswith('.csv'):
@@ -79,7 +108,6 @@ if zoho_file and invoice_file and boa_file:
             
             # E. Core Processing Loop
             for idx, row in zoho_df.iterrows():
-                # Use Invoice customer name as high-priority validation fallback if Zoho data has gaps
                 zoho_cust_name = str(row.get('Customer Name', row.get('Account Name', ''))).strip()
                 cust_name_raw = zoho_cust_name if (zoho_cust_name and zoho_cust_name != "nan") else invoice_customer_name
                 
@@ -87,11 +115,9 @@ if zoho_file and invoice_file and boa_file:
                 fee_amt = float(row.get('Merchant Fee', row.get('Processing Fee', 0)))
                 net_amt = float(row.get('Net Amount', 0))
                 
-                # Cross-reference master lookup data for Account code and terms
                 customer_account_num = "MISSING_ACCT"
                 payment_term = "receipt" # Default fallback
                 
-                # Apply invoice logic check if master term column is blank
                 if 'monthly' in invoice_terms or 'mpp' in invoice_terms:
                     payment_term = "monthly"
                 
@@ -116,7 +142,7 @@ if zoho_file and invoice_file and boa_file:
                         boa_date = str(boa_match.iloc[0][boa_date_col]).strip()
                         boa_reference_desc = str(boa_match.iloc[0][boa_desc_col]).strip()
                 
-                # Construct description formats strictly adhering to your examples
+                # Construct description formats matching examples
                 if payment_term == "monthly":
                     cash_code = "AR002"
                     credit_desc = f"MPP {customer_account_num} {cust_name_raw}_{boa_reference_desc}"
@@ -161,10 +187,19 @@ if zoho_file and invoice_file and boa_file:
                 "Item sales tax group", "Sales tax code", "Offset company", "Bank Account Type",
                 "Offset account", "Offset transaction text", "Currency", "Exchange rate",
                 "Item sales tax group2", "Sales tax group", "Withholding tax group", "Release date",
-                "Reversing entry", "Reversing date"
+                "Reversing entry", "No" if "Reversing entry" in locals() else "Reversing entry", "Reversing date"
             ]
             
-            final_df = pd.DataFrame(journal_rows)[columns_25]
+            # Explicit correction for column mapping
+            final_df = pd.DataFrame(journal_rows)
+            final_df = final_df.reindex(columns=[
+                "Date", "Voucher", "Account name", "Company", "Account type", "Account",
+                "Posting Profile", "Cash code", "Description", "Debit", "Credit",
+                "Item sales tax group", "Sales tax code", "Offset company", "Bank Account Type",
+                "Offset account", "Offset transaction text", "Currency", "Exchange rate",
+                "Item sales tax group2", "Sales tax group", "Withholding tax group", "Release date",
+                "Reversing entry", "Reversing date"
+            ])
             
             st.success("🎉 All files cross-matched and verified seamlessly!")
             st.dataframe(final_df)
@@ -180,4 +215,4 @@ if zoho_file and invoice_file and boa_file:
     except Exception as e:
         st.error(f"❌ Automation mapping process failed: {str(e)}")
 else:
-    st.info("💡 Please upload your Zoho File, Invoice File, and Bank of America statement above to activate the automated alignment mapping engine.")
+    st.info("💡 Please upload your Zoho File, Invoice File (PDF/Excel), and Bank of America statement above to activate the automated alignment mapping engine.")
