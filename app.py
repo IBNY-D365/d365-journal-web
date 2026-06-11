@@ -24,8 +24,13 @@ with col2:
 with col3:
     boa_file = st.file_uploader("3. Upload Bank of America Statement", type=["csv", "xlsx"])
 
-# Target master filename exactly as it is saved in your GitHub repository
-CUSTOMER_MASTER_PATH = "Customer Master Account File.xlsx"
+# Helper function to find the master file safely even if extension is hidden
+def get_master_file_path():
+    possible_names = ["Customer Master Account File", "Customer Master Account File.xlsx", "Customer Master Account File.csv"]
+    for name in possible_names:
+        if os.path.exists(name):
+            return name
+    return None
 
 def extract_text_from_pdf(uploaded_pdf):
     try:
@@ -44,11 +49,16 @@ if zoho_file and invoice_file and boa_file:
     st.subheader("4. Review & Generate")
     
     try:
-        if not os.path.exists(CUSTOMER_MASTER_PATH):
-            st.error(f"❌ Error: Reference database file '{CUSTOMER_MASTER_PATH}' not found in GitHub. Please verify your repository.")
+        master_path = get_master_file_path()
+        if not master_path:
+            st.error("❌ Error: 'Customer Master Account File' not found in your GitHub repository. Please verify your files.")
         else:
-            # A. Load Master Reference Excel dynamically finding the right columns
-            cust_df = pd.read_excel(CUSTOMER_MASTER_PATH, engine='openpyxl')
+            # A. Load Master Reference Excel safely
+            try:
+                cust_df = pd.read_excel(master_path, engine='openpyxl')
+            except Exception:
+                cust_df = pd.read_csv(master_path)
+                
             cust_df.columns = [str(col).strip() for col in cust_df.columns]
             
             # Smart-detect columns in Master Sheet
