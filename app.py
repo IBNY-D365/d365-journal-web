@@ -66,7 +66,6 @@ if zoho_file and invoice_file and boa_file:
             cust_df = pd.read_excel(MASTER_FILE_NAME, engine='openpyxl')
             cust_df.columns = [str(col).strip() for col in cust_df.columns]
             
-            # Explicit column identification based on Master Layout
             name_col = "Account Name" if "Account Name" in cust_df.columns else cust_df.columns[2]
             acct_col = "Account" if "Account" in cust_df.columns else cust_df.columns[1]
             term_col = "Terms" if "Terms" in cust_df.columns else None
@@ -74,21 +73,14 @@ if zoho_file and invoice_file and boa_file:
             # Pre-calculate normalized search targets cleanly
             cust_df['Account Name Clean'] = cust_df[name_col].apply(super_clean_string)
             
-            # B. Extract Terms Information from Invoice File
+            # B. Extract Terms Information & Full Text from Invoice File
             invoice_terms = "receipt" 
             pdf_text_raw = ""
-            invoice_id_from_pdf = ""
-            
             if invoice_file.name.endswith('.pdf'):
                 pdf_text_raw = extract_text_from_pdf(invoice_file)
                 pdf_text_clean = super_clean_string(pdf_text_raw)
                 if 'monthly' in pdf_text_clean or 'mpp' in pdf_text_clean:
                     invoice_terms = "monthly"
-                
-                # Regex search for the exact Invoice ID pattern (e.g., INV-060926000353)
-                inv_match = re.search(r'INV-\d+', pdf_text_raw)
-                if inv_match:
-                    invoice_id_from_pdf = inv_match.group(0)
             else:
                 if invoice_file.name.endswith('.csv'):
                     inv_df = pd.read_csv(invoice_file)
@@ -108,6 +100,7 @@ if zoho_file and invoice_file and boa_file:
             
             zoho_gross_col = next((c for c in zoho_df.columns if 'gross' in c.lower() or 'amount' in c.lower()), zoho_df.columns[3])
             zoho_fee_col = next((c for c in zoho_df.columns if 'fee' in c.lower()), zoho_df.columns[4])
+            zoho_cust_col = next((c for c in zoho_df.columns if 'customername' in c.lower() or 'customer name' in c.lower()), None)
             zoho_desc_col = next((c for c in zoho_df.columns if 'description' in c.lower() or 'desc' in c.lower()), None)
             zoho_type_col = next((c for c in zoho_df.columns if 'type' in c.lower()), None)
             zoho_date_col = next((c for c in zoho_df.columns if 'time' in c.lower() or 'date' in c.lower()), zoho_df.columns[6])
@@ -144,23 +137,39 @@ if zoho_file and invoice_file and boa_file:
                 if zoho_type_col and str(row[zoho_type_col]).strip().lower() == 'refund':
                     continue
                 
-                # Identify Invoice ID from Zoho Description line
-                zoho_desc_text = str(row[zoho_desc_col]).strip() if zoho_desc_col in zoho_df.columns else ""
-                extracted_inv_id = invoice_id_from_pdf
+                # Check 1: Check the Zoho Customer field first
+                payer_name = ""
+                if zoho_cust_col and zoho_cust_col in zoho_df.columns:
+                    payer_name = str(row[zoho_cust_col]).strip()
                 
-                inv_match_zoho = re.search(r'INV-\d+', zoho_desc_text)
-                if inv_match_zoho:
-                    extracted_inv_id = inv_match_zoho.group(0)
+                # Check 2: If Zoho Customer field is blank or contains your merchant name, parse Invoice PDF
+                if not payer_name or payer_name == "nan" or payer_name == "" or "inbody" in payer_name.lower():
+                    if pdf_text_raw:
+                        pdf_text_clean = super_clean_string(pdf_text_raw)
+                        # Scan for any master record name existing inside the invoice document text layout
+                        for m_idx, m_row in cust_df.iterrows():
+                            master_name_clean = str(m_row['Account Name Clean']).strip()
+                            if master_name_clean and master_name_clean in pdf_text_clean:
+                                payer_name = str(m_row[name_col]).strip()
+                                break
                 
-                # strict lookup to prevent guessing account numbers/names
+                # Check 3: Final fallback check against Zoho description string contents if still empty
+                if (!payer_name or payer_name == "nan" or payer_name == "") and zoho_desc_col in zoho_df.columns:
+                    desc_text = str(row[zoho_desc_col]).split('-')[0].strip()
+                    if desc_text and "inbody" not in desc_text.lower():
+                        payer_name = desc_text
+
+                # Initialize lookup targets
                 customer_account_num = "MISSING_ACCT"
-                final_account_name = "Unknown Customer"
+                final_account_name = payer_name if payer_name else "Unknown Payer"
                 payment_term = invoice_terms
                 
-                # Exact cross-reference lookup using extracted Invoice ID via the Customer Master mapping sheet
-                if extracted_inv_id:
-                    # Scan Customer Master rows to check where Invoice references map explicitly
-                    match_cust = cust_df[cust_df.astype(str).apply(lambda x: x.str.contains(extracted_inv_id, case=False, na=False)).any(axis=1)]
+                # Query clean payer details directly back to corporate master record listings
+                search_key = super_clean_string(final_account_name)
+                if search_key:
+                    match_cust = cust_df[cust_df['Account Name Clean'] == search_key]
+                    if match_cust.empty:
+                        match_cust = cust_df[cust_df['Account Name Clean'].str.contains(search_key, na=False)]
                     
                     if not match_cust.empty:
                         customer_account_num = str(match_cust.iloc[0][acct_col]).strip()
@@ -169,16 +178,7 @@ if zoho_file and invoice_file and boa_file:
                             term_check = str(match_cust.iloc[0][term_col]).lower()
                             if 'monthly' in term_check or 'mpp' in term_check:
                                 payment_term = "monthly"
-                
-                # Fallback key matching strategy if explicit invoice lookup maps to empty results
-                if customer_account_num == "MISSING_ACCT" and zoho_desc_text:
-                    clean_desc_name = super_clean_string(zoho_desc_text.split('-')[0].strip())
-                    if clean_desc_name:
-                        match_cust_desc = cust_df[cust_df['Account Name Clean'].str.contains(clean_desc_name, na=False)]
-                        if not match_cust_desc.empty:
-                            customer_account_num = str(match_cust_desc.iloc[0][acct_col]).strip()
-                            final_account_name = str(match_cust_desc.iloc[0][name_col]).strip()
-                
+
                 gross_amt = abs(float(str(row[zoho_gross_col]).replace(',', '')))
                 fee_amt = abs(float(str(row[zoho_fee_col]).replace(',', '')))
                 
