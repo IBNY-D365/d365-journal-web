@@ -143,7 +143,7 @@ if zoho_file and invoice_file and boa_file:
                     
                 cust_name_raw = str(row[zoho_cust_col]).strip()
                 
-                # EDITED LOGIC: Fallback handling when Zoho provides an empty CustomerName column
+                # Fallback handling when Zoho provides an empty CustomerName column
                 if not cust_name_raw or cust_name_raw == "nan" or cust_name_raw == "":
                     # Attempt Extraction from the Zoho Description Text (e.g., "InBody New York - INV-...")
                     if zoho_desc_col in zoho_df.columns and str(row[zoho_desc_col]).strip():
@@ -151,7 +151,7 @@ if zoho_file and invoice_file and boa_file:
                         if desc_text and desc_text.lower() != "nan":
                             cust_name_raw = desc_text
                     
-                    # Secondary Attempt: If Description extraction failed, extract name from the Invoice PDF text lines
+                    # Secondary Attempt: Fixed syntax from (!) to (not)
                     if (not cust_name_raw or cust_name_raw == "nan" or cust_name_raw == "") and pdf_text_raw:
                         lines = [line.strip() for line in pdf_text_raw.split('\n') if line.strip()]
                         if lines:
@@ -206,4 +206,8 @@ if zoho_file and invoice_file and boa_file:
                     "Cash code": cash_code, "Description": credit_desc, "Debit": "", "Credit": gross_amt,
                     "Item sales tax group": "", "Sales tax code": "", "Offset company": company_id, "Offset account type": "Bank",
                     "Offset account": offset_account, "Offset transaction text": "", "Currency": "USD", "Exchange rate": 1.00,
-                    "Item sales tax group2": "", "Sales tax group": "AVATAX", "Withholding tax group": "", "
+                    "Item sales tax group2": "", "Sales tax group": "AVATAX", "Withholding tax group": "", "Release date": "",
+                    "Reversing entry": "No", "Reversing date": ""
+                })
+                
+                # ROW 2: THE D365 DEBIT LINE (LEDGER
