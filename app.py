@@ -142,19 +142,18 @@ if zoho_file and invoice_file and boa_file:
                 if zoho_cust_col and zoho_cust_col in zoho_df.columns:
                     payer_name = str(row[zoho_cust_col]).strip()
                 
-                # Check 2: If Zoho Customer field is blank or contains your merchant name, parse Invoice PDF
+                # Check 2: If Zoho Customer field is blank or contains merchant name, parse Invoice PDF
                 if not payer_name or payer_name == "nan" or payer_name == "" or "inbody" in payer_name.lower():
                     if pdf_text_raw:
                         pdf_text_clean = super_clean_string(pdf_text_raw)
-                        # Scan for any master record name existing inside the invoice document text layout
                         for m_idx, m_row in cust_df.iterrows():
                             master_name_clean = str(m_row['Account Name Clean']).strip()
                             if master_name_clean and master_name_clean in pdf_text_clean:
                                 payer_name = str(m_row[name_col]).strip()
                                 break
                 
-                # Check 3: Final fallback check against Zoho description string contents if still empty
-                if (!payer_name or payer_name == "nan" or payer_name == "") and zoho_desc_col in zoho_df.columns:
+                # Check 3: Final fallback check against Zoho description string contents
+                if (not payer_name or payer_name == "nan" or payer_name == "") and zoho_desc_col in zoho_df.columns:
                     desc_text = str(row[zoho_desc_col]).split('-')[0].strip()
                     if desc_text and "inbody" not in desc_text.lower():
                         payer_name = desc_text
