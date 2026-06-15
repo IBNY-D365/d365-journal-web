@@ -66,20 +66,29 @@ if zoho_file and invoice_file and boa_file:
             cust_df = pd.read_excel(MASTER_FILE_NAME, engine='openpyxl')
             cust_df.columns = [str(col).strip() for col in cust_df.columns]
             
+            # Explicit column identification based on Master Layout
             name_col = "Account Name" if "Account Name" in cust_df.columns else cust_df.columns[2]
             acct_col = "Account" if "Account" in cust_df.columns else cust_df.columns[1]
             term_col = "Terms" if "Terms" in cust_df.columns else None
             
+            # Pre-calculate normalized search targets cleanly
             cust_df['Account Name Clean'] = cust_df[name_col].apply(super_clean_string)
             
             # B. Extract Terms Information from Invoice File
             invoice_terms = "receipt" 
             pdf_text_raw = ""
+            invoice_id_from_pdf = ""
+            
             if invoice_file.name.endswith('.pdf'):
                 pdf_text_raw = extract_text_from_pdf(invoice_file)
                 pdf_text_clean = super_clean_string(pdf_text_raw)
                 if 'monthly' in pdf_text_clean or 'mpp' in pdf_text_clean:
                     invoice_terms = "monthly"
+                
+                # Regex search for the exact Invoice ID pattern (e.g., INV-060926000353)
+                inv_match = re.search(r'INV-\d+', pdf_text_raw)
+                if inv_match:
+                    invoice_id_from_pdf = inv_match.group(0)
             else:
                 if invoice_file.name.endswith('.csv'):
                     inv_df = pd.read_csv(invoice_file)
@@ -97,10 +106,8 @@ if zoho_file and invoice_file and boa_file:
                 zoho_df = pd.read_excel(zoho_file, engine='openpyxl')
             zoho_df.columns = [str(col).strip() for col in zoho_df.columns]
             
-            # Stronger text matching to avoid zero-based index mapping failures
             zoho_gross_col = next((c for c in zoho_df.columns if 'gross' in c.lower() or 'amount' in c.lower()), zoho_df.columns[3])
             zoho_fee_col = next((c for c in zoho_df.columns if 'fee' in c.lower()), zoho_df.columns[4])
-            zoho_cust_col = next((c for c in zoho_df.columns if 'customername' in c.lower() or 'customer name' in c.lower()), None)
             zoho_desc_col = next((c for c in zoho_df.columns if 'description' in c.lower() or 'desc' in c.lower()), None)
             zoho_type_col = next((c for c in zoho_df.columns if 'type' in c.lower()), None)
             zoho_date_col = next((c for c in zoho_df.columns if 'time' in c.lower() or 'date' in c.lower()), zoho_df.columns[6])
@@ -136,46 +143,24 @@ if zoho_file and invoice_file and boa_file:
             for idx, row in zoho_df.iterrows():
                 if zoho_type_col and str(row[zoho_type_col]).strip().lower() == 'refund':
                     continue
-                    
-                cust_name_raw = ""
-                if zoho_cust_col and zoho_cust_col in zoho_df.columns:
-                    cust_name_raw = str(row[zoho_cust_col]).strip()
                 
-                # If name column is completely missing or empty, extract text from fallback options
-                if not cust_name_raw or cust_name_raw == "nan" or cust_name_raw == "":
-                    if zoho_desc_col and zoho_desc_col in zoho_df.columns and str(row[zoho_desc_col]).strip():
-                        desc_text = str(row[zoho_desc_col]).split('-')[0].strip()
-                        if desc_text and desc_text.lower() != "nan":
-                            cust_name_raw = desc_text
-                    
-                    if (not cust_name_raw or cust_name_raw == "nan" or cust_name_raw == "") and pdf_text_raw:
-                        lines = [line.strip() for line in pdf_text_raw.split('\n') if line.strip()]
-                        if lines:
-                            cust_name_raw = lines[0]
+                # Identify Invoice ID from Zoho Description line
+                zoho_desc_text = str(row[zoho_desc_col]).strip() if zoho_desc_col in zoho_df.columns else ""
+                extracted_inv_id = invoice_id_from_pdf
                 
-                if not cust_name_raw or cust_name_raw == "nan" or cust_name_raw == "":
-                    cust_name_raw = "Unknown Customer"
-                    
-                gross_amt = abs(float(str(row[zoho_gross_col]).replace(',', '')))
-                fee_amt = abs(float(str(row[zoho_fee_col]).replace(',', '')))
+                inv_match_zoho = re.search(r'INV-\d+', zoho_desc_text)
+                if inv_match_zoho:
+                    extracted_inv_id = inv_match_zoho.group(0)
                 
-                final_tx_date = boa_date if boa_date else str(row[zoho_date_col]).split(',')[0].strip()
-                
+                # strict lookup to prevent guessing account numbers/names
                 customer_account_num = "MISSING_ACCT"
-                payment_term = "receipt"
-                final_account_name = cust_name_raw 
+                final_account_name = "Unknown Customer"
+                payment_term = invoice_terms
                 
-                if 'monthly' in invoice_terms or 'mpp' in invoice_terms:
-                    payment_term = "monthly"
-                
-                search_key = super_clean_string(cust_name_raw)
-                
-                if search_key:
-                    match_cust = cust_df[cust_df['Account Name Clean'] == search_key]
-                    
-                    if match_cust.empty:
-                        match_cust = cust_df[cust_df['Account Name Clean'].str.contains(search_key, na=False) | 
-                                             (search_key in cust_df['Account Name Clean'].to_string())]
+                # Exact cross-reference lookup using extracted Invoice ID via the Customer Master mapping sheet
+                if extracted_inv_id:
+                    # Scan Customer Master rows to check where Invoice references map explicitly
+                    match_cust = cust_df[cust_df.astype(str).apply(lambda x: x.str.contains(extracted_inv_id, case=False, na=False)).any(axis=1)]
                     
                     if not match_cust.empty:
                         customer_account_num = str(match_cust.iloc[0][acct_col]).strip()
@@ -185,6 +170,20 @@ if zoho_file and invoice_file and boa_file:
                             if 'monthly' in term_check or 'mpp' in term_check:
                                 payment_term = "monthly"
                 
+                # Fallback key matching strategy if explicit invoice lookup maps to empty results
+                if customer_account_num == "MISSING_ACCT" and zoho_desc_text:
+                    clean_desc_name = super_clean_string(zoho_desc_text.split('-')[0].strip())
+                    if clean_desc_name:
+                        match_cust_desc = cust_df[cust_df['Account Name Clean'].str.contains(clean_desc_name, na=False)]
+                        if not match_cust_desc.empty:
+                            customer_account_num = str(match_cust_desc.iloc[0][acct_col]).strip()
+                            final_account_name = str(match_cust_desc.iloc[0][name_col]).strip()
+                
+                gross_amt = abs(float(str(row[zoho_gross_col]).replace(',', '')))
+                fee_amt = abs(float(str(row[zoho_fee_col]).replace(',', '')))
+                
+                final_tx_date = boa_date if boa_date else str(row[zoho_date_col]).split(',')[0].strip()
+                
                 if payment_term == "monthly":
                     cash_code = "AR002"
                     credit_desc = f"MPP {customer_account_num} {final_account_name}_{boa_reference_desc}"
@@ -192,7 +191,7 @@ if zoho_file and invoice_file and boa_file:
                     cash_code = "AR001"
                     credit_desc = f"{customer_account_num} {final_account_name}_{boa_reference_desc}"
                 
-                # ROW 1: THE D365 CREDIT LINE
+                # ROW 1: THE D365 CREDIT LINE (GROSS AMOUNT RULE)
                 journal_rows.append({
                     "Date": final_tx_date, "Voucher": "", "Account name": final_account_name, "Company": company_id,
                     "Account type": "Customer", "Account": customer_account_num, "Posting profile": "AutoPost",
@@ -203,7 +202,7 @@ if zoho_file and invoice_file and boa_file:
                     "Reversing entry": "No", "Reversing date": ""
                 })
                 
-                # ROW 2: THE D365 DEBIT LINE
+                # ROW 2: THE D365 DEBIT LINE (LEDGER MERCHANT FEE)
                 if fee_amt > 0:
                     debit_desc = f"Zoho Merchant Fee {customer_account_num}_{final_account_name}_{boa_reference_desc}"
                     journal_rows.append({
