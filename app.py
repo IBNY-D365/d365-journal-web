@@ -78,9 +78,10 @@ if zoho_file and invoice_file and boa_file:
             
             # B. Extract Terms Information from Invoice File
             invoice_terms = "receipt" # Default fallback
+            pdf_text_raw = ""
             if invoice_file.name.endswith('.pdf'):
-                pdf_text = extract_text_from_pdf(invoice_file)
-                pdf_text_clean = super_clean_string(pdf_text)
+                pdf_text_raw = extract_text_from_pdf(invoice_file)
+                pdf_text_clean = super_clean_string(pdf_text_raw)
                 if 'monthly' in pdf_text_clean or 'mpp' in pdf_text_clean:
                     invoice_terms = "monthly"
             else:
@@ -104,6 +105,7 @@ if zoho_file and invoice_file and boa_file:
             zoho_gross_col = "Amount" if "Amount" in zoho_df.columns else zoho_df.columns[3]
             zoho_fee_col = "Fee" if "Fee" in zoho_df.columns else zoho_df.columns[4]
             zoho_cust_col = "CustomerName" if "CustomerName" in zoho_df.columns else zoho_df.columns[9]
+            zoho_desc_col = "Description" if "Description" in zoho_df.columns else zoho_df.columns[10]
             zoho_type_col = "TransactionType" if "TransactionType" in zoho_df.columns else None
 
             # D. Load Bank of America File
@@ -140,6 +142,22 @@ if zoho_file and invoice_file and boa_file:
                     continue
                     
                 cust_name_raw = str(row[zoho_cust_col]).strip()
+                
+                # EDITED LOGIC: Fallback handling when Zoho provides an empty CustomerName column
+                if not cust_name_raw or cust_name_raw == "nan" or cust_name_raw == "":
+                    # Attempt Extraction from the Zoho Description Text (e.g., "InBody New York - INV-...")
+                    if zoho_desc_col in zoho_df.columns and str(row[zoho_desc_col]).strip():
+                        desc_text = str(row[zoho_desc_col]).split('-')[0].strip()
+                        if desc_text and desc_text.lower() != "nan":
+                            cust_name_raw = desc_text
+                    
+                    # Secondary Attempt: If Description extraction failed, extract name from the Invoice PDF text lines
+                    if (not cust_name_raw or cust_name_raw == "nan" or cust_name_raw == "") and pdf_text_raw:
+                        lines = [line.strip() for line in pdf_text_raw.split('\n') if line.strip()]
+                        if lines:
+                            cust_name_raw = lines[0] # Fallback to first text element of the invoice layout
+                
+                # Final safety pass to ensure loop stability if fields are corrupt
                 if not cust_name_raw or cust_name_raw == "nan" or cust_name_raw == "":
                     continue
                     
@@ -188,49 +206,4 @@ if zoho_file and invoice_file and boa_file:
                     "Cash code": cash_code, "Description": credit_desc, "Debit": "", "Credit": gross_amt,
                     "Item sales tax group": "", "Sales tax code": "", "Offset company": company_id, "Offset account type": "Bank",
                     "Offset account": offset_account, "Offset transaction text": "", "Currency": "USD", "Exchange rate": 1.00,
-                    "Item sales tax group2": "", "Sales tax group": "AVATAX", "Withholding tax group": "", "Release date": "",
-                    "Reversing entry": "No", "Reversing date": ""
-                })
-                
-                # ROW 2: THE D365 DEBIT LINE (LEDGER MERCHANT FEE)
-                if fee_amt > 0:
-                    debit_desc = f"Zoho Merchant Fee {customer_account_num}_{final_account_name}_{boa_reference_desc}"
-                    journal_rows.append({
-                        "Date": boa_date, "Voucher": "", "Account name": "Outside Service (Finance)", "Company": company_id,
-                        "Account type": "Ledger", "Account": debit_ledger_acct, "Posting profile": "",
-                        "Cash code": "OSF005", "Description": debit_desc, "Debit": fee_amt, "Credit": "",
-                        "Item sales tax group": "", "Sales tax code": "", "Offset company": company_id, "Offset account type": "Bank",
-                        "Offset account": offset_account, "Offset transaction text": "", "Currency": "USD", "Exchange rate": 1.00,
-                        "Item sales tax group2": "", "Sales tax group": "AVATAX", "Withholding tax group": "", "Release date": "",
-                        "Reversing entry": "No", "Reversing date": ""
-                    })
-
-            # Create final structured 25-column template
-            columns_25 = [
-                "Date", "Voucher", "Account name", "Company", "Account type", "Account",
-                "Posting profile", "Cash code", "Description", "Debit", "Credit",
-                "Item sales tax group", "Sales tax code", "Offset company", "Offset account type", "Offset account",
-                "Offset transaction text", "Currency", "Exchange rate", "Item sales tax group2",
-                "Sales tax group", "Withholding tax group", "Release date", "Reversing entry", "Reversing date"
-            ]
-            
-            final_df = pd.DataFrame(journal_rows)
-            if not final_df.empty:
-                final_df = final_df.reindex(columns=columns_25).fillna("")
-                st.success("🎉 All files cross-matched and verified seamlessly!")
-                st.dataframe(final_df)
-                
-                csv_data = final_df.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    label="📥 Download Perfect D365 Upload CSV",
-                    data=csv_data,
-                    file_name="D365_Reconciliation_Journal.csv",
-                    mime="text/csv"
-                )
-            else:
-                st.warning("⚠️ No valid transaction charge entries found to process.")
-            
-    except Exception as e:
-        st.error(f"❌ Automation mapping process failed: {str(e)}")
-else:
-    st.info("💡 Please upload your Zoho File, Invoice File (PDF/Excel), and Bank of America statement above to activate the automated alignment mapping engine.")
+                    "Item sales tax group2": "", "Sales tax group": "AVATAX", "Withholding tax group": "", "
