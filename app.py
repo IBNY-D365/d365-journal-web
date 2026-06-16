@@ -51,19 +51,31 @@ if gateway_file and boa_file:
     st.subheader("4. Review & Generate")
     
     try:
-        if not os.path.exists(MASTER_FILE_NAME):
-            st.error(f"❌ Error: Could not find '{MASTER_FILE_NAME}' in root repository folder. Please verify GitHub sync.")
+        if not os.path.exists(MASTER_FILE_NAME) or not os.path.exists(CASH_CODE_FILE):
+            st.error(f"❌ Error: Missing repository lookup master files. Please verify GitHub sync for '{MASTER_FILE_NAME}' and '{CASH_CODE_FILE}'.")
         else:
-            # A. Load Master Reference Excel
+            # A. Load Customer Master File
             cust_df = pd.read_excel(MASTER_FILE_NAME, engine='openpyxl')
             cust_df.columns = [str(col).strip() for col in cust_df.columns]
-            
             name_col = "Account Name" if "Account Name" in cust_df.columns else cust_df.columns[2]
             acct_col = "Account" if "Account" in cust_df.columns else cust_df.columns[1]
-            term_col = "Terms" if "Terms" in cust_df.columns else None
             cust_df['Account Name Clean'] = cust_df[name_col].apply(super_clean_string)
             
-            # B. Load Bank of America File & Detect Settlement Engine
+            # B. Load Cash Code Masterlist File
+            cc_df = pd.read_excel(CASH_CODE_FILE, engine='openpyxl')
+            cc_df.columns = [str(col).strip() for col in cc_df.columns]
+            cc_term_col = next((c for c in cc_df.columns if 'term' in c.lower() or 'desc' in c.lower() or 'name' in c.lower()), cc_df.columns[0])
+            cc_code_col = next((c for c in cc_df.columns if 'code' in c.lower()), cc_df.columns[1])
+            
+            # Helper to safely lookup cash codes from master sheet dynamically
+            def dynamic_cash_code_lookup(term_string, fallback):
+                clean_term = super_clean_string(term_string)
+                match = cc_df[cc_df[cc_term_col].apply(super_clean_string).str.contains(clean_term, na=False)]
+                if not match.empty:
+                    return str(match.iloc[0][cc_code_col]).strip()
+                return fallback
+
+            # C. Load Bank of America File & Detect Settlement Engine
             if boa_file.name.endswith('.csv'):
                 boa_lines = boa_file.getvalue().decode('utf-8', errors='ignore').splitlines()
                 skip_count = 0
@@ -98,174 +110,3 @@ if gateway_file and boa_file:
                 engine_mode = "ZOHO"
                 if not boa_df.empty:
                     boa_date = str(boa_df.iloc[0][boa_date_col_name]).strip()
-                    boa_reference_desc = str(boa_df.iloc[0][boa_desc_col]).strip()
-
-            journal_rows = []
-            total_accumulated_fees = 0.0
-
-            # ==========================================
-            # ENGINE MODE 1: STRIPE DYNAMIC MAPPING ENGINE
-            # ==========================================
-            if engine_mode == "STRIPE" or gateway_file.name.endswith('.pdf'):
-                st.info("⚙️ Running Engine Mode: Stripe Factual PDF Extractor")
-                
-                pdf_text = extract_text_from_pdf(gateway_file)
-                lines = [l.strip() for l in pdf_text.split('\n') if l.strip()]
-                
-                # Check each customer from your master file against the text extracted from the Stripe PDF
-                for m_idx, m_row in cust_df.iterrows():
-                    master_name = str(m_row[name_col]).strip()
-                    master_name_clean = str(m_row['Account Name Clean']).strip()
-                    customer_account_num = str(m_row[acct_col]).strip()
-                    
-                    if not master_name_clean:
-                        continue
-                        
-                    for line in lines:
-                        if master_name_clean in super_clean_string(line):
-                            # Extract raw numeric decimal balances out of the matched customer line matrix
-                            # Handles thousands group comma styling separators automatically
-                            amounts = [float(amt.replace(',', '')) for amt in re.findall(r'\d+(?:,\d{3})*(?:\.\d{2})', line)]
-                            
-                            if amounts:
-                                # Rule: Factual Gross payment amount is always the first numeric float pattern found on the row line
-                                gross_amt = amounts[0]
-                                
-                                # Tally merchant platform processing fee itemizations if visible in the document array structure
-                                if len(amounts) > 1:
-                                    total_accumulated_fees += amounts[1]
-                                
-                                # Track installment notation keyword flags to change receipt parameters
-                                is_installment = "installment" in line.lower()
-                                cash_code = "AR002" if is_installment else "AR001"
-                                
-                                credit_desc = f"MPP {customer_account_num} {master_name}_{boa_reference_desc}" if cash_code == "AR002" else f"{customer_account_num} {master_name}_{boa_reference_desc}"
-                                
-                                # Row Mapping: Customer Credit
-                                journal_rows.append({
-                                    "Date": boa_date, "Voucher": "", "Account name": master_name, "Company": company_id,
-                                    "Account type": "Customer", "Account": customer_account_num, "Posting profile": "AutoPost",
-                                    "Cash code": cash_code, "Description": credit_desc, "Debit": "", "Credit": gross_amt,
-                                    "Item sales tax group": "", "Sales tax code": "", "Offset company": company_id, "Offset account type": "Bank",
-                                    "Offset account": offset_account, "Offset transaction text": "", "Currency": "USD", "Exchange rate": 1.00,
-                                    "Item sales tax group2": "", "Sales tax group": "AVATAX", "Withholding tax group": "", "Release date": "",
-                                    "Reversing entry": "No", "Reversing date": ""
-                                })
-                                break
-
-                # Row Mapping: Single Stripe Summary Processing Ledger Entry (Skipping 'combined')
-                if total_accumulated_fees > 0:
-                    debit_desc = f"Stripe Merchant Fee_{boa_reference_desc}"
-                    journal_rows.append({
-                        "Date": boa_date, "Voucher": "", "Account name": "Outside Service (Finance)", "Company": company_id,
-                        "Account type": "Ledger", "Account": debit_ledger_acct, "Posting profile": "",
-                        "Cash code": "OSF005", "Description": debit_desc, "Debit": round(total_accumulated_fees, 2), "Credit": "",
-                        "Item sales tax group": "", "Sales tax code": "", "Offset company": company_id, "Offset account type": "Bank",
-                        "Offset account": offset_account, "Offset transaction text": "", "Currency": "USD", "Exchange rate": 1.00,
-                        "Item sales tax group2": "", "Sales tax group": "AVATAX", "Withholding tax group": "", "Release date": "",
-                        "Reversing entry": "No", "Reversing date": ""
-                    })
-
-            # ==========================================
-            # ENGINE MODE 2: ZOHO RECONCILIATION ENGINE
-            # ==========================================
-            else:
-                st.info("⚙️ Running Engine Mode: Zoho Corporate Payment Pipeline")
-                invoice_terms = "receipt"
-                extracted_payer_from_invoice = ""
-                
-                if invoice_file and invoice_file.name.endswith('.pdf'):
-                    pdf_text_raw = extract_text_from_pdf(invoice_file)
-                    pdf_text_clean = super_clean_string(pdf_text_raw)
-                    if 'monthly' in pdf_text_clean or 'mpp' in pdf_text_clean:
-                        invoice_terms = "monthly"
-                    
-                    lines = [l.strip() for l in pdf_text_raw.split('\n') if l.strip()]
-                    for idx, line in enumerate(lines):
-                        if "bill to" in line.lower() or "invoice to" in line.lower():
-                            if idx + 1 < len(lines):
-                                extracted_payer_from_invoice = lines[idx + 1].strip()
-                                break
-                
-                if gateway_file.name.endswith('.csv'):
-                    zoho_df = pd.read_csv(gateway_file)
-                else:
-                    zoho_df = pd.read_excel(gateway_file, engine='openpyxl')
-                zoho_df.columns = [str(col).strip() for col in zoho_df.columns]
-                
-                zoho_gross_col = "Amount" if "Amount" in zoho_df.columns else zoho_df.columns[3]
-                zoho_fee_col = "Fee" if "Fee" in zoho_df.columns else zoho_df.columns[4]
-                zoho_cust_col = "CustomerName" if "CustomerName" in zoho_df.columns else None
-                
-                for idx, row in zoho_df.iterrows():
-                    payer_name = str(row[zoho_cust_col]).strip() if zoho_cust_col and zoho_cust_col in zoho_df.columns else ""
-                    if not payer_name or payer_name == "nan" or "inbody" in payer_name.lower():
-                        payer_name = extracted_payer_from_invoice if extracted_payer_from_invoice else "Unknown Payer"
-                    
-                    customer_account_num = "MISSING_ACCT"
-                    final_account_name = payer_name
-                    
-                    search_key = super_clean_string(final_account_name)
-                    if search_key:
-                        match_cust = cust_df[cust_df['Account Name Clean'] == search_key]
-                        if not match_cust.empty:
-                            customer_account_num = str(match_cust.iloc[0][acct_col]).strip()
-                            final_account_name = str(match_cust.iloc[0][name_col]).strip()
-                    
-                    gross_amt = abs(float(str(row[zoho_gross_col]).replace(',', '')))
-                    fee_amt = abs(float(str(row[zoho_fee_col]).replace(',', '')))
-                    cash_code = "AR002" if invoice_terms == "monthly" else "AR001"
-                    
-                    credit_desc = f"MPP {customer_account_num} {final_account_name}_{boa_reference_desc}" if cash_code == "AR002" else f"{customer_account_num} {final_account_name}_{boa_reference_desc}"
-                    
-                    journal_rows.append({
-                        "Date": boa_date, "Voucher": "", "Account name": final_account_name, "Company": company_id,
-                        "Account type": "Customer", "Account": customer_account_num, "Posting profile": "AutoPost",
-                        "Cash code": cash_code, "Description": credit_desc, "Debit": "", "Credit": gross_amt,
-                        "Item sales tax group": "", "Sales tax code": "", "Offset company": company_id, "Offset account type": "Bank",
-                        "Offset account": offset_account, "Offset transaction text": "", "Currency": "USD", "Exchange rate": 1.00,
-                        "Item sales tax group2": "", "Sales tax group": "AVATAX", "Withholding tax group": "", "Release date": "",
-                        "Reversing entry": "No", "Reversing date": ""
-                    })
-                    
-                    if fee_amt > 0:
-                        debit_desc = f"Zoho Merchant Fee {customer_account_num}_{final_account_name}_{boa_reference_desc}"
-                        journal_rows.append({
-                            "Date": boa_date, "Voucher": "", "Account name": "Outside Service (Finance)", "Company": company_id,
-                            "Account type": "Ledger", "Account": debit_ledger_acct, "Posting profile": "",
-                            "Cash code": "OSF005", "Description": debit_desc, "Debit": fee_amt, "Credit": "",
-                            "Item sales tax group": "", "Sales tax code": "", "Offset company": company_id, "Offset account type": "Bank",
-                            "Offset account": offset_account, "Offset transaction text": "", "Currency": "USD", "Exchange rate": 1.00,
-                            "Item sales tax group2": "", "Sales tax group": "AVATAX", "Withholding tax group": "", "Release date": "",
-                            "Reversing entry": "No", "Reversing date": ""
-                        })
-
-            # Create final structured 25-column template layout output
-            columns_25 = [
-                "Date", "Voucher", "Account name", "Company", "Account type", "Account",
-                "Posting profile", "Cash code", "Description", "Debit", "Credit",
-                "Item sales tax group", "Sales tax code", "Offset company", "Offset account type", "Offset account",
-                "Offset transaction text", "Currency", "Exchange rate", "Item sales tax group2",
-                "Sales tax group", "Withholding tax group", "Release date", "Reversing entry", "Reversing date"
-            ]
-            
-            final_df = pd.DataFrame(journal_rows)
-            if not final_df.empty:
-                final_df = final_df.reindex(columns=columns_25).fillna("")
-                st.success("🎉 Cross-matched and balanced journal entries created seamlessly!")
-                st.dataframe(final_df)
-                
-                csv_data = final_df.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    label="📥 Download Perfect D365 Upload CSV",
-                    data=csv_data,
-                    file_name="D365_Reconciliation_Journal.csv",
-                    mime="text/csv"
-                )
-            else:
-                st.warning("⚠️ No valid transaction entries found to process.")
-            
-    except Exception as e:
-        st.error(f"❌ Automation mapping process failed: {str(e)}")
-else:
-    st.info("💡 Please upload your Gateway File (Zoho or Stripe) and Bank of America statement to activate the automated alignment engine.")
