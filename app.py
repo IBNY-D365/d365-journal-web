@@ -43,9 +43,14 @@ def extract_text_from_pdf(uploaded_pdf):
 def super_clean_string(text):
     if pd.isna(text) or text is None:
         return ""
+    # Convert to string and lowercase
+    txt = str(text).lower()
+    # Strip email blocks completely if they are stuck to the name string
+    txt = re.sub(r'\S+@\S+', '', txt)
+    txt = re.sub(r'\b(com|org|net|edu|gov)\b', '', txt)
     # Strip non-alphanumeric artifacts, punctuation, and hyphens completely
-    cleaned = re.sub(r'[^a-zA-Z0-9\s]', ' ', str(text).lower())
-    # Strip common corporate designations to isolate core matching names
+    cleaned = re.sub(r'[^a-zA-Z0-9\s]', ' ', txt)
+    # Strip common corporate designations to isolate core matching tokens
     cleaned = re.sub(r'\b(llc|pllc|inc|corp|co|incorporated|limited|llp)\b', ' ', cleaned)
     return " ".join(cleaned.split())
 
@@ -127,7 +132,7 @@ if gateway_file and boa_file:
                 stripe_fee_accumulator = 0.0
                 
                 lines = [l.strip() for l in pdf_text.split('\n') if l.strip()]
-                for line in lines:
+                for idx, line in enumerate(lines):
                     line_lower = line.lower()
                     if "stripe fee" in line_lower:
                         fee_matches = [float(amt.replace('$', '').replace('USD', '').strip()) for amt in re.findall(r'-\s*\d+\.\d{2}', line)]
@@ -142,10 +147,16 @@ if gateway_file and boa_file:
                             row_fee = abs(amounts[1]) if len(amounts) > 1 else 0.0
                             stripe_fee_accumulator += row_fee
                             
-                            # Cleanly extract true customer string by splitting out metadata
-                            extracted_name = line.split('-')[-2].strip() if '-' in line else "Unknown Customer"
-                            if "@" in extracted_name or ".com" in extracted_name:
-                                extracted_name = line.split('-')[-3].strip()
+                            # Cleanly extract true customer string by isolating text between key tags
+                            extracted_name = "Unknown Customer"
+                            if "agreement -" in line_lower:
+                                extracted_name = line.split("Agreement -")[-1].split(" -")[0].strip()
+                            elif "plan -" in line_lower:
+                                extracted_name = line.split("Plan -")[-1].split(" -")[0].strip()
+                            
+                            # Handle wrapping layouts where the name might bleed into adjacent metadata cells
+                            extracted_name = re.sub(r'\S+@\S+', '', extracted_name).split('@')[0].strip()
+                            extracted_name = extracted_name.strip(" -")
                                 
                             charge_blocks.append({
                                 "name": extracted_name,
@@ -162,10 +173,11 @@ if gateway_file and boa_file:
                     cash_code = dynamic_cash_code_lookup(cash_code_label, "AR002" if is_inst else "AR001")
                     
                     customer_account_num = "MISSING_ACCT"
-                    final_account_name = charge["name"].strip(" -")
+                    final_account_name = charge["name"]
                     
                     search_key = super_clean_string(final_account_name)
                     if search_key:
+                        # Dynamic token lookup: Matches "301 east 57th street" to "301 EAST 57TH STREET GYM LLC" seamlessly
                         match_cust = cust_df[cust_df['Account Name Clean'].apply(lambda x: search_key in str(x) or str(x) in search_key)]
                         
                         if match_cust.empty:
