@@ -43,7 +43,6 @@ def extract_text_from_pdf(uploaded_pdf):
 def super_clean_string(text):
     if pd.isna(text) or text is None:
         return ""
-    # Convert to string and lowercase
     txt = str(text).lower()
     # Strip email blocks completely if they are stuck to the name string
     txt = re.sub(r'\S+@\S+', '', txt)
@@ -147,14 +146,12 @@ if gateway_file and boa_file:
                             row_fee = abs(amounts[1]) if len(amounts) > 1 else 0.0
                             stripe_fee_accumulator += row_fee
                             
-                            # Cleanly extract true customer string by isolating text between key tags
                             extracted_name = "Unknown Customer"
                             if "agreement -" in line_lower:
                                 extracted_name = line.split("Agreement -")[-1].split(" -")[0].strip()
                             elif "plan -" in line_lower:
                                 extracted_name = line.split("Plan -")[-1].split(" -")[0].strip()
                             
-                            # Handle wrapping layouts where the name might bleed into adjacent metadata cells
                             extracted_name = re.sub(r'\S+@\S+', '', extracted_name).split('@')[0].strip()
                             extracted_name = extracted_name.strip(" -")
                                 
@@ -164,7 +161,7 @@ if gateway_file and boa_file:
                                 "is_installment": "installment" in line_lower
                             })
 
-                # Step 2: Generate entries with enhanced word-intersection matching
+                # Step 2: Generate entries with word-token matching logic
                 for charge in charge_blocks:
                     gross_val = charge["gross"]
                     is_inst = charge["is_installment"]
@@ -177,16 +174,28 @@ if gateway_file and boa_file:
                     
                     search_key = super_clean_string(final_account_name)
                     if search_key:
-                        # Dynamic token lookup: Matches "301 east 57th street" to "301 EAST 57TH STREET GYM LLC" seamlessly
+                        # 1. Direct match check
                         match_cust = cust_df[cust_df['Account Name Clean'].apply(lambda x: search_key in str(x) or str(x) in search_key)]
                         
+                        # 2. Token overlap check (solves spelling variation bugs permanently)
                         if match_cust.empty:
-                            search_tokens = search_key.split()
-                            if len(search_tokens) >= 2:
-                                token_key = " ".join(search_tokens[:2])
-                                match_cust = cust_df[cust_df['Account Name Clean'].str.contains(token_key, na=False)]
-
-                        if not match_cust.empty:
+                            search_tokens = set(search_key.split())
+                            best_match_row = None
+                            max_overlap = 0
+                            
+                            for m_idx, m_row in cust_df.iterrows():
+                                master_tokens = set(str(m_row['Account Name Clean']).split())
+                                overlap = len(search_tokens.intersection(master_tokens))
+                                
+                                # If at least 2 primary words overlap, map the record safely
+                                if overlap >= 2 and overlap > max_overlap:
+                                    max_overlap = overlap
+                                    best_match_row = m_row
+                            
+                            if best_match_row is not None:
+                                customer_account_num = str(best_match_row[acct_col]).strip()
+                                final_account_name = str(best_match_row[name_col]).strip()
+                        else:
                             customer_account_num = str(match_cust.iloc[0][acct_col]).strip()
                             final_account_name = str(match_cust.iloc[0][name_col]).strip()
                     
