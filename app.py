@@ -43,7 +43,10 @@ def extract_text_from_pdf(uploaded_pdf):
 def super_clean_string(text):
     if pd.isna(text) or text is None:
         return ""
-    cleaned = re.sub(r'[.,\-_()\[\]]', ' ', str(text).lower())
+    # Strip non-alphanumeric artifacts, punctuation, and hyphens completely
+    cleaned = re.sub(r'[^a-zA-Z0-9\s]', ' ', str(text).lower())
+    # Strip common corporate designations to isolate core matching names
+    cleaned = re.sub(r'\b(llc|pllc|inc|corp|co|incorporated|limited|llp)\b', ' ', cleaned)
     return " ".join(cleaned.split())
 
 # 3. AUTOMATED PARSING AND BALANCING PIPELINE
@@ -67,7 +70,6 @@ if gateway_file and boa_file:
             cc_term_col = next((c for c in cc_df.columns if 'term' in c.lower() or 'desc' in c.lower() or 'name' in c.lower()), cc_df.columns[0])
             cc_code_col = next((c for c in cc_df.columns if 'code' in c.lower()), cc_df.columns[1])
             
-            # Helper to safely lookup cash codes from master sheet dynamically
             def dynamic_cash_code_lookup(term_string, fallback):
                 clean_term = super_clean_string(term_string)
                 match = cc_df[cc_df[cc_term_col].apply(super_clean_string).str.contains(clean_term, na=False)]
@@ -110,3 +112,77 @@ if gateway_file and boa_file:
                 engine_mode = "ZOHO"
                 if not boa_df.empty:
                     boa_date = str(boa_df.iloc[0][boa_date_col_name]).strip()
+                    boa_reference_desc = str(boa_df.iloc[0][boa_desc_col]).strip()
+
+            journal_rows = []
+
+            # ==========================================
+            # ENGINE MODE 1: STRIPE TRUE PARSER (7+1 DATA LAYOUT)
+            # ==========================================
+            if engine_mode == "STRIPE" or gateway_file.name.endswith('.pdf'):
+                st.info("⚙️ Running Engine Mode: Stripe Factual PDF Extractor")
+                
+                pdf_text = extract_text_from_pdf(gateway_file)
+                charge_blocks = []
+                stripe_fee_accumulator = 0.0
+                
+                lines = [l.strip() for l in pdf_text.split('\n') if l.strip()]
+                for line in lines:
+                    line_lower = line.lower()
+                    if "stripe fee" in line_lower:
+                        fee_matches = [float(amt.replace('$', '').replace('USD', '').strip()) for amt in re.findall(r'-\s*\d+\.\d{2}', line)]
+                        if fee_matches:
+                            stripe_fee_accumulator += sum(fee_matches)
+                    
+                    elif "charge" in line_lower and ("plan" in line_lower or "agreement" in line_lower):
+                        amounts = [float(amt.replace(',', '')) for amt in re.findall(r'\d+(?:,\d{3})*(?:\.\d{2})', line)]
+                        
+                        if amounts:
+                            gross_amt = amounts[0]
+                            row_fee = abs(amounts[1]) if len(amounts) > 1 else 0.0
+                            stripe_fee_accumulator += row_fee
+                            
+                            # Cleanly extract true customer string by splitting out metadata
+                            extracted_name = line.split('-')[-2].strip() if '-' in line else "Unknown Customer"
+                            if "@" in extracted_name or ".com" in extracted_name:
+                                extracted_name = line.split('-')[-3].strip()
+                                
+                            charge_blocks.append({
+                                "name": extracted_name,
+                                "gross": gross_amt,
+                                "is_installment": "installment" in line_lower
+                            })
+
+                # Step 2: Generate entries with enhanced word-intersection matching
+                for charge in charge_blocks:
+                    gross_val = charge["gross"]
+                    is_inst = charge["is_installment"]
+                    
+                    cash_code_label = "Installment" if is_inst else "Receipt"
+                    cash_code = dynamic_cash_code_lookup(cash_code_label, "AR002" if is_inst else "AR001")
+                    
+                    customer_account_num = "MISSING_ACCT"
+                    final_account_name = charge["name"].strip(" -")
+                    
+                    search_key = super_clean_string(final_account_name)
+                    if search_key:
+                        # Direct containment or intersection checking to bypass string artifact matching failures
+                        match_cust = cust_df[cust_df['Account Name Clean'].apply(lambda x: search_key in str(x) or str(x) in search_key)]
+                        
+                        if match_cust.empty:
+                            # Advanced token check: look for first two primary words overlapping
+                            search_tokens = search_key.split()
+                            if len(search_tokens) >= 2:
+                                token_key = " ".join(search_tokens[:2])
+                                match_cust = cust_df[cust_df['Account Name Clean'].str.contains(token_key, na=False)]
+
+                        if not match_cust.empty:
+                            customer_account_num = str(match_cust.iloc[0][acct_col]).strip()
+                            final_account_name = str(match_cust.iloc[0][name_col]).strip()
+                    
+                    credit_desc = f"MPP {customer_account_num} {final_account_name}_{boa_reference_desc}" if is_inst else f"{customer_account_num} {final_account_name}_{boa_reference_desc}"
+                    
+                    journal_rows.append({
+                        "Date": boa_date, "Voucher": "", "Account name": final_account_name, "Company": company_id,
+                        "Account type": "Customer", "Account": customer_account_num, "Posting profile": "AutoPost",
+                        "Cash code": cash_code, "Description": credit_desc
