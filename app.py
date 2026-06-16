@@ -44,12 +44,9 @@ def super_clean_string(text):
     if pd.isna(text) or text is None:
         return ""
     txt = str(text).lower()
-    # Strip email blocks completely if they are stuck to the name string
     txt = re.sub(r'\S+@\S+', '', txt)
     txt = re.sub(r'\b(com|org|net|edu|gov)\b', '', txt)
-    # Strip non-alphanumeric artifacts, punctuation, and hyphens completely
     cleaned = re.sub(r'[^a-zA-Z0-9\s]', ' ', txt)
-    # Strip common corporate designations to isolate core matching tokens
     cleaned = re.sub(r'\b(llc|pllc|inc|corp|co|incorporated|limited|llp)\b', ' ', cleaned)
     return " ".join(cleaned.split())
 
@@ -97,26 +94,31 @@ if gateway_file and boa_file:
             
             boa_desc_col = next((c for c in boa_df.columns if 'desc' in c.lower() or 'text' in c.lower()), boa_df.columns[1])
             boa_date_col_name = next((c for c in boa_df.columns if 'date' in c.lower() or 'post' in c.lower()), boa_df.columns[0])
+            boa_amount_col = next((c for c in boa_df.columns if 'amount' in c.lower() or 'amt' in c.lower()), boa_df.columns[2])
             
             is_stripe = boa_df[boa_df[boa_desc_col].astype(str).str.contains('STRIPE', case=False, na=False)]
             is_zoho = boa_df[boa_df[boa_desc_col].astype(str).str.contains('ZOHO PAYMENTS', case=False, na=False)]
             
             boa_date = ""
             boa_reference_desc = "PROCESSING CLEARANCE SETTLEMENT"
+            boa_net_deposit = 0.0
             
             if not is_stripe.empty:
                 engine_mode = "STRIPE"
                 boa_date = str(is_stripe.iloc[0][boa_date_col_name]).strip()
                 boa_reference_desc = str(is_stripe.iloc[0][boa_desc_col]).strip()
+                boa_net_deposit = abs(float(str(is_stripe.iloc[0][boa_amount_col]).replace(',', '').replace('$', '')))
             elif not is_zoho.empty:
                 engine_mode = "ZOHO"
                 boa_date = str(is_zoho.iloc[0][boa_date_col_name]).strip()
                 boa_reference_desc = str(is_zoho.iloc[0][boa_desc_col]).strip()
+                boa_net_deposit = abs(float(str(is_zoho.iloc[0][boa_amount_col]).replace(',', '').replace('$', '')))
             else:
                 engine_mode = "ZOHO"
                 if not boa_df.empty:
                     boa_date = str(boa_df.iloc[0][boa_date_col_name]).strip()
                     boa_reference_desc = str(boa_df.iloc[0][boa_desc_col]).strip()
+                    boa_net_deposit = abs(float(str(boa_df.iloc[0][boa_amount_col]).replace(',', '').replace('$', '')))
 
             journal_rows = []
 
@@ -128,23 +130,18 @@ if gateway_file and boa_file:
                 
                 pdf_text = extract_text_from_pdf(gateway_file)
                 charge_blocks = []
-                stripe_fee_accumulator = 0.0
+                total_extracted_gross = 0.0
                 
                 lines = [l.strip() for l in pdf_text.split('\n') if l.strip()]
                 for idx, line in enumerate(lines):
                     line_lower = line.lower()
-                    if "stripe fee" in line_lower:
-                        fee_matches = [float(amt.replace('$', '').replace('USD', '').strip()) for amt in re.findall(r'-\s*\d+\.\d{2}', line)]
-                        if fee_matches:
-                            stripe_fee_accumulator += sum(fee_matches)
                     
-                    elif "charge" in line_lower and ("plan" in line_lower or "agreement" in line_lower):
+                    if "charge" in line_lower and ("plan" in line_lower or "agreement" in line_lower):
                         amounts = [float(amt.replace(',', '')) for amt in re.findall(r'\d+(?:,\d{3})*(?:\.\d{2})', line)]
                         
                         if amounts:
                             gross_amt = amounts[0]
-                            row_fee = abs(amounts[1]) if len(amounts) > 1 else 0.0
-                            stripe_fee_accumulator += row_fee
+                            total_extracted_gross += gross_amt
                             
                             extracted_name = "Unknown Customer"
                             if "agreement -" in line_lower:
@@ -174,20 +171,17 @@ if gateway_file and boa_file:
                     
                     search_key = super_clean_string(final_account_name)
                     if search_key:
-                        # 1. Direct match check
                         match_cust = cust_df[cust_df['Account Name Clean'].apply(lambda x: search_key in str(x) or str(x) in search_key)]
                         
-                        # 2. Token overlap check (solves spelling variation bugs permanently)
                         if match_cust.empty:
                             search_tokens = set(search_key.split())
                             best_match_row = None
                             max_overlap = 0
                             
                             for m_idx, m_row in cust_df.iterrows():
-                                master_tokens = set(str(m_row['Account Name Clean']).split())
+                                master_tokens = set(str(m_row['Account Name Clean'].split()))
                                 overlap = len(search_tokens.intersection(master_tokens))
                                 
-                                # If at least 2 primary words overlap, map the record safely
                                 if overlap >= 2 and overlap > max_overlap:
                                     max_overlap = overlap
                                     best_match_row = m_row
@@ -211,14 +205,17 @@ if gateway_file and boa_file:
                         "Reversing entry": "No", "Reversing date": ""
                     })
                 
-                # Step 3: Add Stripe Merchant Fee row
-                if stripe_fee_accumulator > 0:
+                # Step 3: Global Balanced Calculation for Stripe Merchant Fees
+                # (Total Extracted Customer Gross - Net Bank Amount Detected) = Total True Merchant Fees
+                calculated_stripe_fee = round(total_extracted_gross - boa_net_deposit, 2)
+                
+                if calculated_stripe_fee > 0:
                     merchant_cash_code = dynamic_cash_code_lookup("Stripe Merchant Fee", "OSF005")
                     debit_desc = f"Stripe Merchant Fee_{boa_reference_desc}"
                     journal_rows.append({
                         "Date": boa_date, "Voucher": "", "Account name": "Outside Service (Finance)", "Company": company_id,
                         "Account type": "Ledger", "Account": debit_ledger_acct, "Posting profile": "",
-                        "Cash code": merchant_cash_code, "Description": debit_desc, "Debit": round(abs(stripe_fee_accumulator), 2), "Credit": "",
+                        "Cash code": merchant_cash_code, "Description": debit_desc, "Debit": calculated_stripe_fee, "Credit": "",
                         "Item sales tax group": "", "Sales tax code": "", "Offset company": company_id, "Offset account type": "Bank",
                         "Offset account": offset_account, "Offset transaction text": "", "Currency": "USD", "Exchange rate": 1.00,
                         "Item sales tax group2": "", "Sales tax group": "AVATAX", "Withholding tax group": "", "Release date": "",
