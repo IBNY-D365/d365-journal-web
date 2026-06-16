@@ -166,11 +166,9 @@ if gateway_file and boa_file:
                     
                     search_key = super_clean_string(final_account_name)
                     if search_key:
-                        # Direct containment or intersection checking to bypass string artifact matching failures
                         match_cust = cust_df[cust_df['Account Name Clean'].apply(lambda x: search_key in str(x) or str(x) in search_key)]
                         
                         if match_cust.empty:
-                            # Advanced token check: look for first two primary words overlapping
                             search_tokens = search_key.split()
                             if len(search_tokens) >= 2:
                                 token_key = " ".join(search_tokens[:2])
@@ -185,4 +183,127 @@ if gateway_file and boa_file:
                     journal_rows.append({
                         "Date": boa_date, "Voucher": "", "Account name": final_account_name, "Company": company_id,
                         "Account type": "Customer", "Account": customer_account_num, "Posting profile": "AutoPost",
-                        "Cash code": cash_code, "Description": credit_desc
+                        "Cash code": cash_code, "Description": credit_desc, "Debit": "", "Credit": gross_val,
+                        "Item sales tax group": "", "Sales tax code": "", "Offset company": company_id, "Offset account type": "Bank",
+                        "Offset account": offset_account, "Offset transaction text": "", "Currency": "USD", "Exchange rate": 1.00,
+                        "Item sales tax group2": "", "Sales tax group": "AVATAX", "Withholding tax group": "", "Release date": "",
+                        "Reversing entry": "No", "Reversing date": ""
+                    })
+                
+                # Step 3: Add Stripe Merchant Fee row
+                if stripe_fee_accumulator > 0:
+                    merchant_cash_code = dynamic_cash_code_lookup("Stripe Merchant Fee", "OSF005")
+                    debit_desc = f"Stripe Merchant Fee_{boa_reference_desc}"
+                    journal_rows.append({
+                        "Date": boa_date, "Voucher": "", "Account name": "Outside Service (Finance)", "Company": company_id,
+                        "Account type": "Ledger", "Account": debit_ledger_acct, "Posting profile": "",
+                        "Cash code": merchant_cash_code, "Description": debit_desc, "Debit": round(abs(stripe_fee_accumulator), 2), "Credit": "",
+                        "Item sales tax group": "", "Sales tax code": "", "Offset company": company_id, "Offset account type": "Bank",
+                        "Offset account": offset_account, "Offset transaction text": "", "Currency": "USD", "Exchange rate": 1.00,
+                        "Item sales tax group2": "", "Sales tax group": "AVATAX", "Withholding tax group": "", "Release date": "",
+                        "Reversing entry": "No", "Reversing date": ""
+                    })
+
+            # ==========================================
+            # ENGINE MODE 2: ZOHO RECONCILIATION ENGINE
+            # ==========================================
+            else:
+                st.info("⚙️ Running Engine Mode: Zoho Corporate Payment Pipeline")
+                invoice_terms = "receipt"
+                extracted_payer_from_invoice = ""
+                
+                if invoice_file and invoice_file.name.endswith('.pdf'):
+                    pdf_text_raw = extract_text_from_pdf(invoice_file)
+                    pdf_text_clean = super_clean_string(pdf_text_raw)
+                    if 'monthly' in pdf_text_clean or 'mpp' in pdf_text_clean:
+                        invoice_terms = "monthly"
+                    
+                    lines = [l.strip() for l in pdf_text_raw.split('\n') if l.strip()]
+                    for idx, line in enumerate(lines):
+                        if "bill to" in line.lower() or "invoice to" in line.lower():
+                            if idx + 1 < len(lines):
+                                extracted_payer_from_invoice = lines[idx + 1].strip()
+                                break
+                
+                if gateway_file.name.endswith('.csv'):
+                    zoho_df = pd.read_csv(gateway_file)
+                else:
+                    zoho_df = pd.read_excel(gateway_file, engine='openpyxl')
+                zoho_df.columns = [str(col).strip() for col in zoho_df.columns]
+                
+                zoho_gross_col = "Amount" if "Amount" in zoho_df.columns else zoho_df.columns[3]
+                zoho_fee_col = "Fee" if "Fee" in zoho_df.columns else zoho_df.columns[4]
+                zoho_cust_col = "CustomerName" if "CustomerName" in zoho_df.columns else None
+                
+                for idx, row in zoho_df.iterrows():
+                    payer_name = str(row[zoho_cust_col]).strip() if zoho_cust_col and zoho_cust_col in zoho_df.columns else ""
+                    if not payer_name or payer_name == "nan" or "inbody" in payer_name.lower():
+                        payer_name = extracted_payer_from_invoice if extracted_payer_from_invoice else "Unknown Payer"
+                    
+                    customer_account_num = "MISSING_ACCT"
+                    final_account_name = payer_name
+                    
+                    search_key = super_clean_string(final_account_name)
+                    if search_key:
+                        match_cust = cust_df[cust_df['Account Name Clean'].str.contains(search_key, na=False)]
+                        if not match_cust.empty:
+                            customer_account_num = str(match_cust.iloc[0][acct_col]).strip()
+                            final_account_name = str(match_cust.iloc[0][name_col]).strip()
+                    
+                    gross_amt = abs(float(str(row[zoho_gross_col]).replace(',', '')))
+                    fee_amt = abs(float(str(row[zoho_fee_col]).replace(',', '')))
+                    
+                    cash_code = dynamic_cash_code_lookup("Installment" if invoice_terms == "monthly" else "Receipt", "AR002" if invoice_terms == "monthly" else "AR001")
+                    credit_desc = f"MPP {customer_account_num} {final_account_name}_{boa_reference_desc}" if invoice_terms == "monthly" else f"{customer_account_num} {final_account_name}_{boa_reference_desc}"
+                    
+                    journal_rows.append({
+                        "Date": boa_date, "Voucher": "", "Account name": final_account_name, "Company": company_id,
+                        "Account type": "Customer", "Account": customer_account_num, "Posting profile": "AutoPost",
+                        "Cash code": cash_code, "Description": credit_desc, "Debit": "", "Credit": gross_amt,
+                        "Item sales tax group": "", "Sales tax code": "", "Offset company": company_id, "Offset account type": "Bank",
+                        "Offset account": offset_account, "Offset transaction text": "", "Currency": "USD", "Exchange rate": 1.00,
+                        "Item sales tax group2": "", "Sales tax group": "AVATAX", "Withholding tax group": "", "Release date": "",
+                        "Reversing entry": "No", "Reversing date": ""
+                    })
+                    
+                    if fee_amt > 0:
+                        debit_desc = f"Zoho Merchant Fee {customer_account_num}_{final_account_name}_{boa_reference_desc}"
+                        journal_rows.append({
+                            "Date": boa_date, "Voucher": "", "Account name": "Outside Service (Finance)", "Company": company_id,
+                            "Account type": "Ledger", "Account": debit_ledger_acct, "Posting profile": "",
+                            "Cash code": "OSF005", "Description": debit_desc, "Debit": fee_amt, "Credit": "",
+                            "Item sales tax group": "", "Sales tax code": "", "Offset company": company_id, "Offset account type": "Bank",
+                            "Offset account": offset_account, "Offset transaction text": "", "Currency": "USD", "Exchange rate": 1.00,
+                            "Item sales tax group2": "", "Sales tax group": "AVATAX", "Withholding tax group": "", "Release date": "",
+                            "Reversing entry": "No", "Reversing date": ""
+                        })
+
+            # Create final structured 25-column template layout output
+            columns_25 = [
+                "Date", "Voucher", "Account name", "Company", "Account type", "Account",
+                "Posting profile", "Cash code", "Description", "Debit", "Credit",
+                "Item sales tax group", "Sales tax code", "Offset company", "Offset account type", "Offset account",
+                "Offset transaction text", "Currency", "Exchange rate", "Item sales tax group2",
+                "Sales tax group", "Withholding tax group", "Release date", "Reversing entry", "Reversing date"
+            ]
+            
+            final_df = pd.DataFrame(journal_rows)
+            if not final_df.empty:
+                final_df = final_df.reindex(columns=columns_25).fillna("")
+                st.success("🎉 Cross-matched and balanced journal entries created seamlessly!")
+                st.dataframe(final_df)
+                
+                csv_data = final_df.to_csv(index=False).encode('utf-8')
+                st.download_button(
+                    label="📥 Download Perfect D365 Upload CSV",
+                    data=csv_data,
+                    file_name="D365_Reconciliation_Journal.csv",
+                    mime="text/csv"
+                )
+            else:
+                st.warning("⚠️ No valid transaction entries found to process.")
+            
+    except Exception as e:
+        st.error(f"❌ Automation mapping process failed: {str(e)}")
+else:
+    st.info("💡 Please upload your Gateway File (Zoho or Stripe) and Bank of America statement to activate the automated alignment engine.")
