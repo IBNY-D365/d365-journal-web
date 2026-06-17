@@ -18,6 +18,7 @@ debit_ledger_acct = st.sidebar.text_input("Debit Line Account", value="43170111-
 # Hardcoded exact repository filenames visible in GitHub
 MASTER_FILE_NAME = "Customer Master Account File.xlsx"
 CASH_CODE_FILE = "Cash Code Masterlist.xlsx"
+BOA_EXPENSES_FILE = "BOA3371 Expenses List.xlsx - BOA3371.csv"
 
 # 2. THREE-FILE UPLOADERS
 col1, col2, col3 = st.columns(3)
@@ -78,7 +79,14 @@ if gateway_file and boa_file:
                     return str(match.iloc[0][cc_code_col]).strip()
                 return fallback
 
-            # C. Load Bank of America File & Detect Settlement Engine
+            # C. Load BOA Expenses Mapping Guide
+            if os.path.exists(BOA_EXPENSES_FILE):
+                exp_df = pd.read_csv(BOA_EXPENSES_FILE, skiprows=1)
+                exp_df.columns = [str(col).strip() for col in exp_df.columns]
+            else:
+                exp_df = pd.DataFrame()
+
+            # D. Load Bank of America File & Clean Headings
             if boa_file.name.endswith('.csv'):
                 boa_lines = boa_file.getvalue().decode('utf-8', errors='ignore').splitlines()
                 skip_count = 0
@@ -87,17 +95,18 @@ if gateway_file and boa_file:
                         break
                     skip_count += 1
                 boa_file.seek(0)
-                boa_df = pd.read_csv(boa_file, skiprows=skip_count)
+                boa_all_df = pd.read_csv(boa_file, skiprows=skip_count)
             else:
-                boa_df = pd.read_excel(boa_file, engine='openpyxl')
-            boa_df.columns = [str(col).strip() for col in boa_df.columns]
+                boa_all_df = pd.read_excel(boa_file, engine='openpyxl')
             
-            boa_desc_col = next((c for c in boa_df.columns if 'desc' in c.lower() or 'text' in c.lower()), boa_df.columns[1])
-            boa_date_col_name = next((c for c in boa_df.columns if 'date' in c.lower() or 'post' in c.lower()), boa_df.columns[0])
-            boa_amount_col = next((c for c in boa_df.columns if 'amount' in c.lower() or 'amt' in c.lower()), boa_df.columns[2])
-            
-            is_stripe = boa_df[boa_df[boa_desc_col].astype(str).str.contains('STRIPE', case=False, na=False)]
-            is_zoho = boa_df[boa_df[boa_desc_col].astype(str).str.contains('ZOHO PAYMENTS', case=False, na=False)]
+            boa_all_df.columns = [str(col).strip() for col in boa_all_df.columns]
+            boa_desc_col = next((c for c in boa_all_df.columns if 'desc' in c.lower() or 'text' in c.lower()), boa_all_df.columns[1])
+            boa_date_col_name = next((c for c in boa_all_df.columns if 'date' in c.lower() or 'post' in c.lower()), boa_all_df.columns[0])
+            boa_amount_col = next((c for c in boa_all_df.columns if 'amount' in c.lower() or 'amt' in c.lower()), boa_all_df.columns[2])
+
+            # Isolate the explicit Engine Row for Stripe/Zoho Settlements
+            is_stripe = boa_all_df[boa_all_df[boa_desc_col].astype(str).str.contains('STRIPE', case=False, na=False)]
+            is_zoho = boa_all_df[boa_all_df[boa_desc_col].astype(str).str.contains('ZOHO PAYMENTS', case=False, na=False)]
             
             boa_date = ""
             boa_reference_desc = "PROCESSING CLEARANCE SETTLEMENT"
@@ -115,10 +124,10 @@ if gateway_file and boa_file:
                 boa_net_deposit = abs(float(str(is_zoho.iloc[0][boa_amount_col]).replace(',', '').replace('$', '')))
             else:
                 engine_mode = "ZOHO"
-                if not boa_df.empty:
-                    boa_date = str(boa_df.iloc[0][boa_date_col_name]).strip()
-                    boa_reference_desc = str(boa_df.iloc[0][boa_desc_col]).strip()
-                    boa_net_deposit = abs(float(str(boa_df.iloc[0][boa_amount_col]).replace(',', '').replace('$', '')))
+                if not boa_all_df.empty:
+                    boa_date = str(boa_all_df.iloc[0][boa_date_col_name]).strip()
+                    boa_reference_desc = str(boa_all_df.iloc[0][boa_desc_col]).strip()
+                    boa_net_deposit = abs(float(str(boa_all_df.iloc[0][boa_amount_col]).replace(',', '').replace('$', '')))
 
             journal_rows = []
 
@@ -158,7 +167,6 @@ if gateway_file and boa_file:
                                 "is_installment": "installment" in line_lower
                             })
 
-                # Step 2: Generate entries with word-token matching logic
                 for charge in charge_blocks:
                     gross_val = charge["gross"]
                     is_inst = charge["is_installment"]
@@ -179,7 +187,7 @@ if gateway_file and boa_file:
                             max_overlap = 0
                             
                             for m_idx, m_row in cust_df.iterrows():
-                                master_tokens = set(str(m_row['Account Name Clean'].split()))
+                                master_tokens = set(str(m_row['Account Name Clean']).split())
                                 overlap = len(search_tokens.intersection(master_tokens))
                                 
                                 if overlap >= 2 and overlap > max_overlap:
@@ -205,8 +213,6 @@ if gateway_file and boa_file:
                         "Reversing entry": "No", "Reversing date": ""
                     })
                 
-                # Step 3: Global Balanced Calculation for Stripe Merchant Fees
-                # (Total Extracted Customer Gross - Net Bank Amount Detected) = Total True Merchant Fees
                 calculated_stripe_fee = round(total_extracted_gross - boa_net_deposit, 2)
                 
                 if calculated_stripe_fee > 0:
@@ -295,6 +301,50 @@ if gateway_file and boa_file:
                             "Item sales tax group2": "", "Sales tax group": "AVATAX", "Withholding tax group": "", "Release date": "",
                             "Reversing entry": "No", "Reversing date": ""
                         })
+
+            # ==========================================
+            # STEP E: AUTOMATED BANK STATEMENT EXPENSE INGESTION
+            # ==========================================
+            if not exp_df.empty:
+                for idx, r_row in boa_all_df.iterrows():
+                    raw_desc = str(r_row[boa_desc_col]).strip()
+                    raw_amt_str = str(r_row[boa_amount_col]).replace(',', '').replace('$', '').strip()
+                    
+                    try:
+                        raw_amt = float(raw_amt_str)
+                    except ValueError:
+                        continue
+                        
+                    # Process lines where corporate funds were debited (spent)
+                    if raw_amt < 0:
+                        debit_value = abs(raw_amt)
+                        
+                        # Check statement descriptions against your Expense Matrix mapping guide
+                        for e_idx, e_row in exp_df.iterrows():
+                            lookup_keyword = str(e_row['Bank Transaction Description']).split('*')[0].split()[0].strip().lower()
+                            
+                            if lookup_keyword and lookup_keyword in raw_desc.lower():
+                                map_name = str(e_row['Account name']).strip()
+                                map_type = str(e_row['Account type']).strip()
+                                map_acct = str(e_row['Account']).strip()
+                                map_cc = str(e_row['Cash code']).strip() if 'Cash code' in e_row else "SP001"
+                                map_desc_base = str(e_row['Description']).strip()
+                                
+                                # Profile defaults: Blank out for Ledger entries, mark 'AutoPost' for Vendors
+                                profile_flag = "AutoPost" if map_type.lower() == "vendor" else ""
+                                combined_desc = f"{map_desc_base}_{raw_desc}"
+                                t_date = str(r_row[boa_date_col_name]).strip()
+                                
+                                journal_rows.append({
+                                    "Date": t_date, "Voucher": "", "Account name": map_name, "Company": company_id,
+                                    "Account type": map_type, "Account": map_acct, "Posting profile": profile_flag,
+                                    "Cash code": map_cc, "Description": combined_desc, "Debit": debit_value, "Credit": "",
+                                    "Item sales tax group": "", "Sales tax code": "", "Offset company": company_id, "Offset account type": "Bank",
+                                    "Offset account": offset_account, "Offset transaction text": "", "Currency": "USD", "Exchange rate": 1.00,
+                                    "Item sales tax group2": "", "Sales tax group": "AVATAX", "Withholding tax group": "", "Release date": "",
+                                    "Reversing entry": "No", "Reversing date": ""
+                                })
+                                break
 
             # Create final structured 25-column template layout output
             columns_25 = [
