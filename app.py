@@ -7,17 +7,20 @@ from pypdf import PdfReader
 # ─── PAGE CONFIG ─────────────────────────────────────────────────────────────
 st.set_page_config(page_title="D365 Accounting Journal Generator", layout="wide")
 st.title("📊 D365 Zoho, Stripe & BOA Journal Generator")
-st.write("Upload your daily processing packages below to build your flawless 25-column D365 upload templates.")
+st.write("Upload your daily processing packages below to build your D365 upload templates.")
 
 # ─── SIDEBAR ─────────────────────────────────────────────────────────────────
 st.sidebar.header("⚙️ Fixed D365 Settings")
-company_id        = st.sidebar.text_input("Company",                    value="bwa")
-offset_account    = st.sidebar.text_input("Offset Account",             value="B1000002")
-debit_ledger_acct = st.sidebar.text_input("Debit Line Account (Ledger)",value="43170111-U26C05001-B735350-UOA003")
+company_id = st.sidebar.text_input("Company", value="bwa")
+offset_account = st.sidebar.text_input("Offset Account", value="B1000002")
+debit_ledger_acct = st.sidebar.text_input(
+    "Debit Line Account (Ledger)",
+    value="43170111-U26C05001-B735350-UOA003",
+)
 
 # Repo-level lookup filenames (must be committed in the same GitHub directory as app.py)
-MASTER_FILE_NAME  = "Customer Master Account File.xlsx"
-CASH_CODE_FILE    = "Cash Code Masterlist.xlsx"
+MASTER_FILE_NAME = "Customer Master Account File.xlsx"
+CASH_CODE_FILE = "Cash Code Masterlist.xlsx"
 
 # ─── FILE UPLOADERS ──────────────────────────────────────────────────────────
 col1, col2, col3 = st.columns(3)
@@ -72,10 +75,14 @@ def lookup_customer(name, cust_df, acct_col, name_col):
     key = clean_for_match(name)
     if not key:
         return "MISSING_ACCT", name
+
+    # Exact / containment match first
     mask = cust_df["_name_clean"].apply(lambda x: key in x or x in key)
-    hit  = cust_df[mask]
+    hit = cust_df[mask]
     if not hit.empty:
         return str(hit.iloc[0][acct_col]).strip(), str(hit.iloc[0][name_col]).strip()
+
+    # Token overlap fallback
     key_tok = set(key.split())
     best, best_s = None, 0
     for _, row in cust_df.iterrows():
@@ -84,26 +91,36 @@ def lookup_customer(name, cust_df, acct_col, name_col):
             best_s, best = s, row
     if best is not None:
         return str(best[acct_col]).strip(), str(best[name_col]).strip()
+
     return "MISSING_ACCT", name
 
 
 def cc_lookup(term, cc_df, term_col, code_col, fallback=""):
     """
     Match term against Cash Code Masterlist.
-    Returns matched code, or fallback (default blank — caller passes "" for expenses).
+    Returns matched code, or fallback (default blank).
     """
     key = clean_for_match(term)
     if not key:
         return fallback
+
     mask = cc_df["_term_clean"].str.contains(key, na=False)
     if not mask.any():
         mask = cc_df["_term_clean"].apply(lambda t: bool(t) and t in key)
+
     return str(cc_df[mask].iloc[0][code_col]).strip() if mask.any() else fallback
 
 
 def parse_invoice_term(text) -> str:
     lower = text.lower()
-    return "monthly" if any(k in lower for k in ("monthly payment", "monthly plan", "mpp", "installment")) else "receipt"
+
+    if "due on receipt" in lower:
+        return "receipt"
+
+    if any(k in lower for k in ("monthly payment", "monthly plan", "mpp", "installment")):
+        return "monthly"
+
+    return "receipt"
 
 
 def parse_invoice_customer(text) -> str:
@@ -114,10 +131,55 @@ def parse_invoice_customer(text) -> str:
     return ""
 
 
-def make_row(date, company, acct_name, acct_type, acct_num,
-             posting_profile, cash_code, description,
-             debit, credit,
-             off_company, off_acct_type, off_acct) -> dict:
+def parse_invoice_number(text) -> str:
+    patterns = [
+        r'INV-\d+',
+        r'Invoice\s*#\s*(INV-\d+)',
+        r'Purchase\s*#\s*(INV-\d+)',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.I)
+        if match:
+            if match.groups():
+                return match.group(1).strip()
+            return match.group(0).strip()
+    return ""
+
+
+def extract_invoice_name_map(invoice_files_list):
+    """Build invoice number -> {customer, term, file_name}."""
+    invoice_map = {}
+    for inv in (invoice_files_list or []):
+        if not inv.name.lower().endswith(".pdf"):
+            continue
+
+        text = extract_text_from_pdf(inv)
+        invoice_no = parse_invoice_number(text)
+        customer_name = parse_invoice_customer(text)
+        term = parse_invoice_term(text)
+
+        if invoice_no:
+            invoice_map[invoice_no] = {
+                "customer": customer_name,
+                "term": term,
+                "file_name": inv.name,
+            }
+    return invoice_map
+
+
+def extract_invoice_number_from_text(text: str) -> str:
+    if not text:
+        return ""
+    match = re.search(r'INV-\d+', text, re.I)
+    return match.group(0).strip() if match else ""
+
+
+def make_row(
+    date, company, acct_name, acct_type, acct_num,
+    posting_profile, cash_code, description,
+    debit, credit,
+    off_company, off_acct_type, off_acct
+) -> dict:
     return {
         "Date": date, "Voucher": "", "Account name": acct_name,
         "Company": company, "Account type": acct_type, "Account": acct_num,
@@ -144,57 +206,51 @@ COLUMNS_25 = [
 ]
 
 # ─── Known BOA keyword → Cash Code map ───────────────────────────────────────
-# These are hard-matched first before falling back to Cash Code Masterlist fuzzy.
-# Add rows here whenever you want to pin a specific vendor to a specific code.
 BOA_KEYWORD_MAP = {
-    # keyword (lowercase, first meaningful token or unique phrase) : cash_code
-    "amazon"        : "SP001",   # Office Supplies
-    "amzn"          : "SP001",
-    "adobe"         : "OSD005",  # Common Subscriptions
-    "microsoft"     : "OSD005",
-    "google"        : "OSD005",
-    "zoom"          : "OSD005",
-    "dropbox"       : "OSD005",
-    "fedex"         : "SC004",   # Shipping Cost (Other)
-    "ups"           : "SC004",
-    "usps"          : "SC004",
-    "uber"          : "TD004",   # Travel Domestic Uber/Taxi
-    "lyft"          : "TD004",
-    "delta"         : "TD002",   # Travel Flight
-    "united"        : "TD002",
-    "american air"  : "TD002",
-    "hilton"        : "TD003",   # Hotel
-    "marriott"      : "TD003",
-    "guardian"      : "OSI002",  # Office Alarm
-    "taskrabbit"    : "OSO007",
-    # IRS, NJ WEB PMT, and similar government payments intentionally omitted → blank
+    "amazon": "SP001",
+    "amzn": "SP001",
+    "adobe": "OSD005",
+    "microsoft": "OSD005",
+    "google": "OSD005",
+    "zoom": "OSD005",
+    "dropbox": "OSD005",
+    "fedex": "SC004",
+    "ups": "SC004",
+    "usps": "SC004",
+    "uber": "TD004",
+    "lyft": "TD004",
+    "delta": "TD002",
+    "united": "TD002",
+    "american air": "TD002",
+    "hilton": "TD003",
+    "marriott": "TD003",
+    "guardian": "OSI002",
+    "taskrabbit": "OSO007",
 }
 
-# ─── Categorise a BOA expense row ─────────────────────────────────────────────
+
 def categorise_boa_expense(desc: str, cc_df, term_col, code_col) -> str:
     """
     Return cash code for a BOA debit line.
-    1. Check BOA_KEYWORD_MAP (hard pins).
-    2. Try fuzzy match against Cash Code Masterlist name column.
-    3. Return "" (blank) if no match — per spec.
+    1. Check BOA_KEYWORD_MAP.
+    2. Try fuzzy against Cash Code Masterlist.
+    3. Return blank if no match.
     """
     desc_lower = desc.lower()
 
-    # Pass 1: keyword map
     for kw, code in BOA_KEYWORD_MAP.items():
         if kw in desc_lower:
             return code
 
-    # Pass 2: fuzzy against masterlist names (use first 3 tokens of BOA desc as search term)
     tokens = re.sub(r'[^a-z0-9\s]', ' ', desc_lower).split()[:3]
     for token in tokens:
-        if len(token) < 4:   # skip short noise tokens
+        if len(token) < 4:
             continue
         result = cc_lookup(token, cc_df, term_col, code_col, fallback="")
         if result:
             return result
 
-    return ""   # no match → blank per spec
+    return ""
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -208,8 +264,7 @@ if gateway_file and boa_file:
         # ── Guard: repo master files must exist ───────────────────────────────
         if not os.path.exists(MASTER_FILE_NAME) or not os.path.exists(CASH_CODE_FILE):
             st.error(
-                f"❌ Missing lookup files. Ensure '{MASTER_FILE_NAME}' and "
-                f"'{CASH_CODE_FILE}' are committed to the repository."
+                f"❌ Missing lookup files. Ensure '{MASTER_FILE_NAME}' and '{CASH_CODE_FILE}' are committed to the repository."
             )
             st.stop()
 
@@ -217,20 +272,14 @@ if gateway_file and boa_file:
         cust_df = pd.read_excel(MASTER_FILE_NAME, engine="openpyxl")
         cust_df.columns = [str(c).strip() for c in cust_df.columns]
         acct_col = next(
-            (c for c in cust_df.columns
-             if re.search(r'\baccount\b', c, re.I) and not re.search(r'name|type|desc', c, re.I)),
+            (c for c in cust_df.columns if re.search(r'\baccount\b', c, re.I) and not re.search(r'name|type|desc', c, re.I)),
             cust_df.columns[1],
         )
-        name_col = next(
-            (c for c in cust_df.columns if re.search(r'name', c, re.I)),
-            cust_df.columns[2],
-        )
+        name_col = next((c for c in cust_df.columns if re.search(r'name', c, re.I)), cust_df.columns[2])
         cust_df["_name_clean"] = cust_df[name_col].apply(clean_for_match)
 
         # ── Load Cash Code Masterlist ─────────────────────────────────────────
-        # The file has a two-row header; row index 1 contains actual column names.
         cc_raw = pd.read_excel(CASH_CODE_FILE, engine="openpyxl", header=None)
-        # Find the row that contains "Cash Code" as the header
         header_row = 0
         for i, row in cc_raw.iterrows():
             if any(str(v).strip().lower() == "cash code" for v in row):
@@ -238,15 +287,8 @@ if gateway_file and boa_file:
                 break
         cc_df = pd.read_excel(CASH_CODE_FILE, engine="openpyxl", skiprows=header_row)
         cc_df.columns = [str(c).strip() for c in cc_df.columns]
-        # Drop rows where Cash Code is NaN (blank separators / repeated headers)
-        cc_code_col = next(
-            (c for c in cc_df.columns if re.search(r'cash\s*code', c, re.I)),
-            cc_df.columns[0],
-        )
-        cc_name_col = next(
-            (c for c in cc_df.columns if re.search(r'name|desc', c, re.I)),
-            cc_df.columns[1],
-        )
+        cc_code_col = next((c for c in cc_df.columns if re.search(r'cash\s*code', c, re.I)), cc_df.columns[0])
+        cc_name_col = next((c for c in cc_df.columns if re.search(r'name|desc', c, re.I)), cc_df.columns[1])
         cc_df = cc_df.dropna(subset=[cc_code_col])
         cc_df = cc_df[cc_df[cc_code_col].astype(str).str.strip() != "Cash Code"]
         cc_df["_term_clean"] = cc_df[cc_name_col].apply(clean_for_match)
@@ -265,11 +307,10 @@ if gateway_file and boa_file:
             boa_df = pd.read_excel(boa_file, engine="openpyxl")
 
         boa_df.columns = [str(c).strip() for c in boa_df.columns]
-        boa_date_col = next((c for c in boa_df.columns if re.search(r'date|post', c, re.I)),   boa_df.columns[0])
+        boa_date_col = next((c for c in boa_df.columns if re.search(r'date|post', c, re.I)), boa_df.columns[0])
         boa_desc_col = next((c for c in boa_df.columns if re.search(r'desc|text|memo', c, re.I)), boa_df.columns[1])
-        boa_amt_col  = next((c for c in boa_df.columns if re.search(r'amount|amt', c, re.I)),  boa_df.columns[2])
+        boa_amt_col = next((c for c in boa_df.columns if re.search(r'amount|amt', c, re.I)), boa_df.columns[2])
 
-        # Drop summary / balance rows (no valid date or amount)
         boa_df = boa_df[boa_df[boa_amt_col].notna()]
         boa_df = boa_df[boa_df[boa_amt_col].astype(str).str.strip() != ""]
         boa_df["_amt_float"] = boa_df[boa_amt_col].apply(safe_float)
@@ -277,28 +318,33 @@ if gateway_file and boa_file:
 
         # ── Detect engine mode ────────────────────────────────────────────────
         stripe_rows = boa_df[boa_df[boa_desc_col].astype(str).str.contains("STRIPE", case=False, na=False)]
-        zoho_rows   = boa_df[boa_df[boa_desc_col].astype(str).str.contains("ZOHO PAYMENTS", case=False, na=False)]
+        zoho_rows = boa_df[boa_df[boa_desc_col].astype(str).str.contains("ZOHO PAYMENTS", case=False, na=False)]
 
         if not stripe_rows.empty or gateway_file.name.lower().endswith(".pdf"):
-            engine_mode       = "STRIPE"
-            boa_settlement    = stripe_rows.iloc[0] if not stripe_rows.empty else boa_df.iloc[0]
+            engine_mode = "STRIPE"
+            boa_settlement = stripe_rows.iloc[0] if not stripe_rows.empty else boa_df.iloc[0]
         else:
-            engine_mode       = "ZOHO"
-            boa_settlement    = zoho_rows.iloc[0] if not zoho_rows.empty else boa_df.iloc[0]
+            engine_mode = "ZOHO"
+            boa_settlement = zoho_rows.iloc[0] if not zoho_rows.empty else boa_df.iloc[0]
 
-        boa_date        = str(boa_settlement[boa_date_col]).strip()
-        boa_ref_desc    = str(boa_settlement[boa_desc_col]).strip()
+        boa_date = str(boa_settlement[boa_date_col]).strip()
+        boa_ref_desc = str(boa_settlement[boa_desc_col]).strip()
         boa_net_deposit = abs(safe_float(boa_settlement[boa_amt_col]))
 
         journal_rows = []
+
+        # ─────────────────────────────────────────────────────────────────────
+        # Preload invoice mapping for Zoho/Stripe customer resolution
+        # ─────────────────────────────────────────────────────────────────────
+        invoice_map = extract_invoice_name_map(invoice_files)
 
         # ══════════════════════════════════════════════════════════════════════
         # ENGINE A — STRIPE PDF
         # ══════════════════════════════════════════════════════════════════════
         if engine_mode == "STRIPE":
             st.info("⚙️ Engine: Stripe PDF Extractor")
-            pdf_text   = extract_text_from_pdf(gateway_file)
-            charges    = []
+            pdf_text = extract_text_from_pdf(gateway_file)
+            charges = []
             total_gross = 0.0
 
             for line in [l.strip() for l in pdf_text.splitlines() if l.strip()]:
@@ -317,10 +363,15 @@ if gateway_file and boa_file:
                         charges.append({"name": name, "gross": gross, "is_mpp": "installment" in ll})
 
             for ch in charges:
+                # For Stripe, try to resolve via invoice/customer master if possible, otherwise keep raw extracted name.
                 ca, cn = lookup_customer(ch["name"], cust_df, acct_col, name_col)
-                code = cc_lookup("Installment" if ch["is_mpp"] else "Receipt",
-                                 cc_df, cc_name_col, cc_code_col,
-                                 "AR002" if ch["is_mpp"] else "AR001")
+                code = cc_lookup(
+                    "Installment" if ch["is_mpp"] else "Receipt",
+                    cc_df,
+                    cc_name_col,
+                    cc_code_col,
+                    "AR002" if ch["is_mpp"] else "AR001",
+                )
                 prefix = "MPP " if ch["is_mpp"] else ""
                 journal_rows.append(make_row(
                     boa_date, company_id, cn, "Customer", ca,
@@ -344,21 +395,8 @@ if gateway_file and boa_file:
         else:
             st.info("⚙️ Engine: Zoho Corporate Payment Pipeline")
 
-            # Parse invoice PDFs → invoice_map[cleaned_customer_name] = {term, raw_name}
-            invoice_map: dict = {}
-            for inv in (invoice_files or []):
-                if not inv.name.lower().endswith(".pdf"):
-                    continue
-                text  = extract_text_from_pdf(inv)
-                term  = parse_invoice_term(text)
-                cname = parse_invoice_customer(text)
-                if cname:
-                    invoice_map[clean_for_match(cname)] = {"term": term, "raw_name": cname}
-
             # Load Zoho export
-            zoho_df = (pd.read_csv(gateway_file)
-                       if gateway_file.name.lower().endswith(".csv")
-                       else pd.read_excel(gateway_file, engine="openpyxl"))
+            zoho_df = pd.read_csv(gateway_file) if gateway_file.name.lower().endswith(".csv") else pd.read_excel(gateway_file, engine="openpyxl")
             zoho_df.columns = [str(c).strip() for c in zoho_df.columns]
 
             gross_col = next(
@@ -369,30 +407,24 @@ if gateway_file and boa_file:
                 (c for c in zoho_df.columns if c.strip().lower() == "fee"),
                 next((c for c in zoho_df.columns if re.search(r'\bfee\b', c, re.I)), zoho_df.columns[4]),
             )
-            cust_name_col = next(
-                (c for c in zoho_df.columns if re.search(r'customer.*name|customername', c, re.I)), None
-            )
-            txn_type_col = next(
-                (c for c in zoho_df.columns if re.search(r'transaction.*type|transactiontype', c, re.I)), None
-            )
+            cust_name_col = next((c for c in zoho_df.columns if re.search(r'customer.*name|customername', c, re.I)), None)
+            txn_type_col = next((c for c in zoho_df.columns if re.search(r'transaction.*type|transactiontype', c, re.I)), None)
+            desc_col = next((c for c in zoho_df.columns if re.search(r'desc|description|memo', c, re.I)), None)
 
             st.caption(
-                f"Zoho columns → Gross: **{gross_col}** | Fee: **{fee_col}** | "
-                f"Customer: **{cust_name_col or 'not found'}**"
+                f"Zoho columns → Gross: **{gross_col}** | Fee: **{fee_col}** | Customer: **{cust_name_col or 'not found'}**"
             )
 
             for _, zrow in zoho_df.iterrows():
                 gross_raw = safe_float(zrow[gross_col])
-                fee_raw   = safe_float(zrow[fee_col])
+                fee_raw = safe_float(zrow[fee_col])
                 if gross_raw == 0.0:
                     continue
 
                 txn_type_val = str(zrow.get(txn_type_col, "")).lower() if txn_type_col else ""
-                is_refund    = gross_raw < 0 or any(
-                    k in txn_type_val for k in ("refund", "chargeback", "reversal", "void")
-                )
+                is_refund = gross_raw < 0 or any(k in txn_type_val for k in ("refund", "chargeback", "reversal", "void"))
                 gross_amt = abs(gross_raw)
-                fee_amt   = abs(fee_raw)
+                fee_amt = abs(fee_raw)
 
                 zoho_cust = ""
                 if cust_name_col:
@@ -400,18 +432,19 @@ if gateway_file and boa_file:
                     if raw.lower() not in ("nan", "none", ""):
                         zoho_cust = raw
 
-                # Match invoice term per customer
+                # If Zoho doesn't supply the customer, resolve customer from invoice number in the description.
+                if not zoho_cust:
+                    raw_desc = str(zrow.get(desc_col, "")) if desc_col else ""
+                    invoice_no = extract_invoice_number_from_text(raw_desc)
+                    if invoice_no and invoice_no in invoice_map:
+                        zoho_cust = invoice_map[invoice_no].get("customer", "")
+
+                # Term resolution from invoice text/file when possible.
                 term = "receipt"
-                if invoice_map:
-                    zk = clean_for_match(zoho_cust)
-                    if zk in invoice_map:
-                        term = invoice_map[zk]["term"]
-                    else:
-                        zt = set(zk.split())
-                        for ik, iv in invoice_map.items():
-                            if len(zt & set(ik.split())) >= 2:
-                                term = iv["term"]
-                                break
+                raw_desc = str(zrow.get(desc_col, "")) if desc_col else ""
+                invoice_no = extract_invoice_number_from_text(raw_desc)
+                if invoice_no and invoice_no in invoice_map:
+                    term = invoice_map[invoice_no].get("term", "receipt")
 
                 ca, cn = lookup_customer(zoho_cust or "Unknown Payer", cust_df, acct_col, name_col)
 
@@ -422,11 +455,10 @@ if gateway_file and boa_file:
                 else:
                     code = cc_lookup("Receipt", cc_df, cc_name_col, cc_code_col, "AR001")
 
-                mpp       = "MPP " if term == "monthly" else ""
-                cr_desc   = f"{mpp}{ca} {cn}_{boa_ref_desc}"
-                fee_desc  = f"Zoho Merchant Fee {ca}_{cn}_{boa_ref_desc}"
+                mpp = "MPP " if term == "monthly" else ""
+                cr_desc = f"{mpp}{ca} {cn}_{boa_ref_desc}"
+                fee_desc = f"Zoho Merchant Fee {ca}_{cn}_{boa_ref_desc}"
 
-                # Customer credit/debit line
                 if is_refund:
                     journal_rows.append(make_row(
                         boa_date, company_id, cn, "Customer", ca,
@@ -442,7 +474,6 @@ if gateway_file and boa_file:
                         company_id, "Bank", offset_account,
                     ))
 
-                # Merchant fee debit line
                 if fee_amt > 0:
                     journal_rows.append(make_row(
                         boa_date, company_id, "Outside Service (Finance)", "Ledger", debit_ledger_acct,
@@ -453,45 +484,33 @@ if gateway_file and boa_file:
 
         # ══════════════════════════════════════════════════════════════════════
         # ENGINE C — ALL OTHER BOA TRANSACTIONS
-        # Processes every BOA row that is NOT the gateway settlement row.
-        # Splits into:
-        #   • Debit rows  (amount < 0) → expense journal entries
-        #   • Credit rows (amount > 0) → income / other receipt entries
-        # NJ WEB PMT is treated as a normal debit expense in this section.
+        # Temporary expense workflow: keep only Date, Description, Debit.
         # ══════════════════════════════════════════════════════════════════════
         st.info("⚙️ Processing remaining BOA transactions…")
 
-        # Identify the gateway settlement row index so we skip it
         gateway_desc_pattern = "ZOHO PAYMENTS" if engine_mode == "ZOHO" else "STRIPE"
-        gateway_mask = boa_df[boa_desc_col].astype(str).str.contains(
-            gateway_desc_pattern, case=False, na=False
-        )
+        gateway_mask = boa_df[boa_desc_col].astype(str).str.contains(gateway_desc_pattern, case=False, na=False)
 
         for _, brow in boa_df[~gateway_mask].iterrows():
             raw_desc = str(brow[boa_desc_col]).strip()
             raw_date = str(brow[boa_date_col]).strip()
-            raw_amt  = brow["_amt_float"]
+            raw_amt = brow["_amt_float"]
 
-            # Skip summary / balance rows
             if raw_desc in ("", "nan") or raw_amt == 0.0:
                 continue
             if re.search(r'beginning balance|ending balance', raw_desc, re.I):
                 continue
 
-            cash_code = categorise_boa_expense(raw_desc, cc_df, cc_name_col, cc_code_col)
-
             if raw_amt < 0:
-                # ── DEBIT (expense / payment) ─────────────────────────────────
-                journal_rows.append(make_row(
-                    raw_date, company_id,
-                    "Outside Service (Finance)", "Ledger", debit_ledger_acct,
-                    "", cash_code,
-                    raw_desc,               # keep BOA description as-is per spec
-                    abs(raw_amt), "",
-                    company_id, "Bank", offset_account,
-                ))
+                # Temporary expense workflow: only populate date, description, debit.
+                blank_row = {col: "" for col in COLUMNS_25}
+                blank_row["Date"] = raw_date
+                blank_row["Description"] = raw_desc
+                blank_row["Debit"] = abs(raw_amt)
+                journal_rows.append(blank_row)
             else:
-                # ── CREDIT (other income / receipt not from gateway) ──────────
+                # Keep existing logic for non-expense credits.
+                cash_code = categorise_boa_expense(raw_desc, cc_df, cc_name_col, cc_code_col)
                 journal_rows.append(make_row(
                     raw_date, company_id,
                     "Outside Service (Finance)", "Ledger", debit_ledger_acct,
@@ -509,27 +528,27 @@ if gateway_file and boa_file:
         if not final_df.empty:
             final_df = final_df.reindex(columns=COLUMNS_25).fillna("")
 
-            # Metrics
-            total_deb = pd.to_numeric(final_df["Debit"],  errors="coerce").fillna(0).sum()
+            total_deb = pd.to_numeric(final_df["Debit"], errors="coerce").fillna(0).sum()
             total_cre = pd.to_numeric(final_df["Credit"], errors="coerce").fillna(0).sum()
-            diff      = abs(total_deb - total_cre)
-            balanced  = diff < 0.02
-            missing   = (final_df["Account"] == "MISSING_ACCT").sum()
+            diff = abs(total_deb - total_cre)
+            balanced = diff < 0.02
+            missing = (final_df["Account"] == "MISSING_ACCT").sum()
 
             m1, m2, m3 = st.columns(3)
-            m1.metric("Total Debits",        f"${total_deb:,.2f}")
-            m2.metric("Total Credits",       f"${total_cre:,.2f}")
-            m3.metric("Balance Difference",  f"${diff:,.2f}",
-                      delta="✅ Balanced" if balanced else "⚠️ Out of balance",
-                      delta_color="normal" if balanced else "inverse")
+            m1.metric("Total Debits", f"${total_deb:,.2f}")
+            m2.metric("Total Credits", f"${total_cre:,.2f}")
+            m3.metric(
+                "Balance Difference",
+                f"${diff:,.2f}",
+                delta="✅ Balanced" if balanced else "⚠️ Out of balance",
+                delta_color="normal" if balanced else "inverse",
+            )
 
             if missing:
                 st.warning(
-                    f"⚠️ {missing} row(s) show MISSING_ACCT — "
-                    "verify those customer names in the Customer Master Account File."
+                    f"⚠️ {missing} row(s) show MISSING_ACCT — verify those customer names in the Customer Master Account File."
                 )
 
-            # Preview — highlight missing accounts in amber
             def hl(row):
                 return ["background-color:#fff3cd" if row["Account"] == "MISSING_ACCT" else "" for _ in row]
 
@@ -542,7 +561,6 @@ if gateway_file and boa_file:
                 file_name="D365_Reconciliation_Journal.csv",
                 mime="text/csv",
             )
-
         else:
             st.warning("⚠️ No journal entries were produced. Check your input files.")
 
