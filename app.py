@@ -424,53 +424,80 @@ def pick_invoice_by_amount(amount, invoices):
         return chosen
     return None
 
-def get_payment_term(invoice_meta, form_df, customer_name, invoice_no):
+
+def resolve_payment_info(invoice_meta, form_df, customer_name, invoice_no, customer_account=""):
+    """
+    Resolve the Zoho cash code (AR001-AR012) and the normalized payment term.
+
+    The form master is treated as the authoritative source when it contains a
+    matching row and an explicit AR code or recognizable payment-term wording.
+    """
+    invoice_term = ""
     if invoice_meta and invoice_meta.get("term"):
-        return invoice_meta["term"]
+        invoice_term = str(invoice_meta.get("term")).strip().lower()
+
+    def term_to_code(term: str) -> str:
+        return cash_code_for_term(term or "receipt")
+
+    fallback_term = invoice_term or "receipt"
+    fallback_code = term_to_code(fallback_term)
+
     if form_df is None or form_df.empty:
-        return "receipt"
-    cols = {c.lower(): c for c in form_df.columns}
-    cust_col = None
-    inv_col = None
-    for c in form_df.columns:
-        n = normalize_text(c)
-        if "customer account" in n or (n == "account" and cust_col is None):
-            cust_col = c
-        elif "business name" in n or "deal name" in n or "invoice sent" in n or "invoice number" in n:
-            inv_col = inv_col or c
-    key = clean_for_match(customer_name)
-    inv_key = normalize_text(invoice_no)
+        return {"term": fallback_term, "cash_code": fallback_code}
+
+    search_keys = [
+        clean_for_match(customer_account),
+        clean_for_match(customer_name),
+        normalize_text(invoice_no),
+    ]
+    best_text = ""
+    best_score = 0
+
     for _, row in form_df.iterrows():
-        row_text = " ".join(str(v) for v in row.tolist())
-        ntext = normalize_text(row_text)
-        if key and key in ntext or inv_key and inv_key in ntext:
-            # look for term keywords in row
-            if any(k in ntext for k in ["monthly", "mpp", "installment"]):
-                return "monthly"
-            if any(k in ntext for k in ["financing"]):
-                return "financing"
-            if any(k in ntext for k in ["leasing"]):
-                return "leasing"
-            if any(k in ntext for k in ["net 60"]):
-                return "net_60days"
-            if any(k in ntext for k in ["net 45"]):
-                return "net_45days"
-            if any(k in ntext for k in ["net 40"]):
-                return "net_40days"
-            if any(k in ntext for k in ["net 30"]):
-                return "net_30days"
-            if any(k in ntext for k in ["net 25"]):
-                return "net_25days"
-            if any(k in ntext for k in ["net 10"]):
-                return "net_10days"
-            if any(k in ntext for k in ["net 1"]):
-                return "net_1day"
-            return "receipt"
-    return "receipt"
+        row_text = normalize_text(" ".join(str(v) for v in row.tolist()))
+        score = sum(1 for k in search_keys if k and k in row_text)
+        if score > best_score:
+            best_score = score
+            best_text = row_text
+
+    if not best_text:
+        return {"term": fallback_term, "cash_code": fallback_code}
+
+    # Explicit AR code in the matched row wins.
+    for term_key, code in AR_CODES.items():
+        if normalize_text(code) in best_text:
+            return {"term": term_key, "cash_code": code}
+
+    # Infer the term from the matched row text.
+    if any(k in best_text for k in ["monthly", "mpp", "installment"]):
+        return {"term": "monthly", "cash_code": AR_CODES["monthly"]}
+    if "financing" in best_text:
+        return {"term": "financing", "cash_code": AR_CODES["financing"]}
+    if "leasing" in best_text:
+        return {"term": "leasing", "cash_code": AR_CODES["leasing"]}
+    if "net 1 day" in best_text or "net 1" in best_text or "1 day" in best_text:
+        return {"term": "net_1day", "cash_code": AR_CODES["net_1day"]}
+    if "net 10 days" in best_text or "net 10" in best_text or "10 day" in best_text:
+        return {"term": "net_10days", "cash_code": AR_CODES["net_10days"]}
+    if "net 25 days" in best_text or "net 25" in best_text or "25 day" in best_text:
+        return {"term": "net_25days", "cash_code": AR_CODES["net_25days"]}
+    if "net 30 days" in best_text or "net 30" in best_text or "30 day" in best_text:
+        return {"term": "net_30days", "cash_code": AR_CODES["net_30days"]}
+    if "net 40 days" in best_text or "net 40" in best_text or "40 day" in best_text:
+        return {"term": "net_40days", "cash_code": AR_CODES["net_40days"]}
+    if "net 45 days" in best_text or "net 45" in best_text or "45 day" in best_text:
+        return {"term": "net_45days", "cash_code": AR_CODES["net_45days"]}
+    if "net 60 days" in best_text or "net 60" in best_text or "60 day" in best_text:
+        return {"term": "net_60days", "cash_code": AR_CODES["net_60days"]}
+
+    return {"term": fallback_term, "cash_code": fallback_code}
+
+
 
 def detect_gateway_kind(file_obj):
     text = ""
     lower_name = file_obj.name.lower()
+
     if lower_name.endswith(".pdf"):
         text = read_pdf_text(file_obj)
     else:
@@ -481,71 +508,116 @@ def detect_gateway_kind(file_obj):
                 text = pd.read_excel(file_obj, engine="openpyxl").astype(str).fillna("").to_string(index=False)
         except Exception:
             text = ""
+
     t = normalize_text(text)
+
+    # Explicit indicators first.
     if "bankcard" in t or "authorize" in t or "authorizenet" in t or "mtot disc" in t:
         return "bankcard", text
-    if "stripe" in t:
+
+    if "stripe" in t or ("agreement" in t and "plan" in t):
         return "stripe", text
+
+    # Zoho payouts often contain "Payout Summary" or "Payout Descriptor: ZOHO PAYMENTS".
+    if "zoho payments" in t or "payout summary" in t or "payout descriptor" in t or "pay.zoho.com" in t:
+        return "zoho", text
+
+    # Default to Zoho for the generic gateway upload unless Stripe/Bankcard is detected.
     return "zoho", text
 
-def parse_gateway_tabular(file_obj):
-    lower_name = file_obj.name.lower()
-    if lower_name.endswith(".csv"):
-        df = pd.read_csv(file_obj)
-    else:
-        df = pd.read_excel(file_obj, engine="openpyxl")
-    df.columns = [str(c).strip() for c in df.columns]
-    amount_col = detect_col(df, ["gross", "amount", "total"], [], 0)
-    fee_col = detect_col(df, ["fee", "merchant fee", "processing"], [], None)
-    desc_col = detect_col(df, ["description", "desc", "memo"], [], None)
-    cust_col = detect_col(df, ["customer", "name", "business"], [], None)
-    type_col = detect_col(df, ["type"], [], None)
-    date_col = detect_col(df, ["date"], [], None)
+
+
+def parse_zoho_payout_pdf_text(text: str):
+    """
+    Extract every payment row from a Zoho payout PDF.
+
+    The expected payout PDF contains one or more rows in the form:
+      Payment Jun 16, 2026, 02:05 PM — ... $1,908.07 −$55.63 $1,852.44 USD
+
+    The parser returns one dict per payment with gross and fee values.
+    """
     txns = []
-    for _, row in df.iterrows():
-        gross = safe_float(row.get(amount_col, 0)) if amount_col else 0
-        fee = safe_float(row.get(fee_col, 0)) if fee_col else 0
-        if gross == 0:
+    if not text:
+        return txns
+
+    normalized = (
+        text.replace("−", "-")
+            .replace("—", " - ")
+            .replace("–", " - ")
+    )
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+
+    # Primary pattern: the payment table row with gross, fee and total.
+    row_pattern = re.compile(
+        r"Payment\s+[A-Za-z]{3}\s+\d{1,2},\s+\d{4},\s+\d{2}:\d{2}\s+[AP]M\s+[-—]\s+"
+        r"(?P<desc>.*?)\s+\$?(?P<gross>[\d,]+\.\d{2})\s+[-−]\s*\$?(?P<fee>[\d,]+\.\d{2})\s+\$?(?P<net>[\d,]+\.\d{2})\s+USD",
+        re.I,
+    )
+
+    for m in row_pattern.finditer(normalized):
+        txns.append(
+            {
+                "gross": round(abs(safe_float(m.group("gross"))), 2),
+                "fee": round(abs(safe_float(m.group("fee"))), 2),
+                "description": m.group("desc").strip(),
+                "customer_name": "",
+                "type": "payment",
+                "date": "",
+            }
+        )
+
+    if txns:
+        return txns
+
+    # Fallback: parse any line that starts with Payment and has at least 3 money fields.
+    for line in [l.strip() for l in text.splitlines() if l.strip()]:
+        line_norm = normalize_text(line)
+        if not line_norm.startswith("payment"):
             continue
-        desc = str(row.get(desc_col, "") if desc_col else "").strip()
-        cust = str(row.get(cust_col, "") if cust_col else "").strip()
-        typ = str(row.get(type_col, "") if type_col else "").strip()
-        dt = str(row.get(date_col, "") if date_col else "").strip()
-        txns.append({
-            "gross": abs(gross),
-            "fee": abs(fee),
-            "description": desc,
-            "customer_name": cust,
-            "type": typ,
-            "date": dt,
-        })
+        amounts = re.findall(r"-?\$?[\d,]+\.\d{2}", line)
+        if len(amounts) < 3:
+            continue
+        txns.append(
+            {
+                "gross": round(abs(safe_float(amounts[-3])), 2),
+                "fee": round(abs(safe_float(amounts[-2])), 2),
+                "description": line,
+                "customer_name": "",
+                "type": "payment",
+                "date": "",
+            }
+        )
     return txns
 
+
 def parse_gateway_pdf_text(text, kind):
+    if kind == "zoho":
+        return parse_zoho_payout_pdf_text(text)
+
     txns = []
-    normalized = text.replace("\u2212", "-").replace("—", "-").replace("–", "-")
+    normalized = text.replace("−", "-").replace("—", "-").replace("–", "-")
     for line in [l.strip() for l in normalized.splitlines() if l.strip()]:
         if not re.search(r"\$?\d[\d,]*\.\d{2}", line):
             continue
         money = re.findall(r"-?\$?\d[\d,]*\.\d{2}", line)
         if len(money) < 1:
             continue
-        # generic row parser
         gross = abs(safe_float(money[0]))
         fee = abs(safe_float(money[1])) if len(money) > 1 else 0.0
-        if kind == "zoho" and "payment" not in normalize_text(line):
-            continue
         if kind in ["stripe", "bankcard"] and not any(k in normalize_text(line) for k in ["charge", "payment", "agreement", "plan", "bankcard", "authorize"]):
             continue
-        txns.append({
-            "gross": gross,
-            "fee": fee,
-            "description": line,
-            "customer_name": "",
-            "type": "payment",
-            "date": "",
-        })
+        txns.append(
+            {
+                "gross": gross,
+                "fee": fee,
+                "description": line,
+                "customer_name": "",
+                "type": "payment",
+                "date": "",
+            }
+        )
     return txns
+
 
 def parse_gateway_file(file_obj):
     kind, text = detect_gateway_kind(file_obj)
@@ -556,79 +628,102 @@ def parse_gateway_file(file_obj):
         txns = parse_gateway_tabular(file_obj)
     return kind, txns, text
 
+
 def build_payment_rows(kind, boarow, txns, invoices, cust_df, acct_col, name_col, form_df, offset_default):
     rows = []
-    used_descs = []
     fee_total = 0.0
     unique_tags = []
+
     for txn in txns:
         gross = round(abs(float(txn["gross"])), 2)
         fee = round(abs(float(txn.get("fee", 0.0))), 2)
         fee_total += fee
+
         invoice = pick_invoice_by_amount(gross, invoices)
         customer_name = ""
-        term = "receipt"
         invoice_no = ""
+
         if invoice:
             customer_name = invoice.get("customer", "") or ""
-            term = invoice.get("term", "receipt") or "receipt"
-            invoice_no = invoice.get("invoice_no", "")
+            invoice_no = invoice.get("invoice_no", "") or ""
         if not customer_name:
             customer_name = txn.get("customer_name", "") or ""
         if not customer_name:
             customer_name = "Unknown"
+
         matched = lookup_customer(customer_name, cust_df, acct_col, name_col)
+
         if matched:
             account_name = matched["name"]
             account_no = matched["account"]
             account_type = "Customer"
-            cash_code = cash_code_for_term(get_payment_term(invoice, form_df, account_name, invoice_no))
-            desc_prefix = "MPP " if cash_code == AR_CODES["monthly"] else ""
+
+            payment_info = resolve_payment_info(
+                invoice_meta=invoice,
+                form_df=form_df,
+                customer_name=account_name,
+                invoice_no=invoice_no,
+                customer_account=account_no,
+            )
+            cash_code = payment_info["cash_code"]
+            term = payment_info["term"]
+            desc_prefix = "MPP " if term == "monthly" else ""
             desc = f"{desc_prefix}{account_no} {account_name}_{boarow['desc']}"
         else:
             account_name = TEMP_RECEIPT_NAME
             account_no = TEMP_RECEIPT_ACCOUNT
             account_type = "Ledger"
             cash_code = AR_CODES["receipt"]
+            term = "receipt"
             desc = f"{TEMP_RECEIPT_NAME}_{boarow['desc']}"
+
         unique_tags.append(f"{account_no} {account_name}")
-        rows.append(build_row(
-            date=boarow["date"],
-            company=company_id,
-            acct_name=account_name,
-            acct_type=account_type,
-            account=account_no,
-            posting_profile="AutoPost",
-            cash_code=cash_code,
-            description=desc,
-            debit="",
-            credit=gross,
-            offset_account_type="Bank",
-            offset_account_value=resolve_offset_account(boarow["desc"], offset_default),
-        ))
-        used_descs.append(desc)
+
+        rows.append(
+            build_row(
+                date=boarow["date"],
+                company=company_id,
+                acct_name=account_name,
+                acct_type=account_type,
+                account=account_no,
+                posting_profile="AutoPost",
+                cash_code=cash_code,
+                description=desc,
+                debit="",
+                credit=gross,
+                offset_account_type="Bank",
+                offset_account_value=resolve_offset_account(boarow["desc"], offset_default),
+            )
+        )
+
     fee_desc_base = f"{kind.capitalize()} Merchant Fee "
     fee_desc = fee_desc_base + ", ".join(dict.fromkeys(unique_tags)) + f"_{boarow['desc']}"
     fee_code = PAYMENT_FEE_CODES.get(kind, "OSF005")
+
     if fee_total == 0 and txns:
         gross_sum = round(sum(abs(float(t["gross"])) for t in txns), 2)
         fee_total = round(max(0.0, gross_sum - abs(float(boarow["amount"]))), 2)
+
     if fee_total > 0:
-        rows.append(build_row(
-            date=boarow["date"],
-            company=company_id,
-            acct_name="Outside Service (Finance)",
-            acct_type="Ledger",
-            account=debit_ledger_acct if kind != "bankcard" else DEFAULT_LEDGER_ACCOUNT,
-            posting_profile="",
-            cash_code=fee_code,
-            description=fee_desc,
-            debit=fee_total,
-            credit="",
-            offset_account_type="Bank",
-            offset_account_value=resolve_offset_account(boarow["desc"], offset_default),
-        ))
+        rows.append(
+            build_row(
+                date=boarow["date"],
+                company=company_id,
+                acct_name="Outside Service (Finance)",
+                acct_type="Ledger",
+                account=debit_ledger_acct if kind != "bankcard" else DEFAULT_LEDGER_ACCOUNT,
+                posting_profile="",
+                cash_code=fee_code,
+                description=fee_desc,
+                debit=fee_total,
+                credit="",
+                offset_account_type="Bank",
+                offset_account_value=resolve_offset_account(boarow["desc"], offset_default),
+            )
+        )
+
     return rows
+
 
 def build_monthly_and_other_rows(boa_df, skip_mask, monthly_rules, offset_default):
     rows = []
