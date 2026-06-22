@@ -672,8 +672,11 @@ Key insight from real data analysis:
 
 Special account types (from real D365 reference data):
   - Normal business customers: Customer type, BC###### account
-  - CS/repair tickets (individuals): Ledger type, account 21040102-B1000002,
-    name "Temporary Receipt", description prefixed with "Nicole Holovach CS Ticket #676_"
+  - CS/repair ticket individuals found in CS/PS Ticket column of master:
+    Customer type, resolved BC###### of their registered business account.
+    Description prefixed with "Name CS Ticket #XXX_"
+  - CS/repair ticket individuals NOT in master: Ledger type,
+    account 21040102-B1000002, name "Temporary Receipt" (flagged for review)
 """
 
 import re
@@ -1163,9 +1166,11 @@ Per transaction (grouped by BOA posting date):
 
 Special account handling (from real D365 reference data):
   • Normal customers: Account type=Customer, Account=BC######, Posting Profile=AutoPost
-  • CS/repair tickets: Account type=Ledger, Account=21040102-B1000002,
-    Account Name=Temporary Receipt, Posting Profile=AutoPost
-    Description: "Nicole Holovach CS Ticket #676_ZOHO PAYMENTS DES:..."
+  • CS/repair tickets (individual in CS/PS Ticket column of master):
+    Account type=Customer, Account=BC######, Posting Profile=AutoPost
+    Description: "Name CS Ticket #XXX_ZOHO PAYMENTS DES:..."
+  • CS/repair tickets (individual NOT in master):
+    Account type=Ledger, Account=21040102-B1000002, Name=Temporary Receipt (flagged)
 """
 
 import re
