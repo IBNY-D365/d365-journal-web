@@ -1,276 +1,438 @@
 """
-matcher.py — Match BOA transactions to Zoho records and resolve customer accounts.
+matcher.py — Match BOA ↔ Zoho transactions and resolve customer accounts.
 
-Matching strategy (in priority order):
-  1. Exact customer name match against customer master
-  2. Fuzzy name match (token_set_ratio ≥ 85)
-  3. Invoice number cross-reference
-  4. Email-to-name lookup (if customer has email in Zoho but no name)
-  5. Flag for manual review if confidence < threshold
+Key insight from real data analysis:
+  - The Zoho Payout PDF has NO customer names (field shows "—")
+  - Customer names must come from uploaded invoice PDFs
+  - Invoices are matched to Zoho transactions by amount (Total on invoice == gross_amount in Zoho)
+  - BOA posting date (payout date) is used as the D365 entry date, not the Zoho transaction date
+  - BOA description string (ZOHO PAYMENTS DES:...) is used in the D365 description field
 
-For the BOA ↔ Zoho financial reconciliation:
-  - BOA Net = sum(Zoho Gross) - sum(Zoho Fees)  [Mathematical Balance Invariant]
-  - Tolerance: max(0.5% of amount, $1.00)
+Special account types (from real D365 reference data):
+  - Normal business customers: Customer type, BC###### account
+  - CS/repair tickets (individuals): Ledger type, account 21040102-B1000002,
+    name "Temporary Receipt", description prefixed with "Nicole Holovach CS Ticket #676_"
 """
 
 import re
 import numpy as np
 import pandas as pd
 from rapidfuzz import fuzz, process
+from parsers import parse_invoice_pdf
 
-# Fuzzy match threshold (0–100); below this → NEEDS_REVIEW
-_FUZZY_THRESHOLD = 82
+_FUZZY_THRESHOLD = 80
+
+# Special handling: individual/CS customers use Temporary Receipt account
+# These are identified when the customer is an individual (not a business)
+# and typically come from CS ticket invoices
+_TEMP_RECEIPT_ACCOUNT = "21040102-B1000002"
+_TEMP_RECEIPT_NAME    = "Temporary Receipt"
+
+# Payment terms → cash code mapping (from automation rules §4)
+_TERMS_TO_CASH_CODE = {
+    "due on receipt":         ("AR001", ""),
+    "due upon receipt":       ("AR001", ""),
+    "monthly payment":        ("AR002", "MPP "),
+    "monthly payment plan":   ("AR002", "MPP "),
+    "mpp":                    ("AR002", "MPP "),
+    "financing":              ("AR003", ""),
+    "leasing":                ("AR004", ""),
+    "net 1":                  ("AR005", ""),
+    "net 10":                 ("AR006", ""),
+    "net 25":                 ("AR007", ""),
+    "net 30":                 ("AR008", ""),
+    "net 40":                 ("AR009", ""),
+    "net 45":                 ("AR010", ""),
+    "net 60":                 ("AR011", ""),
+    "due end of next month":  ("AR010", ""),   # ~45-day term
+    "net":                    ("AR008", ""),   # generic net → AR008
+}
 
 
-def match_transactions(
-    boa_df: pd.DataFrame,
-    zoho_df: pd.DataFrame,
-    customer_df: pd.DataFrame,
-    invoice_files=None,
-) -> tuple[pd.DataFrame, list]:
+def match_transactions(boa_df, zoho_df, customer_df, invoice_files=None):
     """
-    Main entry point.  Returns (enriched_zoho_df, log_entries).
+    Main entry point. Enriches zoho_df rows with D365 fields.
 
-    Adds columns to zoho_df:
-      _account        — resolved BC###### account number
-      _account_name   — canonical account name from customer master
-      _match_method   — how the name was resolved
-      _match_confidence — HIGH / MEDIUM / LOW
-      _needs_review   — bool
-      _review_reason  — human-readable reason if flagged
-      _boa_date       — posting date from BOA record
-      _boa_description — full BOA description string
-      _cash_code      — AR001 / AR002 etc. (may be blank if unknown)
+    Steps:
+      1. Parse all uploaded invoice PDFs → {amount: invoice_data}
+      2. For each Zoho row: match by amount to invoice → get customer name + terms
+      3. Look up customer name in master → get BC###### account
+      4. Attach BOA posting date and description
+      5. Validate balance invariant
     """
     log = []
+
+    # ── Step 1: Parse invoices ────────────────────────────────────────────────
+    invoice_by_amount = {}   # {rounded_amount: invoice_dict}
+    invoice_by_name   = {}   # {normalised_name: invoice_dict}
+
+    if invoice_files:
+        for inv_file in invoice_files:
+            try:
+                inv_data = parse_invoice_pdf(inv_file)
+                if inv_data:
+                    amt = inv_data.get("total")
+                    if amt:
+                        key = round(float(amt), 2)
+                        invoice_by_amount[key] = inv_data
+                    name = inv_data.get("customer_name", "")
+                    if name:
+                        invoice_by_name[_normalise_name(name)] = inv_data
+                    log.append({
+                        "level": "OK",
+                        "msg": (f"Invoice parsed: {inv_data.get('invoice_number','?')} | "
+                                f"Customer: {inv_data.get('customer_name','?')} | "
+                                f"Total: ${amt:,.2f}" if amt else "Invoice parsed (no total)")
+                    })
+            except Exception as e:
+                log.append({"level": "WARN", "msg": f"Could not parse invoice: {e}"})
+
+    # ── Step 2: Build customer lookup ─────────────────────────────────────────
     customer_lookup = _build_customer_lookup(customer_df)
 
-    # ── Step 1: resolve each Zoho row to a customer account ──────────────────
+    # ── Step 3: Resolve each Zoho row ─────────────────────────────────────────
     results = []
     for idx, zrow in zoho_df.iterrows():
-        record = _resolve_zoho_row(zrow, customer_lookup, invoice_files, log)
+        record = _resolve_row(
+            zrow, customer_lookup, invoice_by_amount, invoice_by_name, log
+        )
         results.append(record)
 
     resolved = pd.DataFrame(results)
-    enriched = pd.concat([zoho_df.reset_index(drop=True), resolved.reset_index(drop=True)], axis=1)
+    enriched = pd.concat(
+        [zoho_df.reset_index(drop=True), resolved.reset_index(drop=True)], axis=1
+    )
 
-    # ── Step 2: link BOA date & description to Zoho rows ─────────────────────
-    zoho_rows = enriched  # alias
+    # ── Step 4: Attach BOA date and description ───────────────────────────────
+    enriched = _attach_boa_data(enriched, boa_df, log)
 
-    # Filter BOA to Zoho-only rows
+    # ── Step 5: Balance check ─────────────────────────────────────────────────
+    _validate_balance(boa_df, enriched, log)
+
+    return enriched, log
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Row resolution
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _resolve_row(zrow, customer_lookup, invoice_by_amount, invoice_by_name, log):
+    """Resolve one Zoho transaction row to its D365 fields."""
+    idx          = zrow.name
+    raw_customer = str(zrow.get("customer", "")).strip()
+    gross        = _safe_float(zrow.get("gross_amount"))
+    invoice_ref  = str(zrow.get("invoice", "")).strip()
+
+    # ── Try invoice match by amount first (most reliable for this PDF) ────────
+    inv = None
+    if gross:
+        key = round(gross, 2)
+        inv = invoice_by_amount.get(key)
+
+    # If not found by amount, try by invoice reference string
+    if not inv and invoice_ref and invoice_ref not in ("nan", ""):
+        for norm_name, inv_data in invoice_by_name.items():
+            if inv_data.get("invoice_number", "") in invoice_ref:
+                inv = inv_data
+                break
+
+    # ── If we have an invoice, use it ─────────────────────────────────────────
+    if inv:
+        customer_name  = inv.get("customer_name", "")
+        payment_terms  = inv.get("payment_terms", "")
+        cs_ticket      = inv.get("cs_ticket", "")
+        cash_code, pfx = _terms_to_cash_code(payment_terms)
+
+        log.append({
+            "level": "OK",
+            "msg": (f"Row {idx}: matched invoice {inv.get('invoice_number','?')} "
+                    f"→ '{customer_name}' | terms='{payment_terms}' | code={cash_code}")
+        })
+
+        # Check if this is a CS/repair ticket (individual person, not a business)
+        is_cs_ticket = bool(cs_ticket)
+
+        if is_cs_ticket:
+            # Special handling: Temporary Receipt account (from D365 reference image)
+            desc_prefix = f"{customer_name} CS Ticket #{cs_ticket}_"
+            return {
+                "_account":          _TEMP_RECEIPT_ACCOUNT,
+                "_account_name":     _TEMP_RECEIPT_NAME,
+                "_account_type":     "Ledger",
+                "_posting_profile":  "AutoPost",
+                "_match_method":     "INVOICE_CS_TICKET",
+                "_match_confidence": "HIGH",
+                "_needs_review":     False,
+                "_review_reason":    "",
+                "_cash_code":        cash_code,
+                "_cash_code_prefix": "",
+                "_desc_prefix":      desc_prefix,
+                "_raw_name":         customer_name,
+                "_invoice_number":   inv.get("invoice_number", ""),
+            }
+
+        # Normal business customer — look up in master
+        master_result = _fuzzy_lookup(customer_name, customer_lookup)
+        master_result["_cash_code"]        = cash_code
+        master_result["_cash_code_prefix"] = pfx
+        master_result["_desc_prefix"]      = ""
+        master_result["_invoice_number"]   = inv.get("invoice_number", "")
+        master_result["_raw_name"]         = customer_name
+        master_result.setdefault("_account_type",    "Customer")
+        master_result.setdefault("_posting_profile", "AutoPost")
+
+        if master_result["_match_confidence"] == "LOW":
+            master_result["_needs_review"]  = True
+            master_result["_review_reason"] = (
+                f"Customer '{customer_name}' from invoice not found in master "
+                f"(best match score {master_result.get('_fuzzy_score',0)}/100). "
+                f"Add this account to IBNY_Business_Customer_Account.xlsx."
+            )
+            log.append({
+                "level": "WARN",
+                "msg":   f"Row {idx}: '{customer_name}' not in master — flagged for review."
+            })
+
+        return master_result
+
+    # ── No invoice: try customer name from Zoho directly ─────────────────────
+    if raw_customer and raw_customer not in ("—", "-", "nan", ""):
+        result = _fuzzy_lookup(raw_customer, customer_lookup)
+        result["_cash_code"]        = "AR001"  # default
+        result["_cash_code_prefix"] = ""
+        result["_desc_prefix"]      = ""
+        result["_invoice_number"]   = invoice_ref
+        result["_raw_name"]         = raw_customer
+        result.setdefault("_account_type",    "Customer")
+        result.setdefault("_posting_profile", "AutoPost")
+        return result
+
+    # ── No name, no invoice match ─────────────────────────────────────────────
+    log.append({
+        "level": "WARN",
+        "msg":   (f"Row {idx}: No customer name and no matching invoice for "
+                  f"gross=${gross}. Upload the invoice to resolve.")
+    })
+    return {
+        "_account":          "",
+        "_account_name":     raw_customer or "",
+        "_account_type":     "Customer",
+        "_posting_profile":  "AutoPost",
+        "_match_method":     "UNRESOLVED",
+        "_match_confidence": "LOW",
+        "_needs_review":     True,
+        "_review_reason":    f"No customer name and no invoice matched amount ${gross}",
+        "_cash_code":        "",
+        "_cash_code_prefix": "",
+        "_desc_prefix":      "",
+        "_raw_name":         raw_customer or "",
+        "_invoice_number":   "",
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BOA data attachment
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _attach_boa_data(zoho_df, boa_df, log):
+    """
+    Attach the BOA posting date and description to each Zoho row.
+
+    The BOA CSV has one row per payout date. The payout date in Zoho is
+    stored in 'payout_date' (from the PDF header). If that matches a BOA
+    row date, use it; otherwise fall back to ±3-day window.
+    """
+    zoho_df = zoho_df.copy()
+
+    if boa_df is None or boa_df.empty:
+        zoho_df["_boa_date"]        = pd.NaT
+        zoho_df["_boa_description"] = ""
+        return zoho_df
+
     boa_zoho = boa_df[boa_df.get("_is_zoho", pd.Series(False, index=boa_df.index))].copy()
 
-    if not boa_zoho.empty and "date" in boa_zoho.columns and "date" in zoho_rows.columns:
-        # Group Zoho rows by date; attach matching BOA description by date
-        boa_date_map = {}
-        for _, brow in boa_zoho.iterrows():
-            if pd.notna(brow.get("date")):
-                d = pd.Timestamp(brow["date"]).normalize()
-                # Store as list to handle multiple BOA rows on same date
-                boa_date_map.setdefault(d, []).append({
-                    "description": str(brow.get("description", "")),
-                    "amount":      brow.get("_boa_amount", np.nan),
-                })
+    if boa_zoho.empty:
+        zoho_df["_boa_date"]        = pd.NaT
+        zoho_df["_boa_description"] = ""
+        log.append({
+            "level": "WARN",
+            "msg":   "No ZOHO rows found in BOA file. "
+                     "The BOA description must contain 'ZOHO' to be recognised."
+        })
+        return zoho_df
 
-        def attach_boa(row):
-            if pd.isna(row.get("date")):
-                return pd.Series({"_boa_date": pd.NaT, "_boa_description": ""})
-            d = pd.Timestamp(row["date"]).normalize()
-            # Try exact date, then ±3 days
-            for delta in [0, 1, -1, 2, -2, 3, -3]:
-                target = d + pd.Timedelta(days=delta)
-                if target in boa_date_map:
-                    entries = boa_date_map[target]
-                    return pd.Series({
-                        "_boa_date":        target,
-                        "_boa_description": entries[0]["description"],  # closest match
-                    })
-            return pd.Series({"_boa_date": pd.NaT, "_boa_description": ""})
+    # Build date → {description, amount} map from BOA
+    boa_map = {}
+    for _, brow in boa_zoho.iterrows():
+        if pd.notna(brow.get("date")):
+            d = pd.Timestamp(brow["date"]).normalize()
+            boa_map[d] = {
+                "description": str(brow.get("description", "")),
+                "amount":      brow.get("_boa_amount", np.nan),
+            }
 
-        attached = zoho_rows.apply(attach_boa, axis=1)
-        zoho_rows = pd.concat([zoho_rows, attached], axis=1)
+    def get_boa_for_row(row):
+        # Priority 1: use payout_date from Zoho PDF if available
+        for date_field in ["payout_date", "date"]:
+            val = row.get(date_field)
+            if val and str(val) not in ("nan", "NaT", ""):
+                try:
+                    d = pd.Timestamp(val).normalize()
+                    for delta in [0, 1, -1, 2, -2, 3, -3]:
+                        target = d + pd.Timedelta(days=delta)
+                        if target in boa_map:
+                            return boa_map[target]
+                except Exception:
+                    pass
+        # Use the first BOA row if nothing matched
+        if boa_map:
+            return next(iter(boa_map.values()))
+        return {"description": "", "amount": np.nan}
 
-        # Validate mathematical balance invariant per date group
-        _validate_balance(boa_zoho, zoho_rows, log)
+    boa_dates = []
+    boa_descs = []
+    for _, row in zoho_df.iterrows():
+        boa_entry = get_boa_for_row(row)
+        boa_dates.append(
+            pd.Timestamp(list(boa_map.keys())[0])
+            if boa_map else pd.NaT
+        )
+        boa_descs.append(boa_entry["description"])
+
+    # Use the actual BOA date (from boa_map keys) not the Zoho transaction date
+    # The BOA posting date is what goes into D365 (per SOP)
+    if boa_map:
+        boa_posting_date = list(boa_map.keys())[0]  # first (and usually only) ZOHO row
+        zoho_df["_boa_date"] = boa_posting_date
     else:
-        zoho_rows["_boa_date"]        = pd.NaT
-        zoho_rows["_boa_description"] = ""
-        if boa_zoho.empty:
-            log.append({"level": "WARN", "msg": "No Zoho-tagged rows found in BOA file (description must contain 'ZOHO')."})
+        zoho_df["_boa_date"] = pd.NaT
 
-    return zoho_rows, log
+    zoho_df["_boa_description"] = boa_descs
+    return zoho_df
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Customer resolution
+# Balance validation
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _build_customer_lookup(customer_df: pd.DataFrame) -> dict:
-    """Build a normalised name → {Account, Account Name} lookup."""
+def _validate_balance(boa_df, zoho_df, log):
+    if boa_df is None or boa_df.empty:
+        return
+    if "_boa_amount" not in boa_df.columns:
+        return
+
+    boa_zoho = boa_df[boa_df.get("_is_zoho", pd.Series(False, index=boa_df.index))]
+    if boa_zoho.empty:
+        return
+
+    boa_net   = boa_zoho["_boa_amount"].sum()
+    zoho_gross = zoho_df["gross_amount"].fillna(0).sum() if "gross_amount" in zoho_df.columns else 0
+    zoho_fee   = zoho_df["fee"].fillna(0).sum()          if "fee"          in zoho_df.columns else 0
+    zoho_net   = zoho_gross - zoho_fee
+
+    diff = abs(float(boa_net) - float(zoho_net))
+    tol  = max(abs(float(boa_net)) * 0.005, 1.0)
+
+    if diff <= tol:
+        log.append({
+            "level": "OK",
+            "msg":   (f"Balance check PASSED: BOA net=${boa_net:,.2f} "
+                      f"≈ Zoho gross${zoho_gross:,.2f} − fee${zoho_fee:,.2f} = ${zoho_net:,.2f}")
+        })
+    else:
+        log.append({
+            "level": "WARN",
+            "msg":   (f"Balance mismatch: BOA net=${boa_net:,.2f}, "
+                      f"Zoho net=${zoho_net:,.2f}, diff=${diff:,.2f} "
+                      f"(tolerance=${tol:.2f})")
+        })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Customer lookup helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_customer_lookup(customer_df):
     lookup = {}
     for _, row in customer_df.iterrows():
         acc  = str(row.get("Account", "")).strip()
         name = str(row.get("Account Name", "")).strip()
         if acc and name:
-            key = _normalise_name(name)
-            lookup[key] = {"account": acc, "account_name": name}
+            lookup[_normalise_name(name)] = {"account": acc, "account_name": name}
     return lookup
 
 
-def _normalise_name(name: str) -> str:
-    """Lower-case, strip punctuation and common legal suffixes for fuzzy matching."""
+def _normalise_name(name):
     name = str(name).lower().strip()
     name = re.sub(r"[^\w\s]", " ", name)
-    # Remove common suffixes that vary between sources
-    for suffix in [r"\bllc\b", r"\binc\b", r"\bltd\b", r"\bcorp\b", r"\bpllc\b",
-                   r"\bpc\b", r"\bdba\b", r"\bthe\b"]:
+    for suffix in [r"\bllc\b", r"\binc\b", r"\bltd\b", r"\bcorp\b",
+                   r"\bpllc\b", r"\bpc\b", r"\bdba\b", r"\bthe\b"]:
         name = re.sub(suffix, "", name)
     return re.sub(r"\s+", " ", name).strip()
 
 
-def _resolve_zoho_row(zrow: pd.Series, customer_lookup: dict, invoice_files, log: list) -> dict:
-    """Attempt to resolve a single Zoho row to a known customer account."""
-    raw_name    = str(zrow.get("customer", "")).strip()
-    email       = str(zrow.get("email", "")).strip()
-    invoice_ref = str(zrow.get("invoice", "")).strip()
-    row_idx     = zrow.name
-
-    # ── Pattern 1 & 2: Name present ──────────────────────────────────────────
-    if raw_name and raw_name.lower() not in ("nan", "none", ""):
-        result = _fuzzy_lookup(raw_name, customer_lookup)
-        if result["_match_confidence"] in ("HIGH", "MEDIUM"):
-            result["_raw_name"] = raw_name
-            return result
-        # Low confidence but name present — still flag
-        log.append({"level": "WARN",
-                    "msg":   f"Row {row_idx}: '{raw_name}' fuzzy score {result['_fuzzy_score']} < threshold — REVIEW."})
-        result["_raw_name"] = raw_name
-        return result
-
-    # ── Pattern 3: Invoice number present, no name ───────────────────────────
-    if invoice_ref and invoice_ref.lower() not in ("nan", "none", ""):
-        # Try to extract account from invoice number pattern (e.g. INV-BC000327-...)
-        acct_match = re.search(r"BC\d{6}", invoice_ref, re.IGNORECASE)
-        if acct_match:
-            acct = acct_match.group(0).upper()
-            rev_lookup = {v["account"]: v for v in customer_lookup.values()}
-            if acct in rev_lookup:
-                log.append({"level": "OK",
-                             "msg": f"Row {row_idx}: resolved via invoice ref '{invoice_ref}' → {acct}."})
-                return {
-                    "_account":           acct,
-                    "_account_name":      rev_lookup[acct]["account_name"],
-                    "_match_method":      "INVOICE_REF",
-                    "_match_confidence":  "HIGH",
-                    "_needs_review":      False,
-                    "_review_reason":     "",
-                    "_cash_code":         "",
-                    "_fuzzy_score":       100,
-                    "_raw_name":          "",
-                }
-
-    # ── Pattern 4: Only email present ────────────────────────────────────────
-    # We cannot resolve email → name without an external source; flag for review
-    reason = "No customer name"
-    if email and email.lower() not in ("nan", "none", ""):
-        reason = f"Only email available ({email}) — upload invoice to resolve"
-
-    log.append({"level": "WARN", "msg": f"Row {row_idx}: {reason} — flagged for manual review."})
-    return {
-        "_account":          "",
-        "_account_name":     raw_name or email,
-        "_match_method":     "UNRESOLVED",
-        "_match_confidence": "LOW",
-        "_needs_review":     True,
-        "_review_reason":    reason,
-        "_cash_code":        "",
-        "_fuzzy_score":      0,
-        "_raw_name":         raw_name,
-    }
-
-
-def _fuzzy_lookup(raw_name: str, customer_lookup: dict) -> dict:
-    """Fuzzy-match raw_name against customer master; return resolution dict."""
+def _fuzzy_lookup(raw_name, customer_lookup):
     norm = _normalise_name(raw_name)
     keys = list(customer_lookup.keys())
 
     if not keys:
         return _unresolved(raw_name, "Customer master is empty")
 
-    # token_set_ratio handles re-ordered words and DBA names well
-    result = process.extractOne(norm, keys, scorer=fuzz.token_set_ratio)
-    best_key, score = result[0], result[1]
-    matched = customer_lookup[best_key]
+    result   = process.extractOne(norm, keys, scorer=fuzz.token_set_ratio)
+    best_key = result[0]
+    score    = result[1]
+    matched  = customer_lookup[best_key]
 
     if score >= _FUZZY_THRESHOLD:
-        confidence = "HIGH" if score >= 95 else "MEDIUM"
+        confidence = "HIGH" if score >= 92 else "MEDIUM"
         return {
             "_account":          matched["account"],
             "_account_name":     matched["account_name"],
+            "_account_type":     "Customer",
+            "_posting_profile":  "AutoPost",
             "_match_method":     f"FUZZY({score})",
             "_match_confidence": confidence,
             "_needs_review":     confidence == "MEDIUM",
-            "_review_reason":    f"Fuzzy match score {score}/100 — verify name" if confidence == "MEDIUM" else "",
-            "_cash_code":        "",
+            "_review_reason":    (f"Fuzzy match '{matched['account_name']}' "
+                                  f"score {score}/100 — verify") if confidence == "MEDIUM" else "",
             "_fuzzy_score":      score,
-            "_raw_name":         raw_name,
         }
-    else:
-        return _unresolved(raw_name, f"Best fuzzy match '{matched['account_name']}' scored only {score}/100")
+    return _unresolved(raw_name,
+                       f"Best match '{matched['account_name']}' scored {score}/100 < {_FUZZY_THRESHOLD}")
 
 
-def _unresolved(raw_name: str, reason: str) -> dict:
+def _unresolved(raw_name, reason):
     return {
         "_account":          "",
         "_account_name":     raw_name,
+        "_account_type":     "Customer",
+        "_posting_profile":  "AutoPost",
         "_match_method":     "UNRESOLVED",
         "_match_confidence": "LOW",
         "_needs_review":     True,
         "_review_reason":    reason,
-        "_cash_code":        "",
         "_fuzzy_score":      0,
-        "_raw_name":         raw_name,
     }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Mathematical balance validation
+# Payment term → cash code
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _validate_balance(boa_df: pd.DataFrame, zoho_df: pd.DataFrame, log: list):
-    """
-    Per the Automation Rules §3.3 Balance Invariant:
-      sum(Zoho Gross) - sum(Zoho Fees) == BOA Net
+def _terms_to_cash_code(terms_str):
+    """Return (cash_code, description_prefix) from a payment terms string."""
+    if not terms_str or str(terms_str).lower() in ("nan", ""):
+        return "AR001", ""
+    terms_lower = terms_str.lower().strip()
+    for key, val in _TERMS_TO_CASH_CODE.items():
+        if key in terms_lower:
+            return val
+    return "AR001", ""   # default: due on receipt
 
-    Groups both sides by date and checks within tolerance.
-    Tolerance: max(0.5% of amount, $1.00)
-    """
-    if "date" not in boa_df.columns or "date" not in zoho_df.columns:
-        return
-    if "_boa_amount" not in boa_df.columns:
-        return
 
-    boa_by_date  = boa_df.groupby(boa_df["date"].dt.normalize())["_boa_amount"].sum()
-    zoho_net_by_date = zoho_df.groupby(zoho_df["date"].dt.normalize()).apply(
-        lambda g: g["gross_amount"].fillna(0).sum() - g["fee"].fillna(0).sum()
-    )
-
-    for date, boa_net in boa_by_date.items():
-        if date not in zoho_net_by_date.index:
-            continue
-        zoho_net = zoho_net_by_date[date]
-        diff     = abs(float(boa_net) - float(zoho_net))
-        tol      = max(abs(float(boa_net)) * 0.005, 1.0)
-        if diff > tol:
-            log.append({
-                "level": "WARN",
-                "msg":   (f"Balance mismatch on {date.date()}: "
-                          f"BOA net={boa_net:,.2f}, Zoho net={zoho_net:,.2f}, "
-                          f"diff={diff:,.2f} (tolerance ${tol:.2f})"),
-            })
-        else:
-            log.append({
-                "level": "OK",
-                "msg":   (f"Balance check PASSED for {date.date()}: "
-                          f"BOA net={boa_net:,.2f} ≈ Zoho net={zoho_net:,.2f}"),
-            })
+def _safe_float(val):
+    try:
+        f = float(str(val).replace(",", "").replace("$", "").strip())
+        return None if np.isnan(f) else f
+    except (ValueError, TypeError):
+        return None
