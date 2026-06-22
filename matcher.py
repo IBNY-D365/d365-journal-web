@@ -149,21 +149,27 @@ def _resolve_row(zrow, customer_lookup, invoice_by_amount, invoice_by_name, log)
                     f"→ '{customer_name}' | terms='{payment_terms}' | code={cash_code}")
         })
 
-        # Check if this is a CS/repair ticket (individual person, not a business)
+        # Check if this is a CS/repair ticket invoice (has [## XXX ##] in items)
         is_cs_ticket = bool(cs_ticket)
 
-        if is_cs_ticket:
-            # Special handling: Temporary Receipt account (from D365 reference image)
+        # Normal business customer lookup — works for both business names AND
+        # individual names that appear in the CS/PS Ticket column of the master
+        master_result = _fuzzy_lookup(customer_name, customer_lookup)
+        found_in_master = master_result["_match_confidence"] in ("HIGH", "MEDIUM")
+
+        if is_cs_ticket and not found_in_master:
+            # Individual not found in master at all — use Temporary Receipt
             desc_prefix = f"{customer_name} CS Ticket #{cs_ticket}_"
             return {
                 "_account":          _TEMP_RECEIPT_ACCOUNT,
                 "_account_name":     _TEMP_RECEIPT_NAME,
                 "_account_type":     "Ledger",
                 "_posting_profile":  "AutoPost",
-                "_match_method":     "INVOICE_CS_TICKET",
-                "_match_confidence": "HIGH",
-                "_needs_review":     False,
-                "_review_reason":    "",
+                "_match_method":     "INVOICE_CS_TICKET_UNREGISTERED",
+                "_match_confidence": "MEDIUM",
+                "_needs_review":     True,
+                "_review_reason":    (f"'{customer_name}' not in Account Masterlist. "
+                                      f"Add them with their BC###### to resolve automatically."),
                 "_cash_code":        cash_code,
                 "_cash_code_prefix": "",
                 "_desc_prefix":      desc_prefix,
@@ -171,8 +177,23 @@ def _resolve_row(zrow, customer_lookup, invoice_by_amount, invoice_by_name, log)
                 "_invoice_number":   inv.get("invoice_number", ""),
             }
 
-        # Normal business customer — look up in master
-        master_result = _fuzzy_lookup(customer_name, customer_lookup)
+        if is_cs_ticket and found_in_master:
+            # Individual found via CS/PS Ticket column — use their business account
+            # but keep the CS ticket description prefix for the D365 description
+            log.append({
+                "level": "OK",
+                "msg": (f"Row {idx}: CS ticket '{customer_name}' matched to "
+                        f"'{master_result['_account_name']}' via CS/PS Ticket column.")
+            })
+            desc_prefix = f"{customer_name} CS Ticket #{cs_ticket}_"
+            master_result["_desc_prefix"]      = desc_prefix
+            master_result["_cash_code"]        = cash_code
+            master_result["_cash_code_prefix"] = pfx
+            master_result["_invoice_number"]   = inv.get("invoice_number", "")
+            master_result["_raw_name"]         = customer_name
+            master_result.setdefault("_account_type",    "Customer")
+            master_result.setdefault("_posting_profile", "AutoPost")
+            return master_result
         master_result["_cash_code"]        = cash_code
         master_result["_cash_code_prefix"] = pfx
         master_result["_desc_prefix"]      = ""
@@ -361,12 +382,35 @@ def _validate_balance(boa_df, zoho_df, log):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_customer_lookup(customer_df):
+    """
+    Build lookup dict: normalised_name → {account, account_name}
+
+    Two entries are created per row when CS/PS Ticket is present:
+      1. Normalised Account Name  → used when Zoho/invoice has the business name
+      2. Normalised CS/PS Ticket  → used when invoice "Bill To" has an individual name
+         (e.g. "Ali Amir" → maps to BC000654 Functional Holistic Healing)
+
+    This means even if the invoice says "Bill To: Ali Amir", the app will
+    record the correct D365 account name "Functional Holistic Healing".
+    """
     lookup = {}
     for _, row in customer_df.iterrows():
-        acc  = str(row.get("Account", "")).strip()
-        name = str(row.get("Account Name", "")).strip()
-        if acc and name:
-            lookup[_normalise_name(name)] = {"account": acc, "account_name": name}
+        acc    = str(row.get("Account", "")).strip()
+        name   = str(row.get("Account Name", "")).strip()
+        ticket = str(row.get("CS/PS Ticket", "")).strip()
+
+        if not acc or not name:
+            continue
+
+        entry = {"account": acc, "account_name": name}
+
+        # Primary key: business/account name
+        lookup[_normalise_name(name)] = entry
+
+        # Secondary key: individual name from CS/PS Ticket column
+        if ticket and ticket.lower() not in ("", "nan", "none"):
+            lookup[_normalise_name(ticket)] = entry
+
     return lookup
 
 
