@@ -243,12 +243,24 @@ def _parse_zoho_pdf(file_obj):
     """
     Parse a Zoho Payout Details PDF (screen-captured from pay.zoho.com).
 
-    Key observations from real file:
-      - All text is extracted as raw lines (no proper table structure)
-      - Page 1 has: payout header, summary block, first transaction row (split across lines)
-      - Page 2 has: remaining transaction rows (also split across lines)
-      - Transaction layout: date ... gross ... net ... fee  (fee is LAST, not second)
-      - For each transaction block: largest dollar = gross, smallest = fee, middle = net
+    Architecture:
+      The Zoho PDF is used for PAYOUT-LEVEL METADATA only:
+        - Payout date (= BOA posting date)
+        - Total gross amount (for balance validation)
+        - Total fee / summary fee (authoritative debit amount — never recalculated)
+        - BOA account last 4 digits (for offset account routing)
+        - Payout ID + Bank Reference (appear in BOA description)
+
+      Per-transaction customer names and amounts come from uploaded INVOICES,
+      not from the PDF. This is robust to any transaction count (1 to 14+)
+      because it never relies on parsing individual transaction rows from the PDF.
+
+    Per-transaction amounts ARE extracted when available (for invoice-less flows),
+    using the "chunk-by-3" strategy: the PDF always emits (gross, net, fee) for
+    each transaction in sequence. We skip the summary values and chunk the rest.
+
+    CRITICAL: The summary fee line is ALWAYS used as the debit row amount.
+    Individual per-txn fees are never summed — they can drift due to PDF layout.
     """
     errors = []
     try:
@@ -268,135 +280,144 @@ def _parse_zoho_pdf(file_obj):
 
     full_text = "\n".join(pages_text)
 
-    # ── Extract payout metadata ───────────────────────────────────────────────
-    # Paid On date (3 separate lines: "Jun", "16,", "2026")
-    paid_on_date = None
+    # ── 1. Extract payout metadata ────────────────────────────────────────────
+
+    # Payout date ("Payout: Jun 15, 2026, 06:38 AM")
+    payout_date = None
+    pd_m = re.search(r"Payout:\s+(\w+ \d{1,2}, \d{4})", full_text)
+    if pd_m:
+        payout_date = pd_m.group(1).strip()
+
+    # Paid On date — rendered across 3 separate lines in the PDF:
+    # "Paid / On / Jun / 16, / 2026"  (rendered across 3 separate lines)
+    paid_on = None
     paid_on_m = re.search(
         r"Paid\s*\nOn\s*\n(\w+)\s*\n(\d{1,2}),?\s*\n(\d{4})", full_text
     )
     if paid_on_m:
-        paid_on_date = f"{paid_on_m.group(1)} {paid_on_m.group(2)}, {paid_on_m.group(3)}"
-    
-    # Also try single-line format
-    if not paid_on_date:
-        paid_on_m2 = re.search(
-            r"Paid\s+On\s+(\w+\s+\d{1,2},?\s*\d{4})", full_text, re.IGNORECASE
-        )
+        paid_on = f"{paid_on_m.group(1)} {paid_on_m.group(2)}, {paid_on_m.group(3)}"
+    if not paid_on:
+        paid_on_m2 = re.search(r"Paid\s+On\s+(\w+\s+\d{1,2},?\s*\d{4})", full_text)
         if paid_on_m2:
-            paid_on_date = paid_on_m2.group(1).strip()
+            paid_on = paid_on_m2.group(1).strip()
 
-    payout_id_m = re.search(r"Payout ID:\s*(\d+)", full_text)
-    payout_id = payout_id_m.group(1) if payout_id_m else ""
+    posting_date = paid_on or payout_date or ""
 
-    bank_ref_m = re.search(r"Bank Reference ID:\s*(\d+)", full_text)
-    bank_ref = bank_ref_m.group(1) if bank_ref_m else ""
+    # Payout ID and Bank Reference
+    pid_m = re.search(r"Payout ID:\s*(\d+)", full_text)
+    payout_id = pid_m.group(1) if pid_m else ""
 
-    boa_acct_m = re.search(r"\(\s*(?:\u2022+\s*)?(\d{4})\s*\)", full_text)
-    if not boa_acct_m:
-        boa_acct_m = re.search(r"\(\s*[•]+\s*(\d{4})\s*\)", full_text)
-    boa_acct = boa_acct_m.group(1) if boa_acct_m else ""
+    bref_m = re.search(r"Bank Reference ID:\s*(\d+)", full_text)
+    bank_ref = bref_m.group(1) if bref_m else ""
 
-    # ── Get expected transaction count from summary ───────────────────────────
+    # BOA account last 4 digits "( 3371 )" or "(••••3371)"
+    acct_m = re.search(r"\(\s*[•\*]*\s*(\d{4})\s*\)", full_text)
+    boa_acct = acct_m.group(1) if acct_m else ""
+
+    # ── 2. Extract summary totals (authoritative) ─────────────────────────────
     summary_m = re.search(
-        r"Payments\s+(\d+)\s+\$([\d,]+\.\d{2})\s+[−\-]\$?([\d,]+\.\d{2})",
+        r"Payments\s+(\d+)\s+\$([\d,]+\.\d{2})\s+[−\-]\$?([\d,]+\.\d{2})\s+\$([\d,]+\.\d{2})",
         full_text
     )
-    expected_count = int(summary_m.group(1)) if summary_m else None
-    total_fee_from_summary = float(summary_m.group(3).replace(",","")) if summary_m else None
+    if not summary_m:
+        return pd.DataFrame(), ["Could not find Payments summary line in Zoho PDF. "
+                                  "Check that the file is a Zoho Payout Details PDF."]
 
-    # ── Find the "All Transactions" section ──────────────────────────────────
+    expected_count = int(summary_m.group(1))
+    summary_gross  = float(summary_m.group(2).replace(",", ""))
+    summary_fee    = float(summary_m.group(3).replace(",", ""))  # AUTHORITATIVE fee
+    summary_net    = float(summary_m.group(4).replace(",", ""))
+
+    # ── 3. Extract per-transaction gross amounts ──────────────────────────────
+    # Used when no invoices are uploaded. Strategy: chunk-by-3.
+    # The PDF emits dollar values after the summary in order:
+    #   gross_1, net_1, fee_1, gross_2, net_2, fee_2, ...
+    # We skip the summary values, then chunk remaining values into groups of 3.
+
     txn_section = full_text
     if "All Transactions" in full_text:
         txn_section = full_text.split("All Transactions", 1)[1]
 
-    # ── Find transaction blocks: each starts with a date like "Jun 12, 2026" ─
-    # Dates in transaction rows (not the payout date header)
-    # Payout date = "Jun 15, 2026" (from "Payout: Jun 15...") → skip this date
-    payout_date_m = re.search(r"Payout:\s+(\w+ \d{1,2}, \d{4})", full_text)
-    payout_header_date = payout_date_m.group(1) if payout_date_m else None
+    # Remove noise lines
+    txn_section = re.sub(r"Refunds[^\n]*\n?", "", txn_section)
+    txn_section = re.sub(r"Adjustments[^\n]*\n?", "", txn_section)
+    txn_section = re.sub(r"Amount\s+\$[\d,]+\.\d{2}\s+USD\n?", "", txn_section)
+    txn_section = re.sub(r"https?://\S+", "", txn_section)
+    txn_section = re.sub(r"Page \d+ of \d+", "", txn_section)
 
-    # Find all "Month DD, YYYY" dates in the transaction section
-    all_dates = list(re.finditer(r"(\w{3}\s+\d{1,2},\s*\d{4})", txn_section))
-    
-    # Filter out the payout header date if it appears
-    txn_dates = []
-    for dm in all_dates:
-        d = dm.group(1).strip()
-        if payout_header_date and d == payout_header_date:
+    # Collect all positive dollar values in the transaction section
+    all_dollars = [
+        float(m.group(1).replace(",", ""))
+        for m in re.finditer(r"\$([\d,]+\.\d{2})", txn_section)
+        if float(m.group(1).replace(",", "")) > 0
+    ]
+
+    # Skip leading summary values (summary_gross, summary_fee, summary_net appear first)
+    skip_vals = [summary_gross, summary_fee, summary_net]
+    skip_idx = 0
+    clean_dollars = []
+    for val in all_dollars:
+        if skip_idx < len(skip_vals) and abs(val - skip_vals[skip_idx]) < 0.02:
+            skip_idx += 1
             continue
-        txn_dates.append(dm)
+        clean_dollars.append(val)
 
+    # Chunk into groups of 3: (gross, net, fee)
     transactions = []
-
-    if txn_dates:
-        for i, date_m in enumerate(txn_dates):
-            # Get the text segment around this transaction
-            start = max(0, date_m.start() - 20)  # a little before the date
-            end = txn_dates[i+1].start() if i+1 < len(txn_dates) else len(txn_section)
-            segment = txn_section[start:end]
-
-            # Extract all dollar values in this segment
-            dollar_vals = [
-                float(m.group(1).replace(",",""))
-                for m in re.finditer(r"\$([\d,]+\.\d{2})", segment)
-            ]
-            
-            # Filter out $0.00 values and summary amounts
-            dollar_vals = [v for v in dollar_vals if v > 0]
-
-            if not dollar_vals:
-                continue
-
-            if len(dollar_vals) >= 2:
-                gross = max(dollar_vals)
-                fee   = min(dollar_vals)
-            else:
-                gross = dollar_vals[0]
-                fee   = 0.0
-
+    if len(clean_dollars) >= expected_count * 3:
+        for i in range(expected_count):
+            chunk = clean_dollars[i*3 : i*3+3]
             transactions.append({
-                "date":         date_m.group(1).strip(),
-                "customer":     "",
-                "gross_amount": str(gross),
-                "fee":          str(fee),
-                "net_amount":   str(gross - fee),
-                "payout_date":  paid_on_date or "",
-                "payout_id":    payout_id,
-                "bank_ref":     bank_ref,
-                "boa_acct":     boa_acct,
+                "gross_amount":  str(chunk[0]),
+                "fee":           str(chunk[2]),   # fee is LAST in triplet
+                "net_amount":    str(chunk[1]),
+                "customer":      "",
+                "date":          posting_date,
+                "payout_date":   posting_date,
+                "payout_id":     payout_id,
+                "bank_ref":      bank_ref,
+                "boa_acct":      boa_acct,
+                "_summary_fee":  str(summary_fee),
+                "_summary_gross": str(summary_gross),
+                "_expected_count": str(expected_count),
             })
-    
-    # ── Fallback: distribute summary total across invoices ────────────────────
-    if not transactions and summary_m:
-        total_gross = float(summary_m.group(2).replace(",",""))
-        total_fee   = float(summary_m.group(3).replace(",",""))
-        transactions.append({
-            "date":         paid_on_date or "",
-            "customer":     "",
-            "gross_amount": str(total_gross),
-            "fee":          str(total_fee),
-            "net_amount":   str(total_gross - total_fee),
-            "payout_date":  paid_on_date or "",
-            "payout_id":    payout_id,
-            "bank_ref":     bank_ref,
-            "boa_acct":     boa_acct,
-            "_is_summary":  True,
-        })
+    else:
+        # Partial data or dates-only available — create one row per expected txn
+        # with gross distributed from clean_dollars (best effort)
+        # The summary fee is still authoritative for the debit row
+        available_gross = clean_dollars[:expected_count] if clean_dollars else []
+
+        for i in range(expected_count):
+            gross = available_gross[i] if i < len(available_gross) else 0.0
+            transactions.append({
+                "gross_amount":  str(gross),
+                "fee":           "0.0",   # individual fee unknown; use summary total
+                "net_amount":    str(gross),
+                "customer":      "",
+                "date":          posting_date,
+                "payout_date":   posting_date,
+                "payout_id":     payout_id,
+                "bank_ref":      bank_ref,
+                "boa_acct":      boa_acct,
+                "_summary_fee":  str(summary_fee),
+                "_summary_gross": str(summary_gross),
+                "_expected_count": str(expected_count),
+            })
+
+    # Validate: sum of parsed grosses should match summary
+    parsed_gross_sum = sum(float(t["gross_amount"]) for t in transactions)
+    if abs(parsed_gross_sum - summary_gross) > 1.0:
         errors.append(
-            f"Zoho PDF: Parsed summary only ({summary_m.group(1)} payments, "
-            f"gross=${total_gross:,.2f}, fee=${total_fee:,.2f}). "
-            f"Upload invoices to split by customer."
+            f"Zoho PDF: Per-transaction gross sum ${parsed_gross_sum:,.2f} does not match "
+            f"summary ${summary_gross:,.2f}. Individual row amounts may be approximate. "
+            f"Upload invoices for exact per-customer amounts."
         )
 
     if not transactions:
-        errors.append(
-            "Could not extract transaction data from Zoho PDF. "
-            "Try exporting from Zoho Payments as CSV or Excel."
-        )
-        return pd.DataFrame(), errors
+        return pd.DataFrame(), ["Could not extract transaction rows from Zoho PDF. "
+                                  "Upload Zoho export as CSV or Excel for best results."]
 
-    df = pd.DataFrame(transactions)
-    return df, errors
+    return pd.DataFrame(transactions), errors
 
 
 
