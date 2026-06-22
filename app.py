@@ -17,8 +17,7 @@ from io import BytesIO
 import warnings
 warnings.filterwarnings("ignore")
 
-# ── Inline modules (parsers, matcher, builder, exporter) ─────────────────────
-# All logic is inlined here so a single file update deploys everything.
+# ── Inline modules ───────────────────────────────────────────────────────────
 
 """
 parsers.py — File parsing for BOA, Zoho, and reference spreadsheets.
@@ -1406,11 +1405,20 @@ def _build_credit_description(cash_code, cash_pfx, desc_prefix,
             return f"{cash_pfx}{name_part}_{boa_desc}"
         return f"{cash_pfx}{name_part}"
 
-    # Standard: "AR001: BC000649 Equity Now Inc_ZOHO PAYMENTS DES:..."
-    code_token = f"{cash_code}: " if cash_code else ""
-    if boa_desc:
-        return f"{code_token}{name_part}_{boa_desc}"
-    return f"{code_token}{name_part}"
+    # Standard format per SOP:
+    #   With account resolved:   "AR001: BC000649 Equity Now Inc_ZOHO PAYMENTS DES:..."
+    #   Without account (new):   "Legends Charter School_ZOHO PAYMENTS DES:..."
+    #   (no cash code prefix when account number is not yet in master)
+    if account:
+        code_token = f"{cash_code}: " if cash_code else ""
+        if boa_desc:
+            return f"{code_token}{name_part}_{boa_desc}"
+        return f"{code_token}{name_part}"
+    else:
+        # Account not resolved yet — omit cash code prefix, just use name
+        if boa_desc:
+            return f"{account_name}_{boa_desc}"
+        return account_name
 
 
 def _safe_float(val):
@@ -1684,7 +1692,6 @@ st.markdown("""
 
 # ── Header ────────────────────────────────────────────────────────────────────
 st.markdown('<div class="main-header">📒 IBNY D365 Journal Entry Automation</div>', unsafe_allow_html=True)
-
 st.markdown('<div class="sub-header">Upload BOA and Zoho files to generate a D365-ready journal entry Excel.</div>', unsafe_allow_html=True)
 st.caption("v1.4 — fee fix: uses Zoho summary fee")
 
@@ -1699,9 +1706,8 @@ def load_references():
 
 try:
     customer_df, cash_code_df = load_references()
-    # DIAGNOSTIC: show exactly what columns and CS/PS data the loaded master has
     cs_count = int((customer_df.get("CS/PS Ticket", pd.Series()).fillna("").str.strip() != "").sum()) if "CS/PS Ticket" in customer_df.columns else 0
-    st.markdown(f'<div class="ok-box">✅ Reference files loaded — {len(customer_df)} customer accounts · {len(cash_code_df)} cash codes · CS/PS Ticket entries: {cs_count} · Columns: {list(customer_df.columns)}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="ok-box">✅ Reference files loaded — {len(customer_df)} customer accounts · {len(cash_code_df)} cash codes · CS/PS entries: {cs_count}</div>', unsafe_allow_html=True)
 except Exception as e:
     st.markdown(f'<div class="err-box">❌ Could not load reference files: {e}</div>', unsafe_allow_html=True)
     st.stop()
