@@ -1,31 +1,22 @@
-# D365 General Journal Builder
+[README.md](https://github.com/user-attachments/files/29210005/README.md)
+# D365 Journal Builder
 
-## What it does
+## What changed
+- The D365 template is bundled with the app, so you do **not** need to upload it every day.
+- BOA and Zoho files remain the daily inputs.
+- Zoho record upload now accepts **PDF** in addition to XLSX and CSV.
 
-This Streamlit app reads:
-
-- a Bank of America export
-- a Zoho payment export
-- your D365 template workbook
-
-It then generates a D365-ready journal workbook using the Zoho payment rules and the template column layout.
-
-## Files
-
-- `app.py` - Streamlit app
-- `requirements.txt` - Python dependencies
-- `README.md` - setup notes
+## Files that must live in the repo
+- `app.py`
+- `requirements.txt`
+- `D365_General_Journal_Template.xlsx`
 
 ## Run locally
-
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
 ## Notes
-
-- Use your D365 template workbook as the upload template.
-- If the BOA and Zoho files share a common key, select the join columns in the app.
-- Monthly payment terms get the `MPP` prefix.
-- Credit lines use the Zoho gross amount; debit lines use the merchant fee.
+- Template upload is optional and only used as an override.
+- PDF support is best-effort. If the Zoho PDF is text-based with tables, extraction usually works well. If the PDF is image-only or heavily formatted, CSV/XLSX is more reliable.
