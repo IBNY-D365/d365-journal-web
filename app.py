@@ -38,33 +38,61 @@ def create_base_row():
     row["Reversing entry"] = "No"
     return row
 
-def robust_read_boa_csv(file_io):
+def custom_parse_boa_csv(file_io):
     """
-    Robustly scans the bank statement using fuzzy keyword detection to locate 
-    where the true transaction grid starts, regardless of extra description modifiers.
+    Direct string block scanner that completely bypasses pandas column dependency issues.
+    Extracts date, description, and amount natively using pure positional data streaming.
     """
-    lines = [line.decode('utf-8', errors='ignore') for line in file_io.readlines()]
+    raw_bytes = file_io.read()
     file_io.seek(0)
+    text = raw_bytes.decode('utf-8', errors='ignore')
+    lines = [line.strip() for line in text.split('\n') if line.strip()]
     
-    skip_rows = 0
+    parsed_records = []
+    headers = []
+    header_idx = -1
+    
+    # 1. Locate data grid entry point line-by-line
     for idx, line in enumerate(lines):
-        upper_line = line.upper()
-        # Uses fuzzy partial row scanning to secure matching criteria across files
-        if "DESC" in upper_line or "AMT" in upper_line or "AMOUNT" in upper_line:
-            skip_rows = idx
+        clean_line = line.upper()
+        if "DESCRIPTION" in clean_line and ("AMOUNT" in clean_line or "DEBIT" in clean_line or "CREDIT" in clean_line):
+            headers = [h.strip().replace('"', '') for h in line.split(',')]
+            header_idx = idx
             break
             
-    file_io.seek(0)
-    df = pd.read_csv(
-        file_io, 
-        skiprows=skip_rows, 
-        engine='python', 
-        on_bad_lines='skip'
-    )
-    
-    # Dynamic Column Cleanup: standardizes headers to handle multi-word titles clean
-    df.columns = df.columns.str.strip().str.upper()
-    return df
+    if header_idx == -1:
+        # Fallback if statement lacks formal header grid line
+        headers = ["DATE", "DESCRIPTION", "AMOUNT", "SOURCE ACCOUNT"]
+        header_idx = -1 
+        
+    # 2. Process data lines sequentially below header row
+    for line in lines[header_idx + 1:]:
+        # Handle commas inside quoted description text lines safely
+        parts = []
+        current_part = []
+        in_quotes = False
+        for char in line:
+            if char == '"':
+                in_quotes = not in_quotes
+            elif char == ',' and not in_quotes:
+                parts.append("".join(current_part).strip().replace('"', ''))
+                current_part = []
+            else:
+                current_part.append(char)
+        parts.append("".join(current_part).strip().replace('"', ''))
+        
+        if len(parts) < 2:
+            continue
+            
+        # Map indices dynamically based on found positions
+        row_dict = {}
+        for h_i, h_name in enumerate(headers):
+            if h_i < len(parts):
+                row_dict[h_name.upper()] = parts[h_i]
+                
+        parsed_records.append(row_dict)
+        
+    return pd.DataFrame(parsed_records)
 
 # ==========================================
 # STREAMLIT UI SETUP
@@ -74,83 +102,4 @@ str_lit.set_page_config(page_title="D365 Transaction Journal Generator", layout=
 str_lit.sidebar.header("D365 Defaults")
 default_company = str_lit.sidebar.text_input("Company", value="bwa")
 default_offset = str_lit.sidebar.text_input("Default Offset Account", value="B1000002")
-default_debit_ledger = str_lit.sidebar.text_input("Debit Line Account (Ledger)", value="43170111-U26C05001-B735350-UOA003")
-
-str_lit.title("""D365 Transaction Journal Generator""")
-str_lit.subheader("""Upload your Bank of America statement plus any gateway/invoice files for the day.""")
-
-col1, col2, col3 = str_lit.columns(3)
-
-with col1:
-    gateway_file = str_lit.file_uploader("""1. Upload Zoho / Stripe / Bankcard file (PDF, CSV, XLSX)""", type=["pdf", "csv", "xlsx"])
-with col2:
-    invoice_files = str_lit.file_uploader("""2. Upload invoice files (PDF, CSV, XLSX, TXT)""", accept_multiple_files=True)
-with col3:
-    boa_statement = str_lit.file_uploader("""3. Upload Bank of America statement (CSV, XLSX)""", type=["csv", "xlsx"])
-
-str_lit.info("""Upload the BOA statement to begin. Gateway and invoice files are optional depending on the day.""")
-
-@str_lit.cache_data
-def load_master_files():
-    try:
-        cust_master = pd.read_excel("Customer Master Account File.xlsx")
-        form_master = pd.read_excel("Form_Master_DB.xlsx", sheet_name="Sales_PRF")
-        monthly_exp = pd.read_excel("Monthly Expense Record.xlsx")
-        return cust_master, form_master, monthly_exp
-    except Exception:
-        return None, None, None
-
-cust_master, form_master, monthly_exp = load_master_files()
-
-# ==========================================
-# PROCESSING ENGINE (DETERMINISTIC PIPELINE)
-# ==========================================
-if boa_statement is not None:
-    if boa_statement.name.endswith('.csv'):
-        df_boa = robust_read_boa_csv(boa_statement)
-    else:
-        df_boa = pd.read_excel(boa_statement)
-        df_boa.columns = df_boa.columns.str.strip().str.upper()
-        
-    output_rows = []
-    
-    # Locate exact column reference keys using custom search fallback patterns
-    desc_col = next((col for col in df_boa.columns if "DESC" in col), None)
-    amt_col = next((col for col in df_boa.columns if "AMT" in col or "AMOUNT" in col), None)
-    date_col = next((col for col in df_boa.columns if "DATE" in col), None)
-    src_col = next((col for col in df_boa.columns if "ACC" in col or "SOURCE" in col), "SOURCE ACCOUNT")
-    
-    if desc_col and amt_col:
-        for idx, boa_row in df_boa.iterrows():
-            boa_desc = str(boa_row.get(desc_col, '')).upper()
-            
-            # Rule Implementation: Clear out systemic summary text blocks cleanly
-            if any(ignored in boa_desc for ignored in ["BEGINNING BALANCE", "TOTAL CREDITS", "TOTAL DEBITS", "ENDING BALANCE"]):
-                continue
-                
-            if not boa_desc.strip() or boa_desc == 'NAN':
-                continue
-                
-            try:
-                raw_amt = str(boa_row.get(amt_col, '0')).replace('$', '').replace(',', '').strip()
-                boa_amt = float(raw_amt)
-            except ValueError:
-                boa_amt = 0.0
-                
-            boa_date = boa_row.get(date_col, '') if date_col else ''
-            boa_source_acc = boa_row.get(src_col, '3371')
-            
-            offset_acc = get_offset_account(boa_source_acc)
-            
-            # ----------------------------------------------------
-            # ROUTE 1: ZOHO TRANSACTIONS
-            # ----------------------------------------------------
-            if "ZOHO" in boa_desc:
-                gross_amt = boa_amt * 1.03 
-                fee_amt = gross_amt - boa_amt
-                
-                # Credit Line
-                c_row = create_base_row()
-                c_row["Date"] = boa_date
-                c_row["Account type"] = "Customer"
-                c_row["Account name"] = "Page Fit Inc. DBA Intoxx Fitness" # Resolved via lookup normalization
+default_debit
