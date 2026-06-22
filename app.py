@@ -2,6 +2,7 @@ import streamlit as str_lit
 import pandas as pd
 import numpy as np
 import io
+import csv
 
 # ==========================================
 # CONSTANTS & CONFIGURATION
@@ -38,68 +39,37 @@ def create_base_row():
     row["Reversing entry"] = "No"
     return row
 
-def custom_parse_boa_csv(file_io):
+def fully_universal_read_boa(file_io):
     """
-    Direct string block scanner that completely bypasses pandas column dependency issues.
-    Extracts date, description, and amount natively using pure positional data streaming.
+    Decodes the uploaded file stream cleanly, handles dialet/delimiter sniffing automatically,
+    bypasses metadata summaries, and extracts transactions via standard dictionary structures.
     """
-    raw_bytes = file_io.read()
+    # Read and decode lines while cleaning up byte anomalies
+    raw_content = file_io.read().decode('utf-8', errors='ignore')
     file_io.seek(0)
-    text = raw_bytes.decode('utf-8', errors='ignore')
-    lines = [line.strip() for line in text.split('\n') if line.strip()]
     
-    parsed_records = []
-    headers = []
-    header_idx = -1
+    raw_lines = [line.strip() for line in raw_content.splitlines() if line.strip()]
     
-    # 1. Locate data grid entry point line-by-line
-    for idx, line in enumerate(lines):
-        clean_line = line.upper()
-        if "DESCRIPTION" in clean_line and ("AMOUNT" in clean_line or "DEBIT" in clean_line or "CREDIT" in clean_line):
-            headers = [h.strip().replace('"', '') for h in line.split(',')]
-            header_idx = idx
+    # Locate where the actual transaction layout table grid starts
+    header_line_idx = -1
+    for idx, line in enumerate(raw_lines):
+        up_line = line.upper()
+        if "DESC" in up_line and ("AMT" in up_line or "AMOUNT" in up_line or "DEBIT" in up_line or "CREDIT" in up_line):
+            header_line_idx = idx
             break
             
-    if header_idx == -1:
-        # Fallback if statement lacks formal header grid line
-        headers = ["DATE", "DESCRIPTION", "AMOUNT", "SOURCE ACCOUNT"]
-        header_idx = -1 
+    # Fallback to zero if layout cannot be sniffed explicitly
+    if header_line_idx == -1:
+        header_line_idx = 0
         
-    # 2. Process data lines sequentially below header row
-    for line in lines[header_idx + 1:]:
-        # Handle commas inside quoted description text lines safely
-        parts = []
-        current_part = []
-        in_quotes = False
-        for char in line:
-            if char == '"':
-                in_quotes = not in_quotes
-            elif char == ',' and not in_quotes:
-                parts.append("".join(current_part).strip().replace('"', ''))
-                current_part = []
-            else:
-                current_part.append(char)
-        parts.append("".join(current_part).strip().replace('"', ''))
+    data_content = "\n".join(raw_lines[header_line_idx:])
+    
+    # Sniff dialect to cleanly handle comma vs tab vs semicolon variations
+    try:
+        dialect = csv.Sniffer().sniff(raw_lines[header_line_idx])
+        delimiter = dialect.delimiter
+    except Exception:
+        delimiter = "," # Safe default standard fallback
         
-        if len(parts) < 2:
-            continue
-            
-        # Map indices dynamically based on found positions
-        row_dict = {}
-        for h_i, h_name in enumerate(headers):
-            if h_i < len(parts):
-                row_dict[h_name.upper()] = parts[h_i]
-                
-        parsed_records.append(row_dict)
-        
-    return pd.DataFrame(parsed_records)
-
-# ==========================================
-# STREAMLIT UI SETUP
-# ==========================================
-str_lit.set_page_config(page_title="D365 Transaction Journal Generator", layout="wide")
-
-str_lit.sidebar.header("D365 Defaults")
-default_company = str_lit.sidebar.text_input("Company", value="bwa")
-default_offset = str_lit.sidebar.text_input("Default Offset Account", value="B1000002")
-default_debit
+    # Read via native Python CSV engine to keep data structure safe
+    reader = csv.Dict
