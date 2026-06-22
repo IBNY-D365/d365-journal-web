@@ -532,24 +532,52 @@ def parse_invoice_pdf(file_obj):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_customer_master(path):
+    """
+    Load Account_Masterlist.xlsx.
+    Supports both formats:
+      Old: Account | Account Name  (2 columns)
+      New: Account Type | Account | Account Name  (3 columns)
+    Returns only Customer rows (BC######) for matching purposes.
+    """
     df = pd.read_excel(path, header=None, dtype=str)
+
+    # Find header row
     header_row = 0
     for i, row in df.iterrows():
         vals = [str(v).strip().lower() for v in row.values]
         if "account" in vals:
             header_row = i
             break
+
     df.columns = df.iloc[header_row].astype(str).str.strip()
     df = df.iloc[header_row + 1:].reset_index(drop=True)
     df.columns = [c.strip() for c in df.columns]
-    mask = df.iloc[:, 0].astype(str).str.match(r"BC\d+")
-    df = df[mask].reset_index(drop=True)
-    if len(df.columns) >= 2:
-        df = df.iloc[:, :2]
-        df.columns = ["Account", "Account Name"]
+
+    # Detect 3-column format: Account Type | Account | Account Name
+    cols_lower = [c.lower() for c in df.columns]
+    if "account type" in cols_lower:
+        # Filter to Customer rows only (BC######)
+        type_col = df.columns[cols_lower.index("account type")]
+        df = df[df[type_col].astype(str).str.strip().str.lower() == "customer"].copy()
+        # Find the Account and Account Name columns
+        acct_col = next((c for c in df.columns if c.lower() == "account"), None)
+        name_col = next((c for c in df.columns if c.lower() == "account name"), None)
+        if acct_col and name_col:
+            df = df[[acct_col, name_col]].copy()
+            df.columns = ["Account", "Account Name"]
+    else:
+        # Old 2-column format: filter by BC###### pattern
+        mask = df.iloc[:, 0].astype(str).str.match(r"BC\d+")
+        df = df[mask].reset_index(drop=True)
+        if len(df.columns) >= 2:
+            df = df.iloc[:, :2]
+            df.columns = ["Account", "Account Name"]
+
     df = df.dropna(subset=["Account"]).reset_index(drop=True)
-    df["Account"] = df["Account"].str.strip()
+    df["Account"] = df["Account"].astype(str).str.strip()
     df["Account Name"] = df["Account Name"].astype(str).str.strip()
+    # Keep only valid BC###### accounts
+    df = df[df["Account"].str.match(r"BC\d+")].reset_index(drop=True)
     return df
 
 
