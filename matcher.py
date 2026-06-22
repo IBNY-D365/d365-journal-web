@@ -325,9 +325,17 @@ def _validate_balance(boa_df, zoho_df, log):
     if boa_zoho.empty:
         return
 
-    boa_net   = boa_zoho["_boa_amount"].sum()
+    boa_net    = boa_zoho["_boa_amount"].sum()
     zoho_gross = zoho_df["gross_amount"].fillna(0).sum() if "gross_amount" in zoho_df.columns else 0
-    zoho_fee   = zoho_df["fee"].fillna(0).sum()          if "fee"          in zoho_df.columns else 0
+
+    # Use Zoho summary fee (authoritative) if present; fall back to per-txn sum
+    if "_summary_fee" in zoho_df.columns:
+        summary_fees = zoho_df["_summary_fee"].dropna()
+        summary_fees = pd.to_numeric(summary_fees, errors="coerce").dropna()
+        zoho_fee = summary_fees.iloc[0] if not summary_fees.empty else zoho_df["fee"].fillna(0).sum()
+    else:
+        zoho_fee = zoho_df["fee"].fillna(0).sum() if "fee" in zoho_df.columns else 0
+
     zoho_net   = zoho_gross - zoho_fee
 
     diff = abs(float(boa_net) - float(zoho_net))
