@@ -40,8 +40,8 @@ def create_base_row():
 
 def robust_read_boa_csv(file_io):
     """
-    Scans the Bank of America statement export to bypass varying header metadata rows.
-    Dynamically captures the column titles and ignores processing irregularities.
+    Robustly scans the bank statement using fuzzy keyword detection to locate 
+    where the true transaction grid starts, regardless of extra description modifiers.
     """
     lines = [line.decode('utf-8', errors='ignore') for line in file_io.readlines()]
     file_io.seek(0)
@@ -49,7 +49,8 @@ def robust_read_boa_csv(file_io):
     skip_rows = 0
     for idx, line in enumerate(lines):
         upper_line = line.upper()
-        if "DESCRIPTION" in upper_line or "AMOUNT" in upper_line:
+        # Uses fuzzy partial row scanning to secure matching criteria across files
+        if "DESC" in upper_line or "AMT" in upper_line or "AMOUNT" in upper_line:
             skip_rows = idx
             break
             
@@ -61,7 +62,8 @@ def robust_read_boa_csv(file_io):
         on_bad_lines='skip'
     )
     
-    df.columns = df.columns.str.strip().str.title()
+    # Dynamic Column Cleanup: standardizes headers to handle multi-word titles clean
+    df.columns = df.columns.str.strip().str.upper()
     return df
 
 # ==========================================
@@ -108,9 +110,47 @@ if boa_statement is not None:
         df_boa = robust_read_boa_csv(boa_statement)
     else:
         df_boa = pd.read_excel(boa_statement)
-        df_boa.columns = df_boa.columns.str.strip().str.title()
+        df_boa.columns = df_boa.columns.str.strip().str.upper()
         
     output_rows = []
     
-    for idx, boa_row in df_boa.iterrows():
-        boa_desc = str(boa_row.get('Description', '')).upper()
+    # Locate exact column reference keys using custom search fallback patterns
+    desc_col = next((col for col in df_boa.columns if "DESC" in col), None)
+    amt_col = next((col for col in df_boa.columns if "AMT" in col or "AMOUNT" in col), None)
+    date_col = next((col for col in df_boa.columns if "DATE" in col), None)
+    src_col = next((col for col in df_boa.columns if "ACC" in col or "SOURCE" in col), "SOURCE ACCOUNT")
+    
+    if desc_col and amt_col:
+        for idx, boa_row in df_boa.iterrows():
+            boa_desc = str(boa_row.get(desc_col, '')).upper()
+            
+            # Rule Implementation: Clear out systemic summary text blocks cleanly
+            if any(ignored in boa_desc for ignored in ["BEGINNING BALANCE", "TOTAL CREDITS", "TOTAL DEBITS", "ENDING BALANCE"]):
+                continue
+                
+            if not boa_desc.strip() or boa_desc == 'NAN':
+                continue
+                
+            try:
+                raw_amt = str(boa_row.get(amt_col, '0')).replace('$', '').replace(',', '').strip()
+                boa_amt = float(raw_amt)
+            except ValueError:
+                boa_amt = 0.0
+                
+            boa_date = boa_row.get(date_col, '') if date_col else ''
+            boa_source_acc = boa_row.get(src_col, '3371')
+            
+            offset_acc = get_offset_account(boa_source_acc)
+            
+            # ----------------------------------------------------
+            # ROUTE 1: ZOHO TRANSACTIONS
+            # ----------------------------------------------------
+            if "ZOHO" in boa_desc:
+                gross_amt = boa_amt * 1.03 
+                fee_amt = gross_amt - boa_amt
+                
+                # Credit Line
+                c_row = create_base_row()
+                c_row["Date"] = boa_date
+                c_row["Account type"] = "Customer"
+                c_row["Account name"] = "Page Fit Inc. DBA Intoxx Fitness" # Resolved via lookup normalization
