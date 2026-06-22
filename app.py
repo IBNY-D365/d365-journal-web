@@ -27,7 +27,7 @@ def get_offset_account(boa_source_acc):
     return "B1000002" 
 
 def create_base_row():
-    """Generates a base row formatted with required constant strings and values."""
+    """Generates an empty D365 row pre-populated with standard static configurations."""
     row = {col: "" for col in D365_COLUMNS}
     row["Company"] = "bwa"
     row["Offset company"] = "bwa"
@@ -38,37 +38,31 @@ def create_base_row():
     row["Reversing entry"] = "No"
     return row
 
-def hyper_robust_boa_read(file_io):
+def bypass_and_read_boa(file_io):
     """
-    Completely eliminates string header blocking. Reads the file stream natively,
-    cleans up hidden carriage characters, and applies a multi-tiered header finding matrix.
+    Reads the file using position-based indices to prevent header errors.
+    Bypasses text irregularities and returns a standardized data format.
     """
     raw_bytes = file_io.read()
     file_io.seek(0)
     
-    # Clean out sneaky Byte Order Marks (BOM) and carriage returns natively
+    # Clean up byte anomalies and layout artifacts natively
     text_content = raw_bytes.decode('utf-8-sig', errors='ignore').replace('\r', '')
     lines = [line.strip() for line in text_content.split('\n') if line.strip()]
     
-    # Fallback Tier 1: Look for any line containing DESC or DATE or AMOUNT
-    start_row_idx = 0
+    # Loop over rows to find where transaction data begins
+    start_idx = 0
     for idx, line in enumerate(lines):
         up_line = line.upper()
         if "DESC" in up_line or "AMOUNT" in up_line or "POSTING" in up_line:
-            start_row_idx = idx
+            start_idx = idx
             break
             
-    # Compile a clean CSV string block from the true data grid start position
-    clean_csv_block = "\n".join(lines[start_row_idx:])
+    clean_block = "\n".join(lines[start_idx:])
+    df = pd.read_csv(io.StringIO(clean_block), sep=',', engine='python', on_bad_lines='skip')
     
-    # Read using python engine with adaptive delimiter sniffer fallbacks
-    try:
-        df = pd.read_csv(io.StringIO(clean_csv_block), sep=None, engine='python', on_bad_lines='skip')
-    except Exception:
-        df = pd.read_csv(io.StringIO(clean_csv_block), sep=',', engine='python', on_bad_lines='skip')
-        
-    # Standardize remaining headers completely to upper case to remove matching friction
-    df.columns = df.columns.str.strip().str.upper()
+    # Strip spaces out of column names to protect our dictionary keys
+    df.columns = df.columns.str.strip()
     return df
 
 # ==========================================
@@ -87,4 +81,31 @@ str_lit.subheader("""Upload your Bank of America statement plus any gateway/invo
 col1, col2, col3 = str_lit.columns(3)
 
 with col1:
-    gateway_file = str_lit.file_uploader("""1. Upload Zoho / Stripe / Bankcard file
+    gateway_file = str_lit.file_uploader("""1. Upload Zoho / Stripe / Bankcard file (PDF, CSV, XLSX)""", type=["pdf", "csv", "xlsx"])
+with col2:
+    invoice_files = str_lit.file_uploader("""2. Upload invoice files (PDF, CSV, XLSX, TXT)""", accept_multiple_files=True)
+with col3:
+    boa_statement = str_lit.file_uploader("""3. Upload Bank of America statement (CSV, XLSX)""", type=["csv", "xlsx"])
+
+str_lit.info("""Upload the BOA statement to begin. Gateway and invoice files are optional depending on the day.""")
+
+# ==========================================
+# PROCESSING ENGINE (DETERMINISTIC PIPELINE)
+# ==========================================
+if boa_statement is not None:
+    df_boa = bypass_and_read_boa(boa_statement)
+    output_rows = []
+    
+    # Positional mapping fallback logic to handle missing or modified column headers safely
+    col_names = list(df_boa.columns)
+    
+    desc_col = next((c for c in col_names if "DESC" in c.upper()), None)
+    amt_col = next((c for c in col_names if "AMT" in c.upper() or "AMOUNT" in c.upper()), None)
+    date_col = next((c for c in col_names if "DATE" in c.upper()), None)
+    src_col = next((c for c in col_names if "ACC" in c.upper() or "SOURCE" in c.upper()), None)
+    
+    # Explicit backup fallback if names are changed completely
+    if desc_col is None and len(col_names) > 1: desc_col = col_names[1]
+    if amt_col is None and len(col_names) > 2: amt_col = col_names[2]
+    if date_col is None and len(col_names) > 0: date_col = col_names[0]
+    if src_col is None and len(col_names) > 3: src_
