@@ -1,334 +1,233 @@
-"""D365 journal entry builder.
+"""
+IBNY D365 Journal Entry Automation App
+---------------------------------------
+Automates cash closing by matching BOA + Zoho transactions,
+resolving customer accounts, and generating a D365-ready Excel upload.
 
-Purpose
--------
-Read source files from:
-- Bank of America CSV exports
-- Zoho payment summary files (PDF, CSV, XLSX)
-- Customer invoice PDFs
-
-Then normalize the data and write a D365 General Journal workbook using a
-configuration file that defines the exact column mapping.
-
-Important
----------
-This script is intentionally configuration-driven. It does NOT assume field
-names from your source files. You must supply the exact mappings from your
-Zoho Payment_D365_Automation_Rules document in a YAML file.
-
-Suggested repo layout
----------------------
-.
-├── d365_journal_builder.py
-├── mappings.yaml
-└── requirements.txt
-
-Example mappings.yaml
----------------------
-source_files:
-  boa_csv:
-    transaction_date: Transaction Date
-    description: Description
-    amount: Amount
-    reference: Reference
-  zoho_payment_summary:
-    payment_date: Payment Date
-    invoice_number: Invoice Number
-    customer_name: Customer Name
-    payment_amount: Amount
-  invoice_pdf:
-    invoice_number_regex: 'Invoice\s*#\s*([A-Z0-9-]+)'
-
-d365_template:
-  header_row: 1
-  columns:
-    journal_batch_number: Journal batch number
-    account_type: Account type
-    account: Account
-    debit: Debit
-    credit: Credit
-    text: Text
-    offset_account_type: Offset account type
-    offset_account: Offset account
-    transaction_date: Transaction date
-
-journal_rules:
-  journal_batch_number: AUTO-001
-  debit_line:
-    account_type: Ledger
-    account: 111100
-  credit_line:
-    account_type: Customer
-    offset_account_type: Bank
-  description_template: 'Payment {invoice_number} - {customer_name}'
+Source-of-truth files (bundled with app):
+  - Cash_Code_Masterlist.xlsx
+  - IBNY_Business_Customer_Account.xlsx
+  - Posted_Journal_in_D365_Sample_Reference.xlsx  (format reference)
 """
 
-from __future__ import annotations
-
-import argparse
-import json
-import logging
-import re
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
-
+import streamlit as st
 import pandas as pd
+import numpy as np
+from io import BytesIO
+import warnings
+warnings.filterwarnings("ignore")
 
-try:
-    import pdfplumber
-except ImportError:  # pragma: no cover
-    pdfplumber = None
+from parsers import parse_boa, parse_zoho, load_customer_master, load_cash_codes
+from matcher import match_transactions
+from builder import build_journal_entries
+from exporter import export_to_excel
 
-try:
-    import yaml
-except ImportError:  # pragma: no cover
-    yaml = None
-
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
+# ── Page config ──────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="IBNY D365 Journal Entry Automation",
+    page_icon="📒",
+    layout="wide",
 )
-logger = logging.getLogger(__name__)
 
+# ── Custom CSS ────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+    .main-header {font-size:1.6rem; font-weight:700; color:#1a3c6e; margin-bottom:0.2rem;}
+    .sub-header  {font-size:0.95rem; color:#555; margin-bottom:1.5rem;}
+    .section-title {font-size:1.05rem; font-weight:600; color:#1a3c6e;
+                    border-bottom:2px solid #d0dff5; padding-bottom:4px; margin-bottom:1rem;}
+    .flag-box {background:#fff8e1; border-left:4px solid #ffc107;
+               padding:0.6rem 1rem; border-radius:4px; margin:4px 0;}
+    .ok-box   {background:#e8f5e9; border-left:4px solid #4caf50;
+               padding:0.6rem 1rem; border-radius:4px; margin:4px 0;}
+    .err-box  {background:#ffebee; border-left:4px solid #f44336;
+               padding:0.6rem 1rem; border-radius:4px; margin:4px 0;}
+    .metric-card {background:#f0f4ff; border-radius:8px; padding:1rem;
+                  text-align:center;}
+</style>
+""", unsafe_allow_html=True)
 
-@dataclass
-class NormalizedTransaction:
-    transaction_date: Optional[str]
-    source_type: str
-    reference: Optional[str]
-    invoice_number: Optional[str]
-    customer_name: Optional[str]
-    amount: float
-    description: str
-    raw: Dict[str, Any]
+# ── Header ────────────────────────────────────────────────────────────────────
+st.markdown('<div class="main-header">📒 IBNY D365 Journal Entry Automation</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Upload BOA and Zoho files to generate a D365-ready journal entry Excel.</div>', unsafe_allow_html=True)
 
+# ── Load reference data (auto-loaded from app directory) ─────────────────────
+@st.cache_data(show_spinner=False)
+def load_references():
+    customers = load_customer_master("IBNY_Business_Customer_Account.xlsx")
+    cash_codes = load_cash_codes("Cash_Code_Masterlist.xlsx")
+    return customers, cash_codes
 
-class MappingError(RuntimeError):
-    pass
+try:
+    customer_df, cash_code_df = load_references()
+    st.markdown(f'<div class="ok-box">✅ Reference files loaded — {len(customer_df)} customer accounts · {len(cash_code_df)} cash codes</div>', unsafe_allow_html=True)
+except Exception as e:
+    st.markdown(f'<div class="err-box">❌ Could not load reference files: {e}</div>', unsafe_allow_html=True)
+    st.stop()
 
+st.markdown("---")
 
-def load_yaml(path: Path) -> Dict[str, Any]:
-    if yaml is None:
-        raise RuntimeError("PyYAML is required. Install with pip install pyyaml")
-    with path.open("r", encoding="utf-8") as fh:
-        return yaml.safe_load(fh) or {}
+# ── File Upload ───────────────────────────────────────────────────────────────
+col1, col2 = st.columns(2)
 
+with col1:
+    st.markdown('<div class="section-title">🏦 Bank of America File</div>', unsafe_allow_html=True)
+    boa_file = st.file_uploader(
+        "Upload BOA transaction export",
+        type=["xlsx", "csv", "xls"],
+        key="boa",
+        help="Excel or CSV export from Bank of America. Must contain date, description, and amount columns.",
+    )
 
-def normalize_amount(value: Any) -> float:
-    if value is None or (isinstance(value, float) and pd.isna(value)):
-        return 0.0
-    if isinstance(value, (int, float)):
-        return float(value)
-    text = str(value).strip()
-    if not text:
-        return 0.0
-    text = text.replace(",", "")
-    # Parentheses imply negative values in many bank exports.
-    is_negative = text.startswith("(") and text.endswith(")")
-    text = text.strip("()$")
-    text = text.replace("$", "")
-    amount = float(text)
-    return -amount if is_negative else amount
+with col2:
+    st.markdown('<div class="section-title">💳 Zoho Payments File</div>', unsafe_allow_html=True)
+    zoho_file = st.file_uploader(
+        "Upload Zoho payment export",
+        type=["xlsx", "csv", "xls", "pdf"],
+        key="zoho",
+        help="Zoho Payments export showing gross amount and merchant fee per transaction.",
+    )
 
+# Optional invoice uploader
+with st.expander("📄 Upload Customer Invoices (optional — used when name is missing from Zoho)"):
+    invoice_files = st.file_uploader(
+        "Upload one or more invoice PDFs",
+        type=["pdf"],
+        accept_multiple_files=True,
+        key="invoices",
+    )
 
-def first_nonempty(*values: Any) -> Optional[str]:
-    for value in values:
-        if value is None:
-            continue
-        if isinstance(value, float) and pd.isna(value):
-            continue
-        text = str(value).strip()
-        if text:
-            return text
-    return None
+st.markdown("---")
 
+# ── BOA Account routing (from automation rules §5.1 col 16) ──────────────────
+st.markdown('<div class="section-title">⚙️ BOA Account Settings</div>', unsafe_allow_html=True)
+acct_col1, acct_col2 = st.columns([1, 2])
+with acct_col1:
+    boa_account_last4 = st.selectbox(
+        "BOA Source Account (last 4 digits)",
+        options=["3371", "3924", "3384", "Unknown"],
+        index=0,
+        help="Determines the Offset Account (B1000002, B1000003, or B1000001).",
+    )
+with acct_col2:
+    offset_map = {"3371": "B1000002", "3924": "B1000003", "3384": "B1000001", "Unknown": "B1000002"}
+    selected_offset = offset_map[boa_account_last4]
+    st.info(f"Offset Account → **{selected_offset}**")
 
-def read_csv_file(path: Path) -> pd.DataFrame:
-    return pd.read_csv(path)
+st.markdown("---")
 
+# ── Process ───────────────────────────────────────────────────────────────────
+if st.button("🚀 Generate D365 Journal Entries", type="primary", use_container_width=True):
+    if not boa_file or not zoho_file:
+        st.error("Please upload both a BOA file and a Zoho file before proceeding.")
+        st.stop()
 
-def read_xlsx_file(path: Path) -> pd.DataFrame:
-    return pd.read_excel(path)
+    with st.spinner("Parsing files…"):
+        boa_df, boa_errors = parse_boa(boa_file)
+        zoho_df, zoho_errors = parse_zoho(zoho_file)
 
+    # ── Parse feedback ──
+    if boa_errors:
+        for e in boa_errors:
+            st.markdown(f'<div class="flag-box">⚠️ BOA: {e}</div>', unsafe_allow_html=True)
+    if zoho_errors:
+        for e in zoho_errors:
+            st.markdown(f'<div class="flag-box">⚠️ Zoho: {e}</div>', unsafe_allow_html=True)
 
-def extract_pdf_text(path: Path) -> str:
-    if pdfplumber is None:
-        raise RuntimeError("pdfplumber is required. Install with pip install pdfplumber")
-    text_chunks: List[str] = []
-    with pdfplumber.open(str(path)) as pdf:
-        for page in pdf.pages:
-            text_chunks.append(page.extract_text() or "")
-    return "\n".join(text_chunks)
+    if boa_df is None or boa_df.empty:
+        st.error("Could not parse BOA file. Check the format and try again.")
+        st.stop()
+    if zoho_df is None or zoho_df.empty:
+        st.error("Could not parse Zoho file. Check the format and try again.")
+        st.stop()
 
+    # ── Preview raw parses ──
+    with st.expander("🔍 Raw BOA Rows Parsed"):
+        st.dataframe(boa_df, use_container_width=True)
+    with st.expander("🔍 Raw Zoho Rows Parsed"):
+        st.dataframe(zoho_df, use_container_width=True)
 
-def parse_pdf_table_like_text(text: str) -> pd.DataFrame:
-    """Fallback parser for text-based PDFs.
-
-    This does not assume a single PDF format. It attempts to split lines into
-    columns after removing obvious header noise. For production use, map the
-    exact PDF layout in your config and add a dedicated parser.
-    """
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    rows: List[List[str]] = []
-    for line in lines:
-        # Split on 2+ spaces to preserve fields that contain single spaces.
-        parts = re.split(r"\s{2,}", line)
-        if len(parts) >= 2:
-            rows.append(parts)
-    if not rows:
-        return pd.DataFrame()
-    max_len = max(len(r) for r in rows)
-    padded = [r + [None] * (max_len - len(r)) for r in rows]
-    return pd.DataFrame(padded)
-
-
-def extract_invoice_number(text: str, regex_pattern: str) -> Optional[str]:
-    match = re.search(regex_pattern, text, flags=re.IGNORECASE)
-    return match.group(1).strip() if match else None
-
-
-def load_source_file(path: Path, kind: str) -> pd.DataFrame:
-    suffix = path.suffix.lower()
-    if suffix == ".csv":
-        return read_csv_file(path)
-    if suffix in {".xlsx", ".xls"}:
-        return read_xlsx_file(path)
-    if suffix == ".pdf":
-        text = extract_pdf_text(path)
-        return parse_pdf_table_like_text(text)
-    raise MappingError(f"Unsupported file type for {kind}: {path.name}")
-
-
-def map_boa_transactions(df: pd.DataFrame, cfg: Dict[str, Any]) -> List[NormalizedTransaction]:
-    m = cfg["source_files"]["boa_csv"]
-    tx_date_col = m["transaction_date"]
-    desc_col = m["description"]
-    amount_col = m["amount"]
-    ref_col = m.get("reference")
-
-    out: List[NormalizedTransaction] = []
-    for _, row in df.iterrows():
-        amount = normalize_amount(row.get(amount_col))
-        out.append(
-            NormalizedTransaction(
-                transaction_date=first_nonempty(row.get(tx_date_col)),
-                source_type="boa_csv",
-                reference=first_nonempty(row.get(ref_col)) if ref_col else None,
-                invoice_number=None,
-                customer_name=None,
-                amount=amount,
-                description=first_nonempty(row.get(desc_col)) or "",
-                raw=row.to_dict(),
-            )
+    with st.spinner("Matching transactions and resolving accounts…"):
+        matched_df, match_log = match_transactions(
+            boa_df, zoho_df, customer_df, invoice_files
         )
-    return out
 
-
-def map_zoho_summary(df: pd.DataFrame, cfg: Dict[str, Any]) -> List[NormalizedTransaction]:
-    m = cfg["source_files"]["zoho_payment_summary"]
-    payment_date_col = m["payment_date"]
-    invoice_col = m["invoice_number"]
-    customer_col = m["customer_name"]
-    amount_col = m["payment_amount"]
-
-    out: List[NormalizedTransaction] = []
-    for _, row in df.iterrows():
-        amount = normalize_amount(row.get(amount_col))
-        out.append(
-            NormalizedTransaction(
-                transaction_date=first_nonempty(row.get(payment_date_col)),
-                source_type="zoho_payment_summary",
-                reference=first_nonempty(row.get(invoice_col)),
-                invoice_number=first_nonempty(row.get(invoice_col)),
-                customer_name=first_nonempty(row.get(customer_col)),
-                amount=amount,
-                description="",
-                raw=row.to_dict(),
-            )
+    with st.spinner("Building D365 journal entries…"):
+        journal_df, build_log = build_journal_entries(
+            matched_df, customer_df, selected_offset
         )
-    return out
 
+    # ── Match summary metrics ──
+    st.markdown("---")
+    st.markdown('<div class="section-title">📊 Processing Summary</div>', unsafe_allow_html=True)
 
-def map_invoice_pdf(path: Path, cfg: Dict[str, Any]) -> Dict[str, Any]:
-    m = cfg["source_files"]["invoice_pdf"]
-    regex_pattern = m["invoice_number_regex"]
-    text = extract_pdf_text(path)
-    return {
-        "file": path.name,
-        "invoice_number": extract_invoice_number(text, regex_pattern),
-        "raw_text": text,
-    }
+    total     = len(matched_df)
+    confident = int(matched_df["_match_confidence"].eq("HIGH").sum())  if "_match_confidence" in matched_df else 0
+    flagged   = int(matched_df["_needs_review"].sum())                 if "_needs_review"     in matched_df else 0
 
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Zoho Transactions", total)
+    m2.metric("Matched (High Confidence)", confident)
+    m3.metric("Flagged for Review", flagged)
+    m4.metric("D365 Rows Generated", len(journal_df))
 
-def build_d365_rows(transactions: Iterable[NormalizedTransaction], cfg: Dict[str, Any]) -> pd.DataFrame:
-    rules = cfg["journal_rules"]
-    cols = cfg["d365_template"]["columns"]
+    # ── Match log details ──
+    if match_log:
+        with st.expander(f"📋 Match Log ({len(match_log)} entries)"):
+            for entry in match_log:
+                css_class = "flag-box" if entry.get("level") == "WARN" else "ok-box"
+                st.markdown(f'<div class="{css_class}">{entry["msg"]}</div>', unsafe_allow_html=True)
 
-    rows: List[Dict[str, Any]] = []
-    batch = rules["journal_batch_number"]
-    debit_rule = rules["debit_line"]
-    credit_rule = rules["credit_line"]
-    description_template = rules.get("description_template", "")
+    # ── Review table: flagged rows ──
+    needs_review = journal_df[journal_df.get("_needs_review", False) == True] if "_needs_review" in journal_df else pd.DataFrame()
+    if not needs_review.empty:
+        st.markdown("---")
+        st.markdown('<div class="section-title">🚩 Rows Requiring Manual Review</div>', unsafe_allow_html=True)
+        st.warning(f"{len(needs_review)} row(s) could not be fully resolved. These appear highlighted in the export.")
+        review_cols = [c for c in needs_review.columns if not c.startswith("_")]
+        st.dataframe(needs_review[review_cols], use_container_width=True)
 
-    for tx in transactions:
-        context = {
-            "invoice_number": tx.invoice_number or tx.reference or "",
-            "customer_name": tx.customer_name or "",
-            "amount": tx.amount,
-            "description": tx.description,
-            "transaction_date": tx.transaction_date or "",
-        }
-        text = description_template.format(**context) if description_template else tx.description
-        amount = abs(tx.amount)
+    # ── Full journal preview ──
+    st.markdown("---")
+    st.markdown('<div class="section-title">📄 D365 Journal Entry Preview</div>', unsafe_allow_html=True)
+    display_cols = [c for c in journal_df.columns if not c.startswith("_")]
+    st.dataframe(journal_df[display_cols], use_container_width=True, height=400)
 
-        # Debit line
-        rows.append({
-            cols["journal_batch_number"]: batch,
-            cols["account_type"]: debit_rule["account_type"],
-            cols["account"]: debit_rule["account"],
-            cols["debit"]: amount if amount > 0 else 0,
-            cols["credit"]: 0,
-            cols["text"]: text,
-            cols["offset_account_type"]: credit_rule["offset_account_type"],
-            cols["offset_account"]: credit_rule.get("offset_account", tx.reference or ""),
-            cols["transaction_date"]: tx.transaction_date,
-            "Source Type": tx.source_type,
-            "Source Reference": tx.reference,
-            "Invoice Number": tx.invoice_number,
-            "Customer Name": tx.customer_name,
-            "Raw Amount": tx.amount,
-        })
+    # ── Export ──
+    with st.spinner("Building Excel export…"):
+        excel_bytes = export_to_excel(journal_df)
 
-        # Credit line
-        rows.append({
-            cols["journal_batch_number"]: batch,
-            cols["account_type"]: credit_rule["account_type"],
-            cols["account"]: credit_rule["account"],
-            cols["debit"]: 0,
-            cols["credit"]: amount if amount > 0 else 0,
-            cols["text"]: text,
-            cols["offset_account_type"]: debit_rule["account_type"],
-            cols["offset_account"]: debit_rule["account"],
-            cols["transaction_date"]: tx.transaction_date,
-            "Source Type": tx.source_type,
-            "Source Reference": tx.reference,
-            "Invoice Number": tx.invoice_number,
-            "Customer Name": tx.customer_name,
-            "Raw Amount": tx.amount,
-        })
+    st.success("✅ D365 journal entry file ready for download.")
+    st.download_button(
+        label="⬇️ Download D365 Journal Entry Excel",
+        data=excel_bytes,
+        file_name="D365_Journal_Entry_Upload.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
 
-    return pd.DataFrame(rows)
+# ── Sidebar: reference info ───────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("### 📚 Reference Data")
+    st.markdown(f"**Customer Accounts:** {len(customer_df)}")
+    st.markdown(f"**Cash Codes:** {len(cash_code_df)}")
 
+    st.markdown("---")
+    st.markdown("### 🗂️ Cash Code Reference")
+    st.dataframe(
+        cash_code_df[cash_code_df["Cash Code"].str.startswith("AR")],
+        use_container_width=True, height=320, hide_index=True
+    )
 
-def reorder_columns(df: pd.DataFrame, desired_order: List[str]) -> pd.DataFrame:
-    existing = [c for c in desired_order if c in df.columns]
-    extras = [c for c in df.columns if c not in existing]
-    return df[existing + extras]
-
-
-def process_inputs(input_dir: Path, cfg: Dict[str, Any]) -> pd.DataFrame:
-    all_transactions: List[NormalizedTransaction] = []
-
-    for path in sorted(input_di
+    st.markdown("---")
+    st.markdown("### 📘 How to Use")
+    st.markdown("""
+1. Upload **BOA Excel/CSV** export
+2. Upload **Zoho Payments** export
+3. Select the BOA account (last 4 digits)
+4. Click **Generate Journal Entries**
+5. Review flagged rows
+6. Download the Excel file
+""")
+    st.markdown("---")
+    st.caption("IBNY Cash Closing Automation v1.0")
