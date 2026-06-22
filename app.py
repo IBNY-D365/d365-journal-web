@@ -1699,7 +1699,9 @@ def load_references():
 
 try:
     customer_df, cash_code_df = load_references()
-    st.markdown(f'<div class="ok-box">✅ Reference files loaded — {len(customer_df)} customer accounts · {len(cash_code_df)} cash codes</div>', unsafe_allow_html=True)
+    # DIAGNOSTIC: show exactly what columns and CS/PS data the loaded master has
+    cs_count = int((customer_df.get("CS/PS Ticket", pd.Series()).fillna("").str.strip() != "").sum()) if "CS/PS Ticket" in customer_df.columns else 0
+    st.markdown(f'<div class="ok-box">✅ Reference files loaded — {len(customer_df)} customer accounts · {len(cash_code_df)} cash codes · CS/PS Ticket entries: {cs_count} · Columns: {list(customer_df.columns)}</div>', unsafe_allow_html=True)
 except Exception as e:
     st.markdown(f'<div class="err-box">❌ Could not load reference files: {e}</div>', unsafe_allow_html=True)
     st.stop()
