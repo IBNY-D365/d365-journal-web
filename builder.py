@@ -66,9 +66,10 @@ def build_journal_entries(matched_df, customer_df, offset_account="B1000002"):
     for group_date, group in groups:
         group_rows   = list(group.iterrows())
         multi_batch  = len(group_rows) > 1
-        credit_rows  = []
-        total_fee    = 0.0
-        fee_desc_parts = []
+        credit_rows      = []
+        total_fee        = 0.0   # fallback: sum of per-txn fees
+        summary_fee      = None  # authoritative: from Zoho summary line
+        fee_desc_parts   = []
 
         for _, zrow in group_rows:
             account       = str(zrow.get("_account", "")).strip()
@@ -139,13 +140,23 @@ def build_journal_entries(matched_df, customer_df, offset_account="B1000002"):
             if fee and fee > 0:
                 total_fee += fee
 
+            # Prefer the Zoho summary-level fee over per-txn sum
+            sf = _safe_float(zrow.get("_summary_fee"))
+            if sf and sf > 0:
+                summary_fee = sf
+
             # Accumulate fee description parts
             part = " ".join(filter(None, [account, account_name])).strip()
             if part:
                 fee_desc_parts.append(part)
 
+        # ── Use Zoho summary fee (authoritative) over per-txn sum ───────────
+        # The summary line "Payments N $X −$Y $Z" is the source of truth per SOP.
+        # Never assume or recalculate — use exactly what Zoho reports.
+        debit_fee = summary_fee if summary_fee else total_fee
+
         # ── Single grouped debit row for all fees in this batch ───────────────
-        if total_fee > 0:
+        if debit_fee > 0:
             date_str = credit_rows[0]["Date"] if credit_rows else ""
 
             if multi_batch:
@@ -168,7 +179,7 @@ def build_journal_entries(matched_df, customer_df, offset_account="B1000002"):
                 "Posting profile":       "",
                 "Cash code":             _DEBIT_CASH_CODE,
                 "Description":           debit_desc,
-                "Debit":                 f"{total_fee:.2f}",
+                "Debit":                 f"{debit_fee:.2f}",
                 "Credit":                "",
                 "Item sales tax group":  "",
                 "Sales tax code":        "",
@@ -192,7 +203,8 @@ def build_journal_entries(matched_df, customer_df, offset_account="B1000002"):
             log.append({
                 "level": "OK",
                 "msg": (f"Built {'batch' if multi_batch else 'single'} debit row "
-                        f"for {date_str or 'undated'} — fee ${total_fee:.2f}")
+                        f"for {date_str or 'undated'} — fee ${debit_fee:.2f} "
+                        f"(source: {'Zoho summary' if summary_fee else 'per-txn sum'})")
             })
 
     if not rows:
