@@ -50,6 +50,7 @@ st.markdown("""
 # ── Header ────────────────────────────────────────────────────────────────────
 st.markdown('<div class="main-header">📒 IBNY D365 Journal Entry Automation</div>', unsafe_allow_html=True)
 st.markdown('<div class="sub-header">Upload BOA and Zoho files to generate a D365-ready journal entry Excel.</div>', unsafe_allow_html=True)
+st.caption("v1.4 — fee fix: uses Zoho summary fee")
 
 # ── Load reference data (auto-loaded from app directory) ─────────────────────
 @st.cache_data(show_spinner=False)
@@ -148,6 +149,10 @@ if st.button("🚀 Generate D365 Journal Entries", type="primary", use_container
         st.dataframe(boa_df, use_container_width=True)
     with st.expander("🔍 Raw Zoho Rows Parsed"):
         st.dataframe(zoho_df, use_container_width=True)
+        if "_summary_fee" in zoho_df.columns:
+            st.success(f"✅ Zoho summary fee (authoritative): **${float(zoho_df['_summary_fee'].iloc[0]):,.2f}** — this will be used as the debit amount.")
+        else:
+            st.error("❌ _summary_fee column missing — old parsers.py is still running. Push the new file to GitHub.")
 
     with st.spinner("Matching transactions and resolving accounts…"):
         matched_df, match_log = match_transactions(
