@@ -2,10 +2,9 @@ import streamlit as str_lit
 import pandas as pd
 import numpy as np
 import io
-import pypdf
 
 # ==========================================
-# 1. CORE ARCHITECTURAL CONSTANTS
+# CONSTANTS & CONFIGURATION
 # ==========================================
 D365_COLUMNS = [
     "Date", "Voucher", "Account name", "Company", "Account type", "Account",
@@ -36,41 +35,31 @@ def create_base_row():
     row["Reversing entry"] = "No"
     return row
 
-def extract_text_from_pdf(uploaded_file):
-    """Extracts raw text blocks from uploaded invoice or gateway PDFs."""
-    if uploaded_file is None:
-        return ""
-    try:
-        pdf_reader = pypdf.PdfReader(uploaded_file)
-        text_content = []
-        for page in pdf_reader.pages:
-            text_content.append(page.extract_text() or "")
-        return "\n".join(text_content)
-    except Exception:
-        return ""
-
-def hyper_robust_boa_read(file_io):
-    """Bypasses bank layout formatting and safely reads rows based on index positions."""
+def bypass_and_read_boa(file_io):
+    """
+    Reads the file stream cleanly, handles carriage return layout anomalies, 
+    and returns a standardized column dataframe with stripped column headers.
+    """
     raw_bytes = file_io.read()
     file_io.seek(0)
     
     text_content = raw_bytes.decode('utf-8-sig', errors='ignore').replace('\r', '')
     lines = [line.strip() for line in text_content.split('\n') if line.strip()]
     
-    start_row_idx = 0
+    start_idx = 0
     for idx, line in enumerate(lines):
         up_line = line.upper()
         if "DESC" in up_line or "AMOUNT" in up_line or "POSTING" in up_line:
-            start_row_idx = idx
+            start_idx = idx
             break
             
-    clean_csv_block = "\n".join(lines[start_row_idx:])
-    df = pd.read_csv(io.StringIO(clean_csv_block), sep=',', engine='python', on_bad_lines='skip')
-    df.columns = df.columns.str.strip().str.upper()
+    clean_block = "\n".join(lines[start_idx:])
+    df = pd.read_csv(io.StringIO(clean_block), sep=',', engine='python', on_bad_lines='skip')
+    df.columns = df.columns.str.strip()
     return df
 
 # ==========================================
-# 2. STREAMLIT UI LAYOUT
+# STREAMLIT UI SETUP
 # ==========================================
 str_lit.set_page_config(page_title="D365 Transaction Journal Generator", layout="wide")
 
@@ -93,25 +82,30 @@ with col3:
 
 str_lit.info("""Upload the BOA statement to begin. Gateway and invoice files are optional depending on the day.""")
 
-# Load reference files from local path natively
-cust_master, form_master, monthly_exp = None, None, None
-try:
-    cust_master = pd.read_excel("Customer Master Account File.xlsx")
-    form_master = pd.read_excel("Form_Master_DB.xlsx", sheet_name="Sales_PRF")
-    monthly_exp = pd.read_excel("Monthly Expense Record.xlsx")
-except Exception:
-    pass
-
 # ==========================================
-# 3. AUTOMATION ROUTING ENGINE
+# PROCESSING ENGINE (DETERMINISTIC PIPELINE)
 # ==========================================
 if boa_statement is not None:
-    df_boa = hyper_robust_boa_read(boa_statement)
+    df_boa = bypass_and_read_boa(boa_statement)
     output_rows = []
     
-    # Extract structural text strings out of cross-referenced uploaded PDFs
-    gateway_text = extract_text_from_pdf(gateway_file)
+    col_names = list(df_boa.columns)
+    desc_col = next((c for c in col_names if "DESC" in c.upper()), None)
+    amt_col = next((c for c in col_names if "AMT" in c.upper() or "AMOUNT" in c.upper()), None)
+    date_col = next((c for c in col_names if "DATE" in c.upper()), None)
+    src_col = next((c for c in col_names if "ACC" in c.upper() or "SOURCE" in c.upper()), None)
     
-    desc_key = next((k for k in df_boa.columns if "DESC" in k), None)
-    amt_key = next((k for k in df_boa.columns if "AMT" in k or "AMOUNT" in k or "DEBIT" in k or "CREDIT" in k), None)
-    date_key = next((k for k in df_boa.columns if "DATE" in k), None
+    if desc_col is None and len(col_names) > 1: desc_col = col_names[1]
+    if amt_col is None and len(col_names) > 2: amt_col = col_names[2]
+    if date_col is None and len(col_names) > 0: date_col = col_names[0]
+    if src_col is None and len(col_names) > 3: src_col = col_names[3]
+
+    if desc_col and amt_col:
+        for idx, boa_row in df_boa.iterrows():
+            boa_desc = str(boa_row.get(desc_col, '')).upper().strip()
+            
+            # Filter out systemic summary macro rows natively
+            if any(ignored in boa_desc for ignored in ["BEGINNING BALANCE", "TOTAL CREDITS", "TOTAL DEBITS", "ENDING BALANCE"]):
+                continue
+                
+            if not boa_desc or boa_desc == 'NAN':
