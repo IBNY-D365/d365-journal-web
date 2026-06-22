@@ -54,8 +54,10 @@ st.markdown('<div class="sub-header">Upload BOA and Zoho files to generate a D36
 # ── Load reference data (auto-loaded from app directory) ─────────────────────
 @st.cache_data(show_spinner=False)
 def load_references():
-    customers = load_customer_master("IBNY_Business_Customer_Account.xlsx")
-    cash_codes = load_cash_codes("Cash_Code_Masterlist.xlsx")
+    import os
+    _base = os.path.dirname(os.path.abspath(__file__))
+    customers  = load_customer_master(os.path.join(_base, "IBNY_Business_Customer_Account.xlsx"))
+    cash_codes = load_cash_codes(os.path.join(_base, "Cash_Code_Masterlist.xlsx"))
     return customers, cash_codes
 
 try:
