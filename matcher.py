@@ -44,7 +44,7 @@ _TERMS_TO_CASH_CODE = {
     "net 40":                 ("AR009", ""),
     "net 45":                 ("AR010", ""),
     "net 60":                 ("AR011", ""),
-    "due end of next month":  ("AR010", ""),   # ~45-day term
+    "due end of next month":  ("AR011", ""),   # Net 60 / end of next month
     "net":                    ("AR008", ""),   # generic net → AR008
 }
 
