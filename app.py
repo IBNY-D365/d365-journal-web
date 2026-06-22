@@ -123,36 +123,36 @@ else:
     # -----------------------------------------------------------------
     boa_df = pd.read_csv(boa_file)
     
-    # Strip spaces from column headers to prevent exact-string mismatch errors
-    boa_df.columns = [str(col).strip() for col in boa_df.columns]
+    # Strip spaces and normalize headers to lowercase to match bulletproof criteria
+    normalized_headers = {str(col).strip().lower(): str(col) for col in boa_df.columns}
     
-    # Dynamically locate header column variations for Description, Date, Amount, and Account
-    desc_col = next((c for c in ['Description', 'description', 'Transaction Description', 'Payee', 'Memo'] if c in boa_df.columns), None)
-    date_col = next((c for c in ['Posting Date', 'Posting date', 'Date', 'date', 'Transaction Date'] if c in boa_df.columns), None)
-    amount_col = next((c for c in ['Net Amount', 'Net amount', 'Amount', 'amount'] if c in boa_df.columns), None)
-    account_col = next((c for c in ['Source Account', 'Source account', 'Account', 'account', 'Account Number'] if c in boa_df.columns), None)
+    # Define our lowercase target check groups
+    desc_target = next((normalized_headers[k] for k in ['description', 'transaction description', 'payee', 'memo'] if k in normalized_headers), None)
+    date_target = next((normalized_headers[k] for k in ['posting date', 'date', 'transaction date'] if k in normalized_headers), None)
+    amount_target = next((normalized_headers[k] for k in ['net amount', 'amount', 'net_amount'] if k in normalized_headers), None)
+    account_target = next((normalized_headers[k] for k in ['source account', 'account', 'account number', 'account_number'] if k in normalized_headers), None)
             
-    if desc_col is None:
+    if desc_target is None:
         st.error("❌ Could not find a transaction 'Description' column variant in your Bank of America CSV. Please review file headers.")
         st.stop()
 
     boa_records: List[BOARecord] = []
     for _, row in boa_df.iterrows():
-        raw_desc = str(row.get(desc_col, ''))
+        raw_desc = str(row.get(desc_target, ''))
         
         if "ZOHO" in raw_desc.upper():  # Rule 3.1 Filtering Logic
             parsed_date = datetime.today().date()
-            if date_col and pd.notna(row[date_col]):
+            if date_target and pd.notna(row[date_target]):
                 try:
-                    parsed_date = pd.to_datetime(row[date_col]).date()
+                    parsed_date = pd.to_datetime(row[date_target]).date()
                 except Exception:
                     pass
                     
             boa_records.append(BOARecord(
                 date=parsed_date,
                 description=raw_desc,
-                net_amount=float(row.get(amount_col, 0.0)) if amount_col else 0.0,
-                source_account=str(row.get(account_col, '')).strip() if account_col else ""
+                net_amount=float(row.get(amount_target, 0.0)) if amount_target else 0.0,
+                source_account=str(row.get(account_target, '')).strip() if account_target else ""
             ))
 
     # Zoho Summary Parsing Block
@@ -249,4 +249,31 @@ else:
                 "Posting Profile": "", "Cash code": "OSF005", "Description": fee_desc,
                 "Debit": total_fees, "Credit": "", "Item sales tax group": "", "Sales tax code": "",
                 "Offset company": "bwa", "Bank Account Type": "Bank", "Offset account": offset_acct,
-                "Offset transaction text": "",
+                "Offset transaction text": "", "Currency": "USD", "Exchange rate": 1.00,
+                "Item sales tax group2": "", "Sales group": "AVATAX", "Withholding tax group": "",
+                "Release date": "", "Reversing entry": "No", "Reversing date": ""
+            })
+
+    # -----------------------------------------------------------------
+    # STEP E: DISPLAY INTERACTIVE METRICS & EXPORT DOWNLOADS
+    # -----------------------------------------------------------------
+    if validation_errors:
+        st.error("### Pipeline Validation Discrepancies Checked")
+        for error in validation_errors:
+            st.markdown(error)
+
+    if all_journal_lines:
+        st.success("### Ready D365 Import Template Matrix Transformed Successfully!")
+        output_df = pd.DataFrame(all_journal_lines, columns=D365_TEMPLATE_COLUMNS)
+        st.dataframe(output_df)
+        
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+            output_df.to_excel(writer, index=False, sheet_name="Journal Lines")
+        
+        st.download_button(
+            label="📥 Download Generated D365 Journal Import Sheet",
+            data=buffer.getvalue(),
+            file_name="D365_General_Journal_Import.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
