@@ -1684,6 +1684,12 @@ st.markdown("""
 
 # ── Header ────────────────────────────────────────────────────────────────────
 st.markdown('<div class="main-header">📒 IBNY D365 Journal Entry Automation</div>', unsafe_allow_html=True)
+
+# ── VERSION CHECK — remove after confirming deployment ───────────────────────
+import hashlib, os
+_ver = "BUILD-2026-06-23-V5-SINGLE-FILE"
+st.error(f"🔴 VERSION CHECK: {_ver} | app.py lines: {len(open(__file__).readlines())} | CS/PS logic: {'_build_customer_lookup' in open(__file__).read()}")
+# ─────────────────────────────────────────────────────────────────────────────
 st.markdown('<div class="sub-header">Upload BOA and Zoho files to generate a D365-ready journal entry Excel.</div>', unsafe_allow_html=True)
 st.caption("v1.4 — fee fix: uses Zoho summary fee")
 
