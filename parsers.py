@@ -534,10 +534,20 @@ def parse_invoice_pdf(file_obj):
 def load_customer_master(path):
     """
     Load Account_Masterlist.xlsx.
-    Supports both formats:
-      Old: Account | Account Name  (2 columns)
-      New: Account Type | Account | Account Name  (3 columns)
-    Returns only Customer rows (BC######) for matching purposes.
+
+    Supports these column formats:
+      2-col: Account | Account Name
+      3-col: Account Type | Account | Account Name
+      4-col: Account Type | Account | Account Name | CS/PS Ticket
+
+    The CS/PS Ticket column contains the individual person name that appears
+    on the invoice "Bill To" field (e.g. "Ali Amir") when the registered D365
+    account name is a business (e.g. "Functional Holistic Healing").
+
+    Returns a DataFrame with columns:
+      Account, Account Name, CS/PS Ticket (blank if not present)
+
+    Only Customer rows (BC######) are returned.
     """
     df = pd.read_excel(path, header=None, dtype=str)
 
@@ -552,30 +562,42 @@ def load_customer_master(path):
     df.columns = df.iloc[header_row].astype(str).str.strip()
     df = df.iloc[header_row + 1:].reset_index(drop=True)
     df.columns = [c.strip() for c in df.columns]
-
-    # Detect 3-column format: Account Type | Account | Account Name
     cols_lower = [c.lower() for c in df.columns]
+
+    # Filter to Customer rows only
     if "account type" in cols_lower:
-        # Filter to Customer rows only (BC######)
         type_col = df.columns[cols_lower.index("account type")]
         df = df[df[type_col].astype(str).str.strip().str.lower() == "customer"].copy()
-        # Find the Account and Account Name columns
-        acct_col = next((c for c in df.columns if c.lower() == "account"), None)
-        name_col = next((c for c in df.columns if c.lower() == "account name"), None)
-        if acct_col and name_col:
-            df = df[[acct_col, name_col]].copy()
-            df.columns = ["Account", "Account Name"]
+
+    # Extract the columns we need
+    acct_col = next((c for c in df.columns if c.lower() == "account"), None)
+    name_col = next((c for c in df.columns if c.lower() == "account name"), None)
+
+    # CS/PS Ticket column — optional, present in 4-column format
+    ticket_col = next((c for c in df.columns
+                       if c.lower() in ("cs/ps ticket", "cs ticket", "ps ticket",
+                                        "ticket", "bill to name", "individual name")), None)
+
+    if acct_col and name_col:
+        keep = [acct_col, name_col]
+        if ticket_col:
+            keep.append(ticket_col)
+        df = df[keep].copy()
+        df.columns = ["Account", "Account Name"] + (["CS/PS Ticket"] if ticket_col else [])
     else:
-        # Old 2-column format: filter by BC###### pattern
-        mask = df.iloc[:, 0].astype(str).str.match(r"BC\d+")
-        df = df[mask].reset_index(drop=True)
-        if len(df.columns) >= 2:
-            df = df.iloc[:, :2]
-            df.columns = ["Account", "Account Name"]
+        # Fallback: first two columns
+        df = df.iloc[:, :2].copy()
+        df.columns = ["Account", "Account Name"]
+
+    # Ensure CS/PS Ticket column always exists (blank if not in file)
+    if "CS/PS Ticket" not in df.columns:
+        df["CS/PS Ticket"] = ""
 
     df = df.dropna(subset=["Account"]).reset_index(drop=True)
-    df["Account"] = df["Account"].astype(str).str.strip()
+    df["Account"]      = df["Account"].astype(str).str.strip()
     df["Account Name"] = df["Account Name"].astype(str).str.strip()
+    df["CS/PS Ticket"] = df["CS/PS Ticket"].fillna("").astype(str).str.strip()
+
     # Keep only valid BC###### accounts
     df = df[df["Account"].str.match(r"BC\d+")].reset_index(drop=True)
     return df
