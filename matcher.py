@@ -16,7 +16,7 @@ For the BOA ↔ Zoho financial reconciliation:
 import re
 import numpy as np
 import pandas as pd
-from fuzzywuzzy import fuzz, process
+from rapidfuzz import fuzz, process
 
 # Fuzzy match threshold (0–100); below this → NEEDS_REVIEW
 _FUZZY_THRESHOLD = 82
@@ -198,7 +198,8 @@ def _fuzzy_lookup(raw_name: str, customer_lookup: dict) -> dict:
         return _unresolved(raw_name, "Customer master is empty")
 
     # token_set_ratio handles re-ordered words and DBA names well
-    best_key, score = process.extractOne(norm, keys, scorer=fuzz.token_set_ratio)
+    result = process.extractOne(norm, keys, scorer=fuzz.token_set_ratio)
+    best_key, score = result[0], result[1]
     matched = customer_lookup[best_key]
 
     if score >= _FUZZY_THRESHOLD:
