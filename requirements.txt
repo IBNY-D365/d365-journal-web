@@ -1,3 +1,4 @@
+streamlit>=1.26.0
 pandas>=2.1.0
 openpyxl>=3.1.2
 pypdf>=3.15.0
