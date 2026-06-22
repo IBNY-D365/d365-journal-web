@@ -60,6 +60,20 @@ class AccountMasterItem(BaseModel):
     account_name: str
     payment_term: str
 
+def clean_numeric_value(val: Any) -> float:
+    """Removes currency symbols, commas, and whitespace to safely parse numbers."""
+    if pd.isna(val) or val is None:
+        return 0.0
+    if isinstance(val, (int, float)):
+        return float(val)
+    
+    # Strip spaces, $, and commas
+    cleaned_str = str(val).strip().replace('$', '').replace(',', '')
+    try:
+        return float(cleaned_str)
+    except ValueError:
+        return 0.0
+
 # =====================================================================
 # 3. COMPONENT PARSERS
 # =====================================================================
@@ -151,7 +165,7 @@ else:
             boa_records.append(BOARecord(
                 date=parsed_date,
                 description=raw_desc,
-                net_amount=float(row.get(amount_target, 0.0)) if amount_target else 0.0,
+                net_amount=clean_numeric_value(row.get(amount_target, 0.0)),
                 source_account=str(row.get(account_target, '')).strip() if account_target else ""
             ))
 
@@ -172,8 +186,8 @@ else:
             
         zoho_records.append(ZohoRecord(
             customer_name=cust_name,
-            gross_amount=float(row.get('Gross Amount', 0.0)),
-            merchant_fee=float(row.get('Merchant Fee', 0.0)),
+            gross_amount=clean_numeric_value(row.get('Gross Amount', 0.0)),
+            merchant_fee=clean_numeric_value(row.get('Merchant Fee', 0.0)),
             invoice_number=inv_num
         ))
 
@@ -240,40 +254,4 @@ else:
                 acc = processed_accounts[0]
                 fee_desc = f"Zoho Merchant Fee {acc.account_number} {acc.account_name}_{boa_rec.description}"
             else:
-                account_strings = ", ".join([f"{a.account_number} {a.account_name}" for a in processed_accounts])
-                fee_desc = f"Zoho Merchant Fee {account_strings}_{boa_rec.description}"
-
-            all_journal_lines.append({
-                "Date": boa_rec.date, "Voucher": "", "Account name": "Outside Service (Finance)",
-                "Company": "bwa", "Account type": "Ledger", "Account": "43170111-U26C05001-B735350-UOA003",
-                "Posting Profile": "", "Cash code": "OSF005", "Description": fee_desc,
-                "Debit": total_fees, "Credit": "", "Item sales tax group": "", "Sales tax code": "",
-                "Offset company": "bwa", "Bank Account Type": "Bank", "Offset account": offset_acct,
-                "Offset transaction text": "", "Currency": "USD", "Exchange rate": 1.00,
-                "Item sales tax group2": "", "Sales group": "AVATAX", "Withholding tax group": "",
-                "Release date": "", "Reversing entry": "No", "Reversing date": ""
-            })
-
-    # -----------------------------------------------------------------
-    # STEP E: DISPLAY INTERACTIVE METRICS & EXPORT DOWNLOADS
-    # -----------------------------------------------------------------
-    if validation_errors:
-        st.error("### Pipeline Validation Discrepancies Checked")
-        for error in validation_errors:
-            st.markdown(error)
-
-    if all_journal_lines:
-        st.success("### Ready D365 Import Template Matrix Transformed Successfully!")
-        output_df = pd.DataFrame(all_journal_lines, columns=D365_TEMPLATE_COLUMNS)
-        st.dataframe(output_df)
-        
-        buffer = io.BytesIO()
-        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-            output_df.to_excel(writer, index=False, sheet_name="Journal Lines")
-        
-        st.download_button(
-            label="📥 Download Generated D365 Journal Import Sheet",
-            data=buffer.getvalue(),
-            file_name="D365_General_Journal_Import.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+                account_strings = ", ".join(
