@@ -57,7 +57,7 @@ st.caption("v1.4 — fee fix: uses Zoho summary fee")
 def load_references():
     import os
     _base = os.path.dirname(os.path.abspath(__file__))
-    customers  = load_customer_master(os.path.join(_base, "IBNY_Business_Customer_Account.xlsx"))
+    customers  = load_customer_master(os.path.join(_base, "Account_Masterlist.xlsx"))
     cash_codes = load_cash_codes(os.path.join(_base, "Cash_Code_Masterlist.xlsx"))
     return customers, cash_codes
 
