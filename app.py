@@ -1,0 +1,262 @@
+import streamlit as st
+import pandas as pd
+from pypdf import PdfReader
+from pydantic import BaseModel, Field
+from typing import Optional, List, Dict, Any
+from datetime import datetime
+import re
+import io
+
+# =====================================================================
+# 1. HARDCODED CONFIGURATIONS & MAPPINGS
+# =====================================================================
+CASH_CODE_MAPPING = {
+    "due-on-receipt": ("AR001", "AR Collection_AP"),
+    "monthly": ("AR002", "AR Collection_MPP"),
+    "financing": ("AR003", "AR Collection_Financing"),
+    "leasing": ("AR004", "AR Collection_Leasing"),
+    "net 1 day": ("AR005", "AR Collection_Net_1Day"),
+    "net 10 days": ("AR006", "AR Collection_Net_10Days"),
+    "net 25 days": ("AR007", "AR Collection_Net_25Days"),
+    "net 30 days": ("AR008", "AR Collection_Net_30Days"),
+    "net 40 days": ("AR009", "AR Collection_Net_40Days"),
+    "net 45 days": ("AR010", "AR Collection_Net_45Days"),
+    "net 60 days": ("AR011", "AR Collection_Net_60Days"),
+    "fallback": ("AR012", "AR Collection_Other")
+}
+
+OFFSET_ACCOUNT_ROUTING = {
+    "3371": "B1000002",
+    "3924": "B1000003",
+    "3384": "B1000001"
+}
+
+D365_TEMPLATE_COLUMNS = [
+    "Date", "Voucher", "Account name", "Company", "Account type", "Account",
+    "Posting Profile", "Cash code", "Description", "Debit", "Credit",
+    "Item sales tax group", "Sales tax code", "Offset company", "Bank Account Type",
+    "Offset account", "Offset transaction text", "Currency", "Exchange rate",
+    "Item sales tax group2", "Sales group", "Withholding tax group",
+    "Release date", "Reversing entry", "Reversing date"
+]
+
+# =====================================================================
+# 2. DATA UTILITIES & MODELS
+# =====================================================================
+class BOARecord(BaseModel):
+    date: datetime.date
+    description: str
+    net_amount: float
+    source_account: str
+
+class ZohoRecord(BaseModel):
+    customer_name: Optional[str] = None
+    gross_amount: float
+    merchant_fee: float
+    invoice_number: Optional[str] = None
+
+class AccountMasterItem(BaseModel):
+    account_number: str
+    account_name: str
+    payment_term: str
+
+# =====================================================================
+# 3. COMPONENT PARSERS
+# =====================================================================
+def parse_invoice_pdf(pdf_file) -> Optional[str]:
+    """Extracts customer name from the 'Bill to' section of an invoice PDF[cite: 19, 20]."""
+    try:
+        reader = PdfReader(pdf_file)
+        full_text = ""
+        for page in reader.pages:
+            full_text += page.extract_text() or ""
+        
+        match = re.search(r"Bill\s+to[:]?\s*(.*)", full_text, re.IGNORECASE)
+        if match:
+            return match.group(1).split('\n')[0].strip()
+    except Exception as e:
+        st.error(f"Error parsing PDF invoice: {e}")
+    return None
+
+# =====================================================================
+# 4. STREAMLIT INTERFACE SETUP
+# =====================================================================
+st.set_page_config(page_title="D365 General Journal Automation", layout="wide")
+st.title("D365 General Journal Automation Engine")
+st.subheader("Automate Zoho Payment Reconciliations into D365 Templates [cite: 4]")
+
+st.sidebar.header("Data Sources Upload")
+masterlist_file = st.sidebar.file_uploader("1. Account Masterlist (Excel) [cite: 21]", type=["xlsx"])
+boa_file = st.sidebar.file_uploader("2. Bank of America Report (CSV) [cite: 7]", type=["csv"])
+zoho_file = st.sidebar.file_uploader("3. Zoho Transaction Summary (CSV/XLSX) [cite: 9]", type=["csv", "xlsx"])
+uploaded_invoices = st.sidebar.file_uploader("4. Backup Customer Invoices (PDFs) [cite: 11, 19]", type=["pdf"], accept_multiple_files=True)
+
+if not (masterlist_file and boa_file and zoho_file):
+    st.info("💡 Complete the layout configuration requirements by dropping your Source Masterlist, Bank Reports, and Zoho Summaries into the sidebar panel.")
+else:
+    # -----------------------------------------------------------------
+    # STEP A: LOAD MASTERLIST
+    # -----------------------------------------------------------------
+    master_df = pd.read_excel(masterlist_file)
+    master_lookup: Dict[str, AccountMasterItem] = {}
+    for _, row in master_df.iterrows():
+        name_key = str(row['Account Name']).strip().lower()
+        master_lookup[name_key] = AccountMasterItem(
+            account_number=str(row['Account #']),
+            account_name=str(row['Account Name']),
+            payment_term=str(row.get('Payment Term', 'due-on-receipt')).strip().lower()
+        )
+
+    # -----------------------------------------------------------------
+    # STEP B: LOAD INVOICE REPOSITORY (If any names are missing)
+    # -----------------------------------------------------------------
+    invoice_cache = {}
+    if uploaded_invoices:
+        for inv in uploaded_invoices:
+            # Strip out invoice prefix string if present in file title
+            inv_id = inv.name.replace(".pdf", "")
+            extracted_name = parse_invoice_pdf(inv)
+            if extracted_name:
+                invoice_cache[inv_id] = extracted_name
+
+    # -----------------------------------------------------------------
+    # STEP C: PARSE OPERATIONAL FILES
+    # -----------------------------------------------------------------
+    # Bank of America Parsing Block
+    boa_df = pd.read_csv(boa_file)
+    boa_records: List[BOARecord] = []
+    for _, row in boa_df.iterrows():
+        desc = str(row.get('Description', '')).upper()
+        if "ZOHO" in desc:  # Rule 3.1 Filtering Logic [cite: 17]
+            boa_records.append(BOARecord(
+                date=pd.to_datetime(row['Posting Date']).date(),
+                description=str(row.get('Description', '')),
+                net_amount=float(row.get('Net Amount', 0.0)),
+                source_account=str(row.get('Source Account', '')).strip()
+            ))
+
+    # Zoho Summary Parsing Block
+    if zoho_file.name.endswith('.csv'):
+        zoho_df = pd.read_csv(zoho_file)
+    else:
+        zoho_df = pd.read_excel(zoho_file)
+        
+    zoho_records: List[ZohoRecord] = []
+    for _, row in zoho_df.iterrows():
+        cust_name = str(row['Customer']).strip() if pd.notna(row.get('Customer')) else None
+        inv_num = str(row['Invoice Number']).strip() if pd.notna(row.get('Invoice Number')) else None
+        
+        # Rule 3.2: Check fallback context mapping strings via Invoice text strings [cite: 10, 11, 19]
+        if not cust_name and inv_num in invoice_cache:
+            cust_name = invoice_cache[inv_num]
+            
+        zoho_records.append(ZohoRecord(
+            customer_name=cust_name,
+            gross_amount=float(row.get('Gross Amount', 0.0)),
+            merchant_fee=float(row.get('Merchant Fee', 0.0)),
+            invoice_number=inv_num
+        ))
+
+    # -----------------------------------------------------------------
+    # STEP D: PROCESSING EXECUTION & VALIDATION MATRIX
+    # -----------------------------------------------------------------
+    all_journal_lines = []
+    validation_errors = []
+
+    for boa_rec in boa_records:
+        # Simple proof-of-concept multi-batch matching engine using absolute delta balance values
+        # Under normal structures, you match records using explicit grouping indexes
+        matched_zoho = zoho_records  # For this single file workflow template, assume unified matching block
+        
+        # Rule 3.3 Balance Invariant Validation [cite: 31]
+        total_gross = sum(z.gross_amount for z in matched_zoho)
+        total_fees = sum(z.merchant_fee for z in matched_zoho)
+        calculated_net = total_gross - total_fees
+        
+        if abs(calculated_net - boa_rec.net_amount) > 0.01:
+            validation_errors.append(
+                f"🚨 **Mathematical Balance Discrepancy!** Bank Net: ${boa_rec.net_amount:.2f} | "
+                f"Calculated Target: ${calculated_net:.2f} (Gross Payments: ${total_gross:.2f}, Zoho Fees: ${total_fees:.2f}) [cite: 31]"
+            )
+            continue
+
+        offset_acct = OFFSET_ACCOUNT_ROUTING.get(boa_rec.source_account)
+        if not offset_acct:
+            validation_errors.append(f"❌ Unmapped Bank of America Routing Target Base Account: {boa_rec.source_account} [cite: 38]")
+            continue
+
+        processed_accounts = []
+        
+        # 1. Generate Credit Lines [cite: 27, 28, 37]
+        for z_rec in matched_zoho:
+            if not z_rec.customer_name:
+                validation_errors.append(f"❌ Missing Customer Profile Reference for Invoice Tracker ID: {z_rec.invoice_number} [cite: 10, 19]")
+                continue
+                
+            name_key = z_rec.customer_name.lower()
+            if name_key not in master_lookup:
+                validation_errors.append(f"❌ Unregistered Ledger Entity: '{z_rec.customer_name}' absent from database lookup[cite: 21].")
+                continue
+                
+            master_item = master_lookup[name_key]
+            processed_accounts.append(master_item)
+            
+            cash_code, _ = CASH_CODE_MAPPING.get(master_item.payment_term, CASH_CODE_MAPPING['fallback'])
+            prefix = "MPP " if cash_code == "AR002" else ""
+            desc = f"{prefix}{master_item.account_number} {master_item.account_name}_{boa_rec.description}" # [cite: 38]
+            
+            all_journal_lines.append({
+                "Date": boa_rec.date, "Voucher": "", "Account name": master_item.account_name,
+                "Company": "bwa", "Account type": "Customer", "Account": master_item.account_number,
+                "Posting Profile": "AutoPost", "Cash code": cash_code, "Description": desc,
+                "Debit": "", "Credit": z_rec.gross_amount, "Item sales tax group": "", "Sales tax code": "",
+                "Offset company": "bwa", "Bank Account Type": "Bank", "Offset account": offset_acct,
+                "Offset transaction text": "", "Currency": "USD", "Exchange rate": 1.00,
+                "Item sales tax group2": "", "Sales group": "AVATAX", "Withholding tax group": "",
+                "Release date": "", "Reversing entry": "No", "Reversing date": ""
+            })
+
+        # 2. Generate Grouped Debit Fee Line (Rule 3.3 Multiple Customer Payments) [cite: 29, 30, 40]
+        if total_fees > 0 and len(processed_accounts) > 0:
+            if len(processed_accounts) == 1:
+                acc = processed_accounts[0]
+                fee_desc = f"Zoho Merchant Fee {acc.account_number} {acc.account_name}_{boa_rec.description}" # [cite: 42]
+            else:
+                account_strings = ", ".join([f"{a.account_number} {a.account_name}" for a in processed_accounts])
+                fee_desc = f"Zoho Merchant Fee {account_strings}_{boa_rec.description}" # [cite: 42]
+
+            all_journal_lines.append({
+                "Date": boa_rec.date, "Voucher": "", "Account name": "Outside Service (Finance)",
+                "Company": "bwa", "Account type": "Ledger", "Account": "43170111-U26C05001-B735350-UOA003",
+                "Posting Profile": "", "Cash code": "OSF005", "Description": fee_desc,
+                "Debit": total_fees, "Credit": "", "Item sales tax group": "", "Sales tax code": "",
+                "Offset company": "bwa", "Bank Account Type": "Bank", "Offset account": offset_acct,
+                "Offset transaction text": "", "Currency": "USD", "Exchange rate": 1.00,
+                "Item sales tax group2": "", "Sales group": "AVATAX", "Withholding tax group": "",
+                "Release date": "", "Reversing entry": "No", "Reversing date": ""
+            })
+
+    # -----------------------------------------------------------------
+    # STEP E: DISPLAY INTERACTIVE METRICS & EXPORT DOWNLOADS
+    # -----------------------------------------------------------------
+    if validation_errors:
+        st.error("### Pipeline Validation Discrepancies Checked")
+        for error in validation_errors:
+            st.markdown(error)
+
+    if all_journal_lines:
+        st.success("### Ready D365 Import Template Matrix Transformed Successfully!")
+        output_df = pd.DataFrame(all_journal_lines, columns=D365_TEMPLATE_COLUMNS)
+        st.dataframe(output_df)
+        
+        # Buffer execution layer to convert dataframe into physical file contents for distribution downloads
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+            output_df.to_excel(writer, index=False, sheet_name="Journal Lines")
+        
+        st.download_button(
+            label="📥 Download Generated D365 Journal Import Sheet",
+            data=buffer.getvalue(),
+            file_name="D365_General_Journal_Import.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
