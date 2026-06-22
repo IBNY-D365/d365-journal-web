@@ -114,7 +114,10 @@ def parse_boa(file_obj):
     df = df[df["date"].notna()].copy()
 
     if "description" in df.columns:
-        df["_is_zoho"] = df["description"].astype(str).str.upper().str.contains("ZOHO")
+        # Match only Zoho PAYMENT deposits, not Zoho software charges
+        # "ZOHO PAYMENTS DES:..." = customer payment deposit ✅
+        # "ZOHO* ZOHO-ONE..."     = software subscription charge ❌
+        df["_is_zoho"] = df["description"].astype(str).str.upper().str.contains("ZOHO PAYMENTS")
     else:
         df["_is_zoho"] = False
         errors.append("BOA: No description column found.")
