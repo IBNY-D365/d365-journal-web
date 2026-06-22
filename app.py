@@ -18,9 +18,12 @@ D365_COLUMNS = [
 def get_offset_account(boa_source_acc):
     """Conditional routing based on source BOA transaction account number."""
     acc_str = str(boa_source_acc).strip()
-    if "3371" in acc_str: return "B1000002"
-    elif "3924" in acc_str: return "B1000003"
-    elif "3384" in acc_str: return "B1000001"
+    if "3371" in acc_str: 
+        return "B1000002"
+    elif "3924" in acc_str: 
+        return "B1000003"
+    elif "3384" in acc_str: 
+        return "B1000001"
     return "B1000002" 
 
 def create_base_row():
@@ -71,24 +74,4 @@ default_company = str_lit.sidebar.text_input("Company", value="bwa")
 default_offset = str_lit.sidebar.text_input("Default Offset Account", value="B1000002")
 default_debit_ledger = str_lit.sidebar.text_input("Debit Line Account (Ledger)", value="43170111-U26C05001-B735350-UOA003")
 
-str_lit.title("D365 Transaction Journal Generator")
-str_lit.subheader("Upload your Bank of America statement plus any gateway/invoice files for the day.")
-
-col1, col2, col3 = str_lit.columns(3)
-
-with col1:
-    gateway_file = str_lit.file_uploader("1. Upload Zoho / Stripe / Bankcard file (PDF, CSV, XLSX)", type=["pdf", "csv", "xlsx"])
-with col2:
-    invoice_files = str_lit.file_uploader("2. Upload invoice files (PDF, CSV, XLSX, TXT)", accept_multiple_files=True)
-with col3:
-    boa_statement = str_lit.file_uploader("3. Upload Bank of America statement (CSV, XLSX)", type=["csv", "xlsx"])
-
-str_lit.info("Upload the BOA statement to begin. Gateway and invoice files are optional depending on the day.")
-
-@str_lit.cache_data
-def load_master_files():
-    try:
-        cust_master = pd.read_excel("Customer Master Account File.xlsx")
-        form_master = pd.read_excel("Form_Master_DB.xlsx", sheet_name="Sales_PRF")
-        monthly_exp = pd.read_excel("Monthly Expense Record.xlsx")
-        return cust_master, form_master, monthly_exp
+str_lit.title("D
