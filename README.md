@@ -19,7 +19,7 @@ ibny_app/
 ├── builder.py                          # D365 journal entry row builder
 ├── exporter.py                         # Excel export with formatting
 ├── Cash_Code_Masterlist.xlsx           # Reference — auto-loaded
-├── IBNY_Business_Customer_Account.xlsx # Reference — auto-loaded
+├── Account Masterlist.xlsx # Reference — auto-loaded
 ├── Posted_Journal_in_D365_Sample_Reference.xlsx  # Format reference
 └── README.md
 ```
