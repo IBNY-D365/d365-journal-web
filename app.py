@@ -2,7 +2,6 @@ import streamlit as str_lit
 import pandas as pd
 import numpy as np
 import io
-import csv
 
 # ==========================================
 # CONSTANTS & CONFIGURATION
@@ -39,37 +38,53 @@ def create_base_row():
     row["Reversing entry"] = "No"
     return row
 
-def fully_universal_read_boa(file_io):
+def hyper_robust_boa_read(file_io):
     """
-    Decodes the uploaded file stream cleanly, handles dialet/delimiter sniffing automatically,
-    bypasses metadata summaries, and extracts transactions via standard dictionary structures.
+    Completely eliminates string header blocking. Reads the file stream natively,
+    cleans up hidden carriage characters, and applies a multi-tiered header finding matrix.
     """
-    # Read and decode lines while cleaning up byte anomalies
-    raw_content = file_io.read().decode('utf-8', errors='ignore')
+    raw_bytes = file_io.read()
     file_io.seek(0)
     
-    raw_lines = [line.strip() for line in raw_content.splitlines() if line.strip()]
+    # Clean out sneaky Byte Order Marks (BOM) and carriage returns natively
+    text_content = raw_bytes.decode('utf-8-sig', errors='ignore').replace('\r', '')
+    lines = [line.strip() for line in text_content.split('\n') if line.strip()]
     
-    # Locate where the actual transaction layout table grid starts
-    header_line_idx = -1
-    for idx, line in enumerate(raw_lines):
+    # Fallback Tier 1: Look for any line containing DESC or DATE or AMOUNT
+    start_row_idx = 0
+    for idx, line in enumerate(lines):
         up_line = line.upper()
-        if "DESC" in up_line and ("AMT" in up_line or "AMOUNT" in up_line or "DEBIT" in up_line or "CREDIT" in up_line):
-            header_line_idx = idx
+        if "DESC" in up_line or "AMOUNT" in up_line or "POSTING" in up_line:
+            start_row_idx = idx
             break
             
-    # Fallback to zero if layout cannot be sniffed explicitly
-    if header_line_idx == -1:
-        header_line_idx = 0
-        
-    data_content = "\n".join(raw_lines[header_line_idx:])
+    # Compile a clean CSV string block from the true data grid start position
+    clean_csv_block = "\n".join(lines[start_row_idx:])
     
-    # Sniff dialect to cleanly handle comma vs tab vs semicolon variations
+    # Read using python engine with adaptive delimiter sniffer fallbacks
     try:
-        dialect = csv.Sniffer().sniff(raw_lines[header_line_idx])
-        delimiter = dialect.delimiter
+        df = pd.read_csv(io.StringIO(clean_csv_block), sep=None, engine='python', on_bad_lines='skip')
     except Exception:
-        delimiter = "," # Safe default standard fallback
+        df = pd.read_csv(io.StringIO(clean_csv_block), sep=',', engine='python', on_bad_lines='skip')
         
-    # Read via native Python CSV engine to keep data structure safe
-    reader = csv.Dict
+    # Standardize remaining headers completely to upper case to remove matching friction
+    df.columns = df.columns.str.strip().str.upper()
+    return df
+
+# ==========================================
+# STREAMLIT UI SETUP
+# ==========================================
+str_lit.set_page_config(page_title="D365 Transaction Journal Generator", layout="wide")
+
+str_lit.sidebar.header("D365 Defaults")
+default_company = str_lit.sidebar.text_input("Company", value="bwa")
+default_offset = str_lit.sidebar.text_input("Default Offset Account", value="B1000002")
+default_debit_ledger = str_lit.sidebar.text_input("Debit Line Account (Ledger)", value="43170111-U26C05001-B735350-UOA003")
+
+str_lit.title("""D365 Transaction Journal Generator""")
+str_lit.subheader("""Upload your Bank of America statement plus any gateway/invoice files for the day.""")
+
+col1, col2, col3 = str_lit.columns(3)
+
+with col1:
+    gateway_file = str_lit.file_uploader("""1. Upload Zoho / Stripe / Bankcard file
