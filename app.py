@@ -1349,6 +1349,24 @@ def load_references():
     _base = os.path.dirname(os.path.abspath(__file__))
     customers  = load_customer_master(os.path.join(_base, "Account_Masterlist.xlsx"))
     cash_codes = load_cash_codes(os.path.join(_base, "Cash_Code_Masterlist.xlsx"))
+
+    # Ensure CS/PS Ticket column exists — apply known entries as a fallback
+    # even if the xlsx file in the repo predates the column addition.
+    if "CS/PS Ticket" not in customers.columns:
+        customers["CS/PS Ticket"] = ""
+
+    # Known CS/PS Ticket mappings (individual Bill To → business account)
+    # Add new entries here as they are discovered.
+    _known_tickets = {
+        "BC000653": "Paul Fuss",
+        "BC000654": "Ali Amir",
+        "BC000655": "Svitlana Karaliou",
+    }
+    for acct, ticket_name in _known_tickets.items():
+        mask = customers["Account"] == acct
+        if mask.any() and customers.loc[mask, "CS/PS Ticket"].iloc[0].strip() == "":
+            customers.loc[mask, "CS/PS Ticket"] = ticket_name
+
     return customers, cash_codes
 
 try:
