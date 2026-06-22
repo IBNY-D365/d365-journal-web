@@ -17,52 +17,42 @@ from io import BytesIO
 import warnings
 warnings.filterwarnings("ignore")
 
-# ── Inline modules ───────────────────────────────────────────────────────────
+# ── All logic inlined — single file deployment ───────────────────────────
 
 """
-parsers.py — File parsing for BOA, Zoho, and reference spreadsheets.
+parsers.py — File parsing for BOA, Zoho (PDF/CSV/Excel), invoices, and reference files.
 
-Tuned to the actual file formats observed:
-  BOA CSV  : 5-row summary block at top, then blank line, then real data header
-             Columns: Date, Description, Amount, Running Bal.
-  Zoho PDF : Screen-captured payout page from pay.zoho.com — no proper table
-             structure. All data lives in a single merged cell as raw text.
-             Must be parsed from the plain text of each page.
+Source of truth: Zoho_Payment_D365_Automation_Rules.docx
+
+BOA CSV format:   5-row summary block, blank line, then real header + data
+Zoho PDF format:  Screen-captured pay.zoho.com page — parsed from raw text
+Invoice PDF:      InBody Purchase Statement — extract Bill To, total, terms, ticket#
 """
 
-import re
-import io
+import re, io
 import pandas as pd
 import numpy as np
 
-# ── Column aliases ────────────────────────────────────────────────────────────
+# ── BOA column aliases ────────────────────────────────────────────────────────
 _BOA_COL_MAP = {
-    "date":        ["date", "posting date", "post date", "transaction date",
-                    "trans date", "effective date"],
-    "description": ["description", "payee", "details", "memo", "narrative",
-                    "transaction description", "trans desc"],
-    "amount":      ["amount", "net amount", "credit", "credit amount",
-                    "transaction amount", "trans amount"],
+    "date":        ["date", "posting date", "post date", "transaction date"],
+    "description": ["description", "payee", "details", "memo"],
+    "amount":      ["amount", "net amount", "credit", "credit amount", "transaction amount"],
     "debit":       ["debit", "debit amount"],
     "balance":     ["balance", "running balance", "running bal", "running bal."],
 }
 
+# ── Zoho column aliases ───────────────────────────────────────────────────────
 _ZOHO_COL_MAP = {
-    "date":         ["date", "payment date", "transaction date", "created date",
-                     "created time", "payout date", "date & time"],
-    "customer":     ["customer name", "customer", "client name", "name",
-                     "bill to", "payer", "contact", "buyer"],
-    "gross_amount": ["gross amount", "gross", "amount", "total amount",
-                     "payment amount", "gross sales"],
-    "fee":          ["processing fee", "merchant fee", "fee", "transaction fee",
-                     "charge", "service fee", "fees"],
-    "net_amount":   ["net amount", "net", "net payment", "settlement amount",
-                     "payout amount", "total"],
-    "invoice":      ["invoice", "invoice number", "invoice #", "invoice no",
-                     "reference", "description"],
-    "payment_id":   ["payment id", "payment reference", "transaction id", "id"],
+    "date":         ["date", "payment date", "transaction date", "created date", "date & time"],
+    "customer":     ["customer name", "customer", "client name", "name", "bill to", "payer"],
+    "gross_amount": ["gross amount", "gross", "amount", "total amount", "payment amount"],
+    "fee":          ["processing fee", "merchant fee", "fee", "transaction fee", "fees"],
+    "net_amount":   ["net amount", "net", "net payment", "settlement amount", "payout amount"],
+    "invoice":      ["invoice", "invoice number", "invoice #", "reference", "description"],
+    "payment_id":   ["payment id", "transaction id", "id"],
     "status":       ["status", "payment status", "type"],
-    "email":        ["email", "email address", "customer email"],
+    "email":        ["email", "email address"],
 }
 
 
@@ -81,31 +71,34 @@ def _map_columns(df, col_map):
     return result
 
 
+def _to_numeric(series):
+    return (
+        series.astype(str)
+        .str.replace(r"[\$,€£]", "", regex=True)
+        .str.replace(r"[−–]", "-", regex=True)
+        .str.replace(r"\((\d+\.?\d*)\)", r"-\1", regex=True)
+        .str.strip()
+        .replace("", np.nan)
+        .replace("nan", np.nan)
+        .pipe(pd.to_numeric, errors="coerce")
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# BOA CSV/Excel parser
+# BOA parser
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_boa(file_obj):
-    """
-    Parse Bank of America export.
-
-    The real stmt.csv has this structure:
-      Row 0:  Description,,Summary Amt.         ← summary header (3 cols)
-      Row 1:  Beginning balance...              ← summary data
-      Row 2:  Total credits...
-      Row 3:  Total debits...
-      Row 4:  Ending balance...
-      Row 5:  (blank)
-      Row 6:  Date,Description,Amount,Running Bal.   ← REAL header (4 cols)
-      Row 7+: actual transactions
+    """Parse Bank of America export (CSV or Excel).
+    
+    Filter rule per §3.1: only rows where description contains
+    'ZOHO PAYMENTS' are processed as Zoho payment deposits.
+    'ZOHO* ZOHO-ONE' and other Zoho software charges are excluded.
     """
     errors = []
     try:
         name = getattr(file_obj, "name", "")
-        if name.lower().endswith(".csv"):
-            df = _read_boa_csv(file_obj)
-        else:
-            df = _read_boa_excel(file_obj)
+        df = _read_boa_csv(file_obj) if name.lower().endswith(".csv") else _read_boa_excel(file_obj)
     except Exception as e:
         return None, [f"Failed to read BOA file: {e}"]
 
@@ -113,17 +106,15 @@ def parse_boa(file_obj):
         return None, ["BOA file parsed to an empty DataFrame."]
 
     mapping = _map_columns(df, _BOA_COL_MAP)
-    rename = {v: k for k, v in mapping.items()}
-    df = df.rename(columns=rename)
+    df = df.rename(columns={v: k for k, v in mapping.items()})
 
     for col in ("date", "description", "amount", "debit", "balance"):
         if col not in df.columns:
             df[col] = np.nan
 
-    # Derive signed amount
     if "amount" in df.columns and df["amount"].notna().any():
         df["_boa_amount"] = _to_numeric(df["amount"])
-    elif "debit" in df.columns and df["debit"].notna().any():
+    elif "debit" in df.columns:
         df["_boa_amount"] = _to_numeric(df["debit"]) * -1
     else:
         df["_boa_amount"] = np.nan
@@ -131,68 +122,30 @@ def parse_boa(file_obj):
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
 
-    # Drop rows with no date (summary/balance rows that slipped through)
-    df = df[df["date"].notna()].copy()
-
+    # §3.1: filter to "ZOHO PAYMENTS" deposits only — excludes software subscriptions
     if "description" in df.columns:
-        # Match only Zoho PAYMENT deposits, not Zoho software charges
-        # "ZOHO PAYMENTS DES:..." = customer payment deposit ✅
-        # "ZOHO* ZOHO-ONE..."     = software subscription charge ❌
         df["_is_zoho"] = df["description"].astype(str).str.upper().str.contains("ZOHO PAYMENTS")
     else:
         df["_is_zoho"] = False
-        errors.append("BOA: No description column found.")
 
-    df = df.reset_index(drop=True)
+    # Drop rows with no date (summary/balance rows)
+    df = df[df["date"].notna()].reset_index(drop=True)
     return df, errors
 
 
 def _read_boa_csv(file_obj):
-    """
-    The BOA CSV has a 5-row summary block with 3 columns, then a blank line,
-    then the real 4-column transaction data. We find the real header by
-    looking for the line with the most recognized column keywords.
-    """
     raw = file_obj.read()
     if isinstance(raw, bytes):
         raw = raw.decode("utf-8", errors="replace")
-
     lines = raw.splitlines()
-
-    # Score each line: count how many BOA header keywords it contains
-    best_score = 0
-    header_idx = 0
+    # Find header line: most keyword matches
+    best_score, header_idx = 0, 0
     for i, line in enumerate(lines):
-        lower = line.lower()
-        score = sum(1 for kw in ["date", "description", "amount", "balance"]
-                    if kw in lower)
+        score = sum(1 for kw in ["date", "description", "amount", "balance"] if kw in line.lower())
         if score > best_score:
-            best_score = score
-            header_idx = i
-
-    # Take everything from the best header line onward
-    data_lines = lines[header_idx:]
-
-    # Determine column count from the header
-    header_cols = len(next(iter(data_lines)).split(","))
-
-    # Keep only lines that have plausible column counts (header_cols ± 1)
-    # to drop any stray summary lines below the data
-    clean_lines = [data_lines[0]]  # always keep header
-    for line in data_lines[1:]:
-        stripped = line.strip()
-        if not stripped:
-            continue
-        clean_lines.append(line)
-
-    csv_content = "\n".join(clean_lines)
-
-    return pd.read_csv(
-        io.StringIO(csv_content),
-        dtype=str,
-        on_bad_lines="skip",
-        engine="python",
-    )
+            best_score, header_idx = score, i
+    csv_content = "\n".join(lines[header_idx:])
+    return pd.read_csv(io.StringIO(csv_content), dtype=str, on_bad_lines="skip", engine="python")
 
 
 def _read_boa_excel(file_obj):
@@ -200,10 +153,8 @@ def _read_boa_excel(file_obj):
     for header_row in range(10):
         try:
             df = pd.read_excel(io.BytesIO(data), header=header_row, dtype=str)
-            cols_lower = [str(c).lower() for c in df.columns]
-            score = sum(1 for kw in ["date", "description", "amount"]
-                        if any(kw in c for c in cols_lower))
-            if score >= 2:
+            cols = [str(c).lower() for c in df.columns]
+            if sum(1 for kw in ["date", "description", "amount"] if any(kw in c for c in cols)) >= 2:
                 return df
         except Exception:
             continue
@@ -211,18 +162,13 @@ def _read_boa_excel(file_obj):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Zoho PDF parser  (screen-captured payout page from pay.zoho.com)
+# Zoho parser
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_zoho(file_obj):
-    """
-    Route to the correct sub-parser based on file extension.
-    The Zoho Payout PDF is a screen-captured web page — pdfplumber finds only
-    ONE merged cell containing all text. We must parse the raw page text.
-    """
+    """Parse Zoho Payments export (PDF, CSV, or Excel)."""
     errors = []
     name = getattr(file_obj, "name", "")
-
     try:
         if name.lower().endswith(".pdf"):
             df, pdf_errors = _parse_zoho_pdf(file_obj)
@@ -238,9 +184,7 @@ def parse_zoho(file_obj):
         return None, ["Zoho file parsed to an empty DataFrame."]
 
     mapping = _map_columns(df, _ZOHO_COL_MAP)
-
-    rename = {v: k for k, v in mapping.items()}
-    df = df.rename(columns=rename)
+    df = df.rename(columns={v: k for k, v in mapping.items()})
 
     for col in _ZOHO_COL_MAP.keys():
         if col not in df.columns:
@@ -253,48 +197,34 @@ def parse_zoho(file_obj):
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
 
-    # Drop only literal "Total" summary rows (not empty-customer rows from PDF)
-    # Zoho PDF rows legitimately have blank customer — name comes from invoice
+    # Drop only "Total" summary rows, NOT blank-customer rows
+    # (Zoho PDF always has blank customer — name comes from invoice)
     if "customer" in df.columns:
         mask = ~df["customer"].astype(str).str.strip().str.lower().str.startswith("total")
         df = df[mask]
 
-    df = df.reset_index(drop=True)
-    return df, errors
+    return df.reset_index(drop=True), errors
 
 
 def _parse_zoho_pdf(file_obj):
     """
-    Parse a Zoho Payout Details PDF (screen-captured from pay.zoho.com).
-
-    Architecture:
-      The Zoho PDF is used for PAYOUT-LEVEL METADATA only:
-        - Payout date (= BOA posting date)
-        - Total gross amount (for balance validation)
-        - Total fee / summary fee (authoritative debit amount — never recalculated)
-        - BOA account last 4 digits (for offset account routing)
-        - Payout ID + Bank Reference (appear in BOA description)
-
-      Per-transaction customer names and amounts come from uploaded INVOICES,
-      not from the PDF. This is robust to any transaction count (1 to 14+)
-      because it never relies on parsing individual transaction rows from the PDF.
-
-    Per-transaction amounts ARE extracted when available (for invoice-less flows),
-    using the "chunk-by-3" strategy: the PDF always emits (gross, net, fee) for
-    each transaction in sequence. We skip the summary values and chunk the rest.
-
-    CRITICAL: The summary fee line is ALWAYS used as the debit row amount.
-    Individual per-txn fees are never summed — they can drift due to PDF layout.
+    Parse Zoho Payout Details PDF (screen-captured from pay.zoho.com).
+    
+    Extracts:
+    - Payout metadata: date, payout ID, bank ref, BOA account last 4
+    - Summary: total count, AUTHORITATIVE gross and fee totals
+    - Per-transaction gross amounts (for invoice matching)
+    
+    The summary fee is ALWAYS used as the debit row amount (never per-txn sum).
     """
     errors = []
     try:
         import pdfplumber
     except ImportError:
-        return pd.DataFrame(), ["pdfplumber not installed — PDF parsing unavailable."]
+        return pd.DataFrame(), ["pdfplumber not installed."]
 
     raw_data = file_obj.read()
     pages_text = []
-
     try:
         with pdfplumber.open(io.BytesIO(raw_data)) as pdf:
             for page in pdf.pages:
@@ -304,145 +234,105 @@ def _parse_zoho_pdf(file_obj):
 
     full_text = "\n".join(pages_text)
 
-    # ── 1. Extract payout metadata ────────────────────────────────────────────
-
-    # Payout date ("Payout: Jun 15, 2026, 06:38 AM")
+    # ── Payout metadata ───────────────────────────────────────────────────────
     payout_date = None
     pd_m = re.search(r"Payout:\s+(\w+ \d{1,2}, \d{4})", full_text)
     if pd_m:
         payout_date = pd_m.group(1).strip()
 
-    # Paid On date — rendered across 3 separate lines in the PDF:
-    # "Paid / On / Jun / 16, / 2026"  (rendered across 3 separate lines)
+    # Paid On date (split across 3 lines: "Jun\n18,\n2026")
     paid_on = None
-    paid_on_m = re.search(
-        r"Paid\s*\nOn\s*\n(\w+)\s*\n(\d{1,2}),?\s*\n(\d{4})", full_text
-    )
-    if paid_on_m:
-        paid_on = f"{paid_on_m.group(1)} {paid_on_m.group(2)}, {paid_on_m.group(3)}"
+    po_m = re.search(r"Paid\s*\nOn\s*\n(\w+)\s*\n(\d{1,2}),?\s*\n(\d{4})", full_text)
+    if po_m:
+        paid_on = f"{po_m.group(1)} {po_m.group(2)}, {po_m.group(3)}"
     if not paid_on:
-        paid_on_m2 = re.search(r"Paid\s+On\s+(\w+\s+\d{1,2},?\s*\d{4})", full_text)
-        if paid_on_m2:
-            paid_on = paid_on_m2.group(1).strip()
+        po_m2 = re.search(r"Paid\s+On\s+(\w+\s+\d{1,2},?\s*\d{4})", full_text)
+        if po_m2:
+            paid_on = po_m2.group(1).strip()
 
     posting_date = paid_on or payout_date or ""
 
-    # Payout ID and Bank Reference
     pid_m = re.search(r"Payout ID:\s*(\d+)", full_text)
     payout_id = pid_m.group(1) if pid_m else ""
 
-    bref_m = re.search(r"Bank Reference ID:\s*(\d+)", full_text)
+    bref_m = re.search(r"Bank Reference(?:\s+ID)?:\s*(\d+)", full_text)
     bank_ref = bref_m.group(1) if bref_m else ""
 
-    # BOA account last 4 digits "( 3371 )" or "(••••3371)"
     acct_m = re.search(r"\(\s*[•\*]*\s*(\d{4})\s*\)", full_text)
     boa_acct = acct_m.group(1) if acct_m else ""
 
-    # ── 2. Extract summary totals (authoritative) ─────────────────────────────
+    # ── Summary line (AUTHORITATIVE) ─────────────────────────────────────────
     summary_m = re.search(
         r"Payments\s+(\d+)\s+\$([\d,]+\.\d{2})\s+[−\-]\$?([\d,]+\.\d{2})\s+\$([\d,]+\.\d{2})",
         full_text
     )
     if not summary_m:
-        return pd.DataFrame(), ["Could not find Payments summary line in Zoho PDF. "
-                                  "Check that the file is a Zoho Payout Details PDF."]
+        return pd.DataFrame(), ["Could not find Payments summary line in Zoho PDF."]
 
     expected_count = int(summary_m.group(1))
     summary_gross  = float(summary_m.group(2).replace(",", ""))
-    summary_fee    = float(summary_m.group(3).replace(",", ""))  # AUTHORITATIVE fee
+    summary_fee    = float(summary_m.group(3).replace(",", ""))  # AUTHORITATIVE
     summary_net    = float(summary_m.group(4).replace(",", ""))
 
-    # ── 3. Extract per-transaction gross amounts ──────────────────────────────
-    # Used when no invoices are uploaded. Strategy: chunk-by-3.
-    # The PDF emits dollar values after the summary in order:
-    #   gross_1, net_1, fee_1, gross_2, net_2, fee_2, ...
-    # We skip the summary values, then chunk remaining values into groups of 3.
+    # ── Per-transaction gross amounts (chunk-by-3 strategy) ──────────────────
+    txn_section = full_text.split("All Transactions", 1)[1] if "All Transactions" in full_text else full_text
+    for pat in [r"Refunds[^\n]*\n?", r"Adjustments[^\n]*\n?",
+                r"Amount\s+\$[\d,]+\.\d{2}\s+USD\n?", r"https?://\S+", r"Page \d+ of \d+"]:
+        txn_section = re.sub(pat, "", txn_section)
 
-    txn_section = full_text
-    if "All Transactions" in full_text:
-        txn_section = full_text.split("All Transactions", 1)[1]
+    all_dollars = [float(m.group(1).replace(",", ""))
+                   for m in re.finditer(r"\$([\d,]+\.\d{2})", txn_section)
+                   if float(m.group(1).replace(",", "")) > 0]
 
-    # Remove noise lines
-    txn_section = re.sub(r"Refunds[^\n]*\n?", "", txn_section)
-    txn_section = re.sub(r"Adjustments[^\n]*\n?", "", txn_section)
-    txn_section = re.sub(r"Amount\s+\$[\d,]+\.\d{2}\s+USD\n?", "", txn_section)
-    txn_section = re.sub(r"https?://\S+", "", txn_section)
-    txn_section = re.sub(r"Page \d+ of \d+", "", txn_section)
-
-    # Collect all positive dollar values in the transaction section
-    all_dollars = [
-        float(m.group(1).replace(",", ""))
-        for m in re.finditer(r"\$([\d,]+\.\d{2})", txn_section)
-        if float(m.group(1).replace(",", "")) > 0
-    ]
-
-    # Skip leading summary values (summary_gross, summary_fee, summary_net appear first)
-    skip_vals = [summary_gross, summary_fee, summary_net]
-    skip_idx = 0
-    clean_dollars = []
-    for val in all_dollars:
-        if skip_idx < len(skip_vals) and abs(val - skip_vals[skip_idx]) < 0.02:
+    # Strip summary values from front
+    skip_vals, skip_idx, clean = [summary_gross, summary_fee, summary_net], 0, []
+    for v in all_dollars:
+        if skip_idx < len(skip_vals) and abs(v - skip_vals[skip_idx]) < 0.02:
             skip_idx += 1
             continue
-        clean_dollars.append(val)
+        clean.append(v)
 
-    # Chunk into groups of 3: (gross, net, fee)
     transactions = []
-    if len(clean_dollars) >= expected_count * 3:
+    if len(clean) >= expected_count * 3:
         for i in range(expected_count):
-            chunk = clean_dollars[i*3 : i*3+3]
+            chunk = clean[i*3:i*3+3]
             transactions.append({
-                "gross_amount":  str(chunk[0]),
-                "fee":           str(chunk[2]),   # fee is LAST in triplet
-                "net_amount":    str(chunk[1]),
-                "customer":      "",
-                "date":          posting_date,
-                "payout_date":   posting_date,
-                "payout_id":     payout_id,
-                "bank_ref":      bank_ref,
-                "boa_acct":      boa_acct,
-                "_summary_fee":  str(summary_fee),
+                "date":           posting_date,
+                "customer":       "",
+                "gross_amount":   str(chunk[0]),
+                "fee":            str(chunk[2]),
+                "net_amount":     str(chunk[1]),
+                "payout_date":    posting_date,
+                "payout_id":      payout_id,
+                "bank_ref":       bank_ref,
+                "boa_acct":       boa_acct,
+                "_summary_fee":   str(summary_fee),
                 "_summary_gross": str(summary_gross),
-                "_expected_count": str(expected_count),
             })
     else:
-        # Partial data or dates-only available — create one row per expected txn
-        # with gross distributed from clean_dollars (best effort)
-        # The summary fee is still authoritative for the debit row
-        available_gross = clean_dollars[:expected_count] if clean_dollars else []
-
+        # Fallback: use available grosses, rely on summary fee for debit
+        available = clean[:expected_count]
         for i in range(expected_count):
-            gross = available_gross[i] if i < len(available_gross) else 0.0
+            gross = available[i] if i < len(available) else 0.0
             transactions.append({
-                "gross_amount":  str(gross),
-                "fee":           "0.0",   # individual fee unknown; use summary total
-                "net_amount":    str(gross),
-                "customer":      "",
-                "date":          posting_date,
-                "payout_date":   posting_date,
-                "payout_id":     payout_id,
-                "bank_ref":      bank_ref,
-                "boa_acct":      boa_acct,
-                "_summary_fee":  str(summary_fee),
+                "date":           posting_date,
+                "customer":       "",
+                "gross_amount":   str(gross),
+                "fee":            "0.0",
+                "net_amount":     str(gross),
+                "payout_date":    posting_date,
+                "payout_id":      payout_id,
+                "bank_ref":       bank_ref,
+                "boa_acct":       boa_acct,
+                "_summary_fee":   str(summary_fee),
                 "_summary_gross": str(summary_gross),
-                "_expected_count": str(expected_count),
             })
-
-    # Validate: sum of parsed grosses should match summary
-    parsed_gross_sum = sum(float(t["gross_amount"]) for t in transactions)
-    if abs(parsed_gross_sum - summary_gross) > 1.0:
-        errors.append(
-            f"Zoho PDF: Per-transaction gross sum ${parsed_gross_sum:,.2f} does not match "
-            f"summary ${summary_gross:,.2f}. Individual row amounts may be approximate. "
-            f"Upload invoices for exact per-customer amounts."
-        )
-
-    if not transactions:
-        return pd.DataFrame(), ["Could not extract transaction rows from Zoho PDF. "
-                                  "Upload Zoho export as CSV or Excel for best results."]
+        parsed_sum = sum(float(t["gross_amount"]) for t in transactions)
+        if abs(parsed_sum - summary_gross) > 1.0:
+            errors.append(f"Per-transaction gross sum ${parsed_sum:,.2f} != summary ${summary_gross:,.2f}. "
+                         f"Upload invoices for exact per-customer amounts.")
 
     return pd.DataFrame(transactions), errors
-
 
 
 def _read_zoho_csv(file_obj):
@@ -452,17 +342,11 @@ def _read_zoho_csv(file_obj):
     lines = content.splitlines()
     header_idx = 0
     for i, line in enumerate(lines):
-        lower = line.lower()
-        score = sum(1 for kw in ["amount", "fee", "date", "customer", "name"]
-                    if kw in lower)
-        if score >= 2:
+        if sum(1 for kw in ["amount", "fee", "date", "customer"] if kw in line.lower()) >= 2:
             header_idx = i
             break
-    csv_content = "\n".join(lines[header_idx:])
-    return pd.read_csv(
-        io.StringIO(csv_content), dtype=str,
-        on_bad_lines="skip", engine="python"
-    )
+    return pd.read_csv(io.StringIO("\n".join(lines[header_idx:])), dtype=str,
+                       on_bad_lines="skip", engine="python")
 
 
 def _read_zoho_excel(file_obj):
@@ -470,10 +354,8 @@ def _read_zoho_excel(file_obj):
     for header_row in range(8):
         try:
             df = pd.read_excel(io.BytesIO(data), header=header_row, dtype=str)
-            cols_lower = [str(c).lower() for c in df.columns]
-            score = sum(1 for kw in ["amount", "fee", "date", "customer"]
-                        if any(kw in c for c in cols_lower))
-            if score >= 2:
+            cols = [str(c).lower() for c in df.columns]
+            if sum(1 for kw in ["amount", "fee", "date", "customer"] if any(kw in c for c in cols)) >= 2:
                 return df
         except Exception:
             continue
@@ -486,11 +368,11 @@ def _read_zoho_excel(file_obj):
 
 def parse_invoice_pdf(file_obj):
     """
-    Extract customer name, invoice number, total, and payment terms from
-    an InBody Purchase Statement PDF.
-
-    Returns a dict with keys:
-      invoice_number, customer_name, total, payment_terms, invoice_date, cs_ticket
+    Extract from InBody Purchase Statement PDF:
+      invoice_number, customer_name (Bill To), total, payment_terms, cs_ticket
+    
+    Per §3.2: if customer name absent from Zoho, invoice Bill To is used.
+    Per §3.2: if CS/PS Ticket column matches Bill To name, use that Account Name.
     """
     try:
         import pdfplumber
@@ -508,47 +390,38 @@ def parse_invoice_pdf(file_obj):
 
     result = {}
 
-    # Invoice number
     inv_m = re.search(r"Purchase\s*#\s*(INV-[\w\d]+)", text, re.IGNORECASE)
     if inv_m:
         result["invoice_number"] = inv_m.group(1).strip()
 
-    # Bill To name (line immediately after "Bill To")
-    bill_to_m = re.search(r"Bill\s+To\s*\n([^\n]+)", text, re.IGNORECASE)
-    if bill_to_m:
-        result["customer_name"] = bill_to_m.group(1).strip()
+    # Bill To: name on the line immediately after "Bill To"
+    bill_m = re.search(r"Bill\s+To\s*\n([^\n]+)", text, re.IGNORECASE)
+    if bill_m:
+        result["customer_name"] = bill_m.group(1).strip()
 
-    # Payment Terms
     terms_m = re.search(r"Terms\s*:\s*([^\n]+)", text, re.IGNORECASE)
     if terms_m:
         result["payment_terms"] = terms_m.group(1).strip()
 
-    # Invoice date
     date_m = re.search(r"Invoice\s+Date\s*:\s*([^\n]+)", text, re.IGNORECASE)
     if date_m:
         result["invoice_date"] = date_m.group(1).strip()
 
-    # Total: find the LAST standalone "Total $X,XXX.XX" line
-    # (not SubTotal, not "Balance Due", just "Total $X")
-    # Use findall and take the value after the last plain "Total"
-    total_matches = list(re.finditer(
-        r"(?:^|\n)\s*Total\s+\$?([\d,]+\.\d{2})", text
-    ))
+    # Total: last standalone "Total $X" (not SubTotal)
+    total_matches = list(re.finditer(r"(?:^|\n)\s*Total\s+\$?([\d,]+\.\d{2})", text))
     if total_matches:
         result["total"] = float(total_matches[-1].group(1).replace(",", ""))
     else:
-        # Fallback: any "Total $X"
         t_m = re.search(r"Total\s+\$?([\d,]+\.\d{2})", text)
         if t_m:
             result["total"] = float(t_m.group(1).replace(",", ""))
 
-    # CS Ticket number — "[## 676 ##]" pattern
+    # CS/PS ticket number: "[## 653 ##]" pattern in item descriptions
     ticket_m = re.search(r"\[##\s*(\d+)\s*##\]", text)
     if ticket_m:
         result["cs_ticket"] = ticket_m.group(1).strip()
 
     return result
-
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -558,28 +431,14 @@ def parse_invoice_pdf(file_obj):
 def load_customer_master(path):
     """
     Load Account_Masterlist.xlsx.
-
-    Supports these column formats:
-      2-col: Account | Account Name
-      3-col: Account Type | Account | Account Name
-      4-col: Account Type | Account | Account Name | CS/PS Ticket
-
-    The CS/PS Ticket column contains the individual person name that appears
-    on the invoice "Bill To" field (e.g. "Ali Amir") when the registered D365
-    account name is a business (e.g. "Functional Holistic Healing").
-
-    Returns a DataFrame with columns:
-      Account, Account Name, CS/PS Ticket (blank if not present)
-
-    Only Customer rows (BC######) are returned.
+    Columns: Account Type | Account | Account Name | CS/PS Ticket (optional)
+    Returns only Customer rows (BC######).
+    CS/PS Ticket column maps individual Bill To names to business accounts.
     """
     df = pd.read_excel(path, header=None, dtype=str)
-
-    # Find header row
     header_row = 0
     for i, row in df.iterrows():
-        vals = [str(v).strip().lower() for v in row.values]
-        if "account" in vals:
+        if "account" in [str(v).strip().lower() for v in row.values]:
             header_row = i
             break
 
@@ -588,32 +447,24 @@ def load_customer_master(path):
     df.columns = [c.strip() for c in df.columns]
     cols_lower = [c.lower() for c in df.columns]
 
-    # Filter to Customer rows only
+    # Filter to Customer rows
     if "account type" in cols_lower:
         type_col = df.columns[cols_lower.index("account type")]
         df = df[df[type_col].astype(str).str.strip().str.lower() == "customer"].copy()
 
-    # Extract the columns we need
-    acct_col = next((c for c in df.columns if c.lower() == "account"), None)
-    name_col = next((c for c in df.columns if c.lower() == "account name"), None)
-
-    # CS/PS Ticket column — optional, present in 4-column format
+    acct_col   = next((c for c in df.columns if c.lower() == "account"), None)
+    name_col   = next((c for c in df.columns if c.lower() == "account name"), None)
     ticket_col = next((c for c in df.columns
-                       if c.lower() in ("cs/ps ticket", "cs ticket", "ps ticket",
-                                        "ticket", "bill to name", "individual name")), None)
+                       if c.lower() in ("cs/ps ticket", "cs ticket", "ps ticket", "ticket")), None)
 
     if acct_col and name_col:
-        keep = [acct_col, name_col]
-        if ticket_col:
-            keep.append(ticket_col)
+        keep = [acct_col, name_col] + ([ticket_col] if ticket_col else [])
         df = df[keep].copy()
         df.columns = ["Account", "Account Name"] + (["CS/PS Ticket"] if ticket_col else [])
     else:
-        # Fallback: first two columns
         df = df.iloc[:, :2].copy()
         df.columns = ["Account", "Account Name"]
 
-    # Ensure CS/PS Ticket column always exists (blank if not in file)
     if "CS/PS Ticket" not in df.columns:
         df["CS/PS Ticket"] = ""
 
@@ -621,8 +472,6 @@ def load_customer_master(path):
     df["Account"]      = df["Account"].astype(str).str.strip()
     df["Account Name"] = df["Account Name"].astype(str).str.strip()
     df["CS/PS Ticket"] = df["CS/PS Ticket"].fillna("").astype(str).str.strip()
-
-    # Keep only valid BC###### accounts
     df = df[df["Account"].str.match(r"BC\d+")].reset_index(drop=True)
     return df
 
@@ -631,8 +480,7 @@ def load_cash_codes(path):
     df = pd.read_excel(path, header=None, dtype=str)
     header_row = 0
     for i, row in df.iterrows():
-        vals = [str(v).strip().lower() for v in row.values]
-        if "cash code" in vals:
+        if "cash code" in [str(v).strip().lower() for v in row.values]:
             header_row = i
             break
     df.columns = df.iloc[header_row].astype(str).str.strip()
@@ -643,40 +491,19 @@ def load_cash_codes(path):
     return df
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _to_numeric(series):
-    return (
-        series.astype(str)
-        .str.replace(r"[\$,€£]", "", regex=True)
-        .str.replace(r"[−–]", "-", regex=True)
-        .str.replace(r"\((\d+\.?\d*)\)", r"-\1", regex=True)
-        .str.strip()
-        .replace("", np.nan)
-        .replace("nan", np.nan)
-        .pipe(pd.to_numeric, errors="coerce")
-    )
-
-
 """
 matcher.py — Match BOA ↔ Zoho transactions and resolve customer accounts.
 
-Key insight from real data analysis:
-  - The Zoho Payout PDF has NO customer names (field shows "—")
-  - Customer names must come from uploaded invoice PDFs
-  - Invoices are matched to Zoho transactions by amount (Total on invoice == gross_amount in Zoho)
-  - BOA posting date (payout date) is used as the D365 entry date, not the Zoho transaction date
-  - BOA description string (ZOHO PAYMENTS DES:...) is used in the D365 description field
+Rules source: Zoho_Payment_D365_Automation_Rules.docx §3.2
 
-Special account types (from real D365 reference data):
-  - Normal business customers: Customer type, BC###### account
-  - CS/repair ticket individuals found in CS/PS Ticket column of master:
-    Customer type, resolved BC###### of their registered business account.
-    Description prefixed with "Name CS Ticket #XXX_"
-  - CS/repair ticket individuals NOT in master: Ledger type,
-    account 21040102-B1000002, name "Temporary Receipt" (flagged for review)
+Resolution pipeline per §3.2:
+  1. Match Zoho transaction gross amount to invoice total
+  2. Get customer name from invoice "Bill To"
+  3. Look up name in Account_Masterlist:
+     a. If found in Account Name column → use that account
+     b. If found in CS/PS Ticket column → use the corresponding Account Name (business name)
+     c. If not found → flag for review, leave Account blank, Account type = Customer
+  4. Cash code from invoice payment terms
 """
 
 import re
@@ -687,464 +514,316 @@ from parsers import parse_invoice_pdf
 
 _FUZZY_THRESHOLD = 80
 
-# Special handling: individual/CS customers use Temporary Receipt account
-# These are identified when the customer is an individual (not a business)
-# and typically come from CS ticket invoices
-_TEMP_RECEIPT_ACCOUNT = "21040102-B1000002"
-_TEMP_RECEIPT_NAME    = "Temporary Receipt"
-
-# Payment terms → cash code mapping (from automation rules §4)
-_TERMS_TO_CASH_CODE = {
-    "due on receipt":         ("AR001", ""),
-    "due upon receipt":       ("AR001", ""),
-    "monthly payment":        ("AR002", "MPP "),
-    "monthly payment plan":   ("AR002", "MPP "),
-    "mpp":                    ("AR002", "MPP "),
-    "financing":              ("AR003", ""),
-    "leasing":                ("AR004", ""),
-    "net 1":                  ("AR005", ""),
-    "net 10":                 ("AR006", ""),
-    "net 25":                 ("AR007", ""),
-    "net 30":                 ("AR008", ""),
-    "net 40":                 ("AR009", ""),
-    "net 45":                 ("AR010", ""),
-    "net 60":                 ("AR011", ""),
-    "due end of next month":  ("AR011", ""),   # Net 60 / end of next month
-    "net":                    ("AR008", ""),   # generic net → AR008
+# Payment terms → (cash_code, description_prefix)
+# Source: Zoho_Payment_D365_Automation_Rules.docx §4
+_TERMS_MAP = {
+    "due on receipt":        ("AR001", ""),
+    "due upon receipt":      ("AR001", ""),
+    "monthly payment plan":  ("AR002", "MPP "),
+    "monthly payment":       ("AR002", "MPP "),
+    "mpp":                   ("AR002", "MPP "),
+    "financing":             ("AR003", ""),
+    "leasing":               ("AR004", ""),
+    "net 1":                 ("AR005", ""),
+    "net 10":                ("AR006", ""),
+    "net 25":                ("AR007", ""),
+    "net 30":                ("AR008", ""),
+    "net 40":                ("AR009", ""),
+    "net 45":                ("AR010", ""),
+    "net 60":                ("AR011", ""),
+    "due end of next month": ("AR011", ""),
+    "net":                   ("AR008", ""),
 }
 
 
 def match_transactions(boa_df, zoho_df, customer_df, invoice_files=None):
     """
-    Main entry point. Enriches zoho_df rows with D365 fields.
-
-    Steps:
-      1. Parse all uploaded invoice PDFs → {amount: invoice_data}
-      2. For each Zoho row: match by amount to invoice → get customer name + terms
-      3. Look up customer name in master → get BC###### account
-      4. Attach BOA posting date and description
-      5. Validate balance invariant
+    Enrich each Zoho transaction row with D365 fields.
+    
+    Returns (enriched_df, log_entries).
+    Each row gains: _account, _account_name, _cash_code, _cash_code_prefix,
+                    _desc_prefix, _match_confidence, _needs_review, _review_reason,
+                    _boa_date, _boa_description, _summary_fee
     """
     log = []
 
-    # ── Step 1: Parse invoices ────────────────────────────────────────────────
-    invoice_by_amount = {}   # {rounded_amount: invoice_dict}
-    invoice_by_name   = {}   # {normalised_name: invoice_dict}
-
+    # ── Step 1: Parse invoices → {amount: invoice_data} ──────────────────────
+    invoice_by_amount = {}
     if invoice_files:
         for inv_file in invoice_files:
             try:
-                inv_data = parse_invoice_pdf(inv_file)
-                if inv_data:
-                    amt = inv_data.get("total")
-                    if amt:
-                        key = round(float(amt), 2)
-                        invoice_by_amount[key] = inv_data
-                    name = inv_data.get("customer_name", "")
-                    if name:
-                        invoice_by_name[_normalise_name(name)] = inv_data
-                    log.append({
-                        "level": "OK",
-                        "msg": (f"Invoice parsed: {inv_data.get('invoice_number','?')} | "
-                                f"Customer: {inv_data.get('customer_name','?')} | "
-                                f"Total: ${amt:,.2f}" if amt else "Invoice parsed (no total)")
-                    })
+                inv = parse_invoice_pdf(inv_file)
+                if inv and inv.get("total"):
+                    key = round(float(inv["total"]), 2)
+                    invoice_by_amount[key] = inv
+                    log.append({"level": "OK",
+                                "msg": f"Invoice: {inv.get('invoice_number')} | "
+                                       f"Bill To: '{inv.get('customer_name')}' | "
+                                       f"Total: ${float(inv['total']):,.2f} | "
+                                       f"Terms: {inv.get('payment_terms')} | "
+                                       f"Ticket: {inv.get('cs_ticket','')} "})
             except Exception as e:
                 log.append({"level": "WARN", "msg": f"Could not parse invoice: {e}"})
 
-    # ── Step 2: Build customer lookup ─────────────────────────────────────────
-    customer_lookup = _build_customer_lookup(customer_df)
+    # ── Step 2: Build customer lookup (Account Name + CS/PS Ticket) ───────────
+    lookup = _build_lookup(customer_df)
 
     # ── Step 3: Resolve each Zoho row ─────────────────────────────────────────
     results = []
     for idx, zrow in zoho_df.iterrows():
-        record = _resolve_row(
-            zrow, customer_lookup, invoice_by_amount, invoice_by_name, log
-        )
+        record = _resolve_row(idx, zrow, lookup, invoice_by_amount, log)
         results.append(record)
 
-    resolved = pd.DataFrame(results)
     enriched = pd.concat(
-        [zoho_df.reset_index(drop=True), resolved.reset_index(drop=True)], axis=1
+        [zoho_df.reset_index(drop=True), pd.DataFrame(results).reset_index(drop=True)],
+        axis=1
     )
 
-    # ── Step 4: Attach BOA date and description ───────────────────────────────
-    enriched = _attach_boa_data(enriched, boa_df, log)
+    # ── Step 4: Attach BOA posting date and description ───────────────────────
+    enriched = _attach_boa(enriched, boa_df, log)
 
     # ── Step 5: Balance check ─────────────────────────────────────────────────
-    _validate_balance(boa_df, enriched, log)
+    _check_balance(boa_df, enriched, log)
 
     return enriched, log
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Row resolution
+# Customer lookup
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _resolve_row(zrow, customer_lookup, invoice_by_amount, invoice_by_name, log):
-    """Resolve one Zoho transaction row to its D365 fields."""
-    idx          = zrow.name
-    raw_customer = str(zrow.get("customer", "")).strip()
-    gross        = _safe_float(zrow.get("gross_amount"))
-    invoice_ref  = str(zrow.get("invoice", "")).strip()
-
-    # ── Try invoice match by amount first (most reliable for this PDF) ────────
-    inv = None
-    if gross:
-        key = round(gross, 2)
-        inv = invoice_by_amount.get(key)
-
-    # If not found by amount, try by invoice reference string
-    if not inv and invoice_ref and invoice_ref not in ("nan", ""):
-        for norm_name, inv_data in invoice_by_name.items():
-            if inv_data.get("invoice_number", "") in invoice_ref:
-                inv = inv_data
-                break
-
-    # ── If we have an invoice, use it ─────────────────────────────────────────
-    if inv:
-        customer_name  = inv.get("customer_name", "")
-        payment_terms  = inv.get("payment_terms", "")
-        cs_ticket      = inv.get("cs_ticket", "")
-        cash_code, pfx = _terms_to_cash_code(payment_terms)
-
-        log.append({
-            "level": "OK",
-            "msg": (f"Row {idx}: matched invoice {inv.get('invoice_number','?')} "
-                    f"→ '{customer_name}' | terms='{payment_terms}' | code={cash_code}")
-        })
-
-        # Check if this is a CS/repair ticket invoice (has [## XXX ##] in items)
-        is_cs_ticket = bool(cs_ticket)
-
-        # Normal business customer lookup — works for both business names AND
-        # individual names that appear in the CS/PS Ticket column of the master
-        master_result = _fuzzy_lookup(customer_name, customer_lookup)
-        found_in_master = master_result["_match_confidence"] in ("HIGH", "MEDIUM")
-
-        if is_cs_ticket and not found_in_master:
-            # Individual not found in master at all — use Temporary Receipt
-            desc_prefix = f"{customer_name} CS Ticket #{cs_ticket}_"
-            return {
-                "_account":          _TEMP_RECEIPT_ACCOUNT,
-                "_account_name":     _TEMP_RECEIPT_NAME,
-                "_account_type":     "Ledger",
-                "_posting_profile":  "AutoPost",
-                "_match_method":     "INVOICE_CS_TICKET_UNREGISTERED",
-                "_match_confidence": "MEDIUM",
-                "_needs_review":     True,
-                "_review_reason":    (f"'{customer_name}' not in Account Masterlist. "
-                                      f"Add them with their BC###### to resolve automatically."),
-                "_cash_code":        cash_code,
-                "_cash_code_prefix": "",
-                "_desc_prefix":      desc_prefix,
-                "_raw_name":         customer_name,
-                "_invoice_number":   inv.get("invoice_number", ""),
-            }
-
-        if is_cs_ticket and found_in_master:
-            # Individual found via CS/PS Ticket column — use their business account
-            # but keep the CS ticket description prefix for the D365 description
-            log.append({
-                "level": "OK",
-                "msg": (f"Row {idx}: CS ticket '{customer_name}' matched to "
-                        f"'{master_result['_account_name']}' via CS/PS Ticket column.")
-            })
-            desc_prefix = f"{customer_name} CS Ticket #{cs_ticket}_"
-            master_result["_desc_prefix"]      = desc_prefix
-            master_result["_cash_code"]        = cash_code
-            master_result["_cash_code_prefix"] = pfx
-            master_result["_invoice_number"]   = inv.get("invoice_number", "")
-            master_result["_raw_name"]         = customer_name
-            master_result.setdefault("_account_type",    "Customer")
-            master_result.setdefault("_posting_profile", "AutoPost")
-            return master_result
-        master_result["_cash_code"]        = cash_code
-        master_result["_cash_code_prefix"] = pfx
-        master_result["_desc_prefix"]      = ""
-        master_result["_invoice_number"]   = inv.get("invoice_number", "")
-        master_result["_raw_name"]         = customer_name
-        master_result.setdefault("_account_type",    "Customer")
-        master_result.setdefault("_posting_profile", "AutoPost")
-
-        if master_result["_match_confidence"] == "LOW":
-            master_result["_needs_review"]  = True
-            master_result["_review_reason"] = (
-                f"Customer '{customer_name}' from invoice not found in master "
-                f"(best match score {master_result.get('_fuzzy_score',0)}/100). "
-                f"Add this account to IBNY_Business_Customer_Account.xlsx."
-            )
-            log.append({
-                "level": "WARN",
-                "msg":   f"Row {idx}: '{customer_name}' not in master — flagged for review."
-            })
-
-        return master_result
-
-    # ── No invoice: try customer name from Zoho directly ─────────────────────
-    if raw_customer and raw_customer not in ("—", "-", "nan", ""):
-        result = _fuzzy_lookup(raw_customer, customer_lookup)
-        result["_cash_code"]        = "AR001"  # default
-        result["_cash_code_prefix"] = ""
-        result["_desc_prefix"]      = ""
-        result["_invoice_number"]   = invoice_ref
-        result["_raw_name"]         = raw_customer
-        result.setdefault("_account_type",    "Customer")
-        result.setdefault("_posting_profile", "AutoPost")
-        return result
-
-    # ── No name, no invoice match ─────────────────────────────────────────────
-    log.append({
-        "level": "WARN",
-        "msg":   (f"Row {idx}: No customer name and no matching invoice for "
-                  f"gross=${gross}. Upload the invoice to resolve.")
-    })
-    return {
-        "_account":          "",
-        "_account_name":     raw_customer or "",
-        "_account_type":     "Customer",
-        "_posting_profile":  "AutoPost",
-        "_match_method":     "UNRESOLVED",
-        "_match_confidence": "LOW",
-        "_needs_review":     True,
-        "_review_reason":    f"No customer name and no invoice matched amount ${gross}",
-        "_cash_code":        "",
-        "_cash_code_prefix": "",
-        "_desc_prefix":      "",
-        "_raw_name":         raw_customer or "",
-        "_invoice_number":   "",
-    }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# BOA data attachment
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _attach_boa_data(zoho_df, boa_df, log):
+def _build_lookup(customer_df):
     """
-    Attach the BOA posting date and description to each Zoho row.
-
-    The BOA CSV has one row per payout date. The payout date in Zoho is
-    stored in 'payout_date' (from the PDF header). If that matches a BOA
-    row date, use it; otherwise fall back to ±3-day window.
-    """
-    zoho_df = zoho_df.copy()
-
-    if boa_df is None or boa_df.empty:
-        zoho_df["_boa_date"]        = pd.NaT
-        zoho_df["_boa_description"] = ""
-        return zoho_df
-
-    boa_zoho = boa_df[boa_df.get("_is_zoho", pd.Series(False, index=boa_df.index))].copy()
-
-    if boa_zoho.empty:
-        zoho_df["_boa_date"]        = pd.NaT
-        zoho_df["_boa_description"] = ""
-        log.append({
-            "level": "WARN",
-            "msg":   "No ZOHO rows found in BOA file. "
-                     "The BOA description must contain 'ZOHO' to be recognised."
-        })
-        return zoho_df
-
-    # Build date → {description, amount} map from BOA
-    boa_map = {}
-    for _, brow in boa_zoho.iterrows():
-        if pd.notna(brow.get("date")):
-            d = pd.Timestamp(brow["date"]).normalize()
-            boa_map[d] = {
-                "description": str(brow.get("description", "")),
-                "amount":      brow.get("_boa_amount", np.nan),
-            }
-
-    def get_boa_for_row(row):
-        # Priority 1: use payout_date from Zoho PDF if available
-        for date_field in ["payout_date", "date"]:
-            val = row.get(date_field)
-            if val and str(val) not in ("nan", "NaT", ""):
-                try:
-                    d = pd.Timestamp(val).normalize()
-                    for delta in [0, 1, -1, 2, -2, 3, -3]:
-                        target = d + pd.Timedelta(days=delta)
-                        if target in boa_map:
-                            return boa_map[target]
-                except Exception:
-                    pass
-        # Use the first BOA row if nothing matched
-        if boa_map:
-            return next(iter(boa_map.values()))
-        return {"description": "", "amount": np.nan}
-
-    boa_dates = []
-    boa_descs = []
-    for _, row in zoho_df.iterrows():
-        boa_entry = get_boa_for_row(row)
-        boa_dates.append(
-            pd.Timestamp(list(boa_map.keys())[0])
-            if boa_map else pd.NaT
-        )
-        boa_descs.append(boa_entry["description"])
-
-    # Use the actual BOA date (from boa_map keys) not the Zoho transaction date
-    # The BOA posting date is what goes into D365 (per SOP)
-    if boa_map:
-        boa_posting_date = list(boa_map.keys())[0]  # first (and usually only) ZOHO row
-        zoho_df["_boa_date"] = boa_posting_date
-    else:
-        zoho_df["_boa_date"] = pd.NaT
-
-    zoho_df["_boa_description"] = boa_descs
-    return zoho_df
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Balance validation
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _validate_balance(boa_df, zoho_df, log):
-    if boa_df is None or boa_df.empty:
-        return
-    if "_boa_amount" not in boa_df.columns:
-        return
-
-    boa_zoho = boa_df[boa_df.get("_is_zoho", pd.Series(False, index=boa_df.index))]
-    if boa_zoho.empty:
-        return
-
-    boa_net    = boa_zoho["_boa_amount"].sum()
-    zoho_gross = zoho_df["gross_amount"].fillna(0).sum() if "gross_amount" in zoho_df.columns else 0
-
-    # Use Zoho summary fee (authoritative) if present; fall back to per-txn sum
-    if "_summary_fee" in zoho_df.columns:
-        summary_fees = zoho_df["_summary_fee"].dropna()
-        summary_fees = pd.to_numeric(summary_fees, errors="coerce").dropna()
-        zoho_fee = summary_fees.iloc[0] if not summary_fees.empty else zoho_df["fee"].fillna(0).sum()
-    else:
-        zoho_fee = zoho_df["fee"].fillna(0).sum() if "fee" in zoho_df.columns else 0
-
-    zoho_net   = zoho_gross - zoho_fee
-
-    diff = abs(float(boa_net) - float(zoho_net))
-    tol  = max(abs(float(boa_net)) * 0.005, 1.0)
-
-    if diff <= tol:
-        log.append({
-            "level": "OK",
-            "msg":   (f"Balance check PASSED: BOA net=${boa_net:,.2f} "
-                      f"≈ Zoho gross${zoho_gross:,.2f} − fee${zoho_fee:,.2f} = ${zoho_net:,.2f}")
-        })
-    else:
-        log.append({
-            "level": "WARN",
-            "msg":   (f"Balance mismatch: BOA net=${boa_net:,.2f}, "
-                      f"Zoho net=${zoho_net:,.2f}, diff=${diff:,.2f} "
-                      f"(tolerance=${tol:.2f})")
-        })
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Customer lookup helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _build_customer_lookup(customer_df):
-    """
-    Build lookup dict: normalised_name → {account, account_name}
-
-    Two entries are created per row when CS/PS Ticket is present:
-      1. Normalised Account Name  → used when Zoho/invoice has the business name
-      2. Normalised CS/PS Ticket  → used when invoice "Bill To" has an individual name
-         (e.g. "Ali Amir" → maps to BC000654 Functional Holistic Healing)
-
-    This means even if the invoice says "Bill To: Ali Amir", the app will
-    record the correct D365 account name "Functional Holistic Healing".
+    Build {normalised_name: {account, account_name}} dict.
+    Two entries per row when CS/PS Ticket is present:
+      - Account Name (business name)
+      - CS/PS Ticket (individual Bill To name → same business account)
     """
     lookup = {}
     for _, row in customer_df.iterrows():
         acc    = str(row.get("Account", "")).strip()
         name   = str(row.get("Account Name", "")).strip()
         ticket = str(row.get("CS/PS Ticket", "")).strip()
-
         if not acc or not name:
             continue
-
         entry = {"account": acc, "account_name": name}
-
-        # Primary key: business/account name
-        lookup[_normalise_name(name)] = entry
-
-        # Secondary key: individual name from CS/PS Ticket column
+        lookup[_norm(name)] = entry
         if ticket and ticket.lower() not in ("", "nan", "none"):
-            lookup[_normalise_name(ticket)] = entry
-
+            lookup[_norm(ticket)] = entry
     return lookup
 
 
-def _normalise_name(name):
+def _norm(name):
+    """Normalise name for fuzzy matching."""
     name = str(name).lower().strip()
     name = re.sub(r"[^\w\s]", " ", name)
-    for suffix in [r"\bllc\b", r"\binc\b", r"\bltd\b", r"\bcorp\b",
-                   r"\bpllc\b", r"\bpc\b", r"\bdba\b", r"\bthe\b"]:
-        name = re.sub(suffix, "", name)
+    for sfx in [r"\bllc\b", r"\binc\b", r"\bltd\b", r"\bcorp\b",
+                r"\bpllc\b", r"\bpc\b", r"\bdba\b", r"\bthe\b"]:
+        name = re.sub(sfx, "", name)
     return re.sub(r"\s+", " ", name).strip()
 
 
-def _fuzzy_lookup(raw_name, customer_lookup):
-    norm = _normalise_name(raw_name)
-    keys = list(customer_lookup.keys())
-
-    if not keys:
-        return _unresolved(raw_name, "Customer master is empty")
-
-    result   = process.extractOne(norm, keys, scorer=fuzz.token_set_ratio)
-    best_key = result[0]
-    score    = result[1]
-    matched  = customer_lookup[best_key]
-
+def _fuzzy_lookup(raw_name, lookup):
+    """Fuzzy-match raw_name against lookup keys."""
+    if not lookup:
+        return None, 0
+    norm = _norm(raw_name)
+    result  = process.extractOne(norm, list(lookup.keys()), scorer=fuzz.token_set_ratio)
+    if not result:
+        return None, 0
+    best_key, score = result[0], result[1]
     if score >= _FUZZY_THRESHOLD:
-        confidence = "HIGH" if score >= 92 else "MEDIUM"
-        return {
-            "_account":          matched["account"],
-            "_account_name":     matched["account_name"],
-            "_account_type":     "Customer",
-            "_posting_profile":  "AutoPost",
-            "_match_method":     f"FUZZY({score})",
-            "_match_confidence": confidence,
-            "_needs_review":     confidence == "MEDIUM",
-            "_review_reason":    (f"Fuzzy match '{matched['account_name']}' "
-                                  f"score {score}/100 — verify") if confidence == "MEDIUM" else "",
-            "_fuzzy_score":      score,
-        }
-    return _unresolved(raw_name,
-                       f"Best match '{matched['account_name']}' scored {score}/100 < {_FUZZY_THRESHOLD}")
+        return lookup[best_key], score
+    return None, score
 
 
-def _unresolved(raw_name, reason):
+# ─────────────────────────────────────────────────────────────────────────────
+# Row resolution
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _resolve_row(idx, zrow, lookup, invoice_by_amount, log):
+    """
+    Resolve one Zoho transaction row to D365 fields.
+    
+    Priority:
+    1. Match gross amount to invoice → get Bill To name + terms
+    2. Look up Bill To name in master (Account Name or CS/PS Ticket column)
+    3. If not found → flag, leave account blank, still Customer type
+    """
+    gross = _safe_float(zrow.get("gross_amount"))
+
+    # ── Match invoice by gross amount ─────────────────────────────────────────
+    inv = None
+    if gross:
+        inv = invoice_by_amount.get(round(gross, 2))
+
+    if inv:
+        customer_name = inv.get("customer_name", "")
+        payment_terms = inv.get("payment_terms", "")
+        cs_ticket     = inv.get("cs_ticket", "")
+        cash_code, pfx = _terms_to_cash_code(payment_terms)
+
+        # Look up customer in master
+        matched, score = _fuzzy_lookup(customer_name, lookup)
+
+        if matched:
+            is_cs = bool(cs_ticket)
+            desc_prefix = f"{customer_name} CS Ticket #{cs_ticket}_" if is_cs else ""
+            log.append({"level": "OK",
+                        "msg": f"Row {idx}: '{customer_name}' → "
+                               f"{matched['account']} {matched['account_name']} "
+                               f"[score={score}] cash={cash_code}"})
+            return {
+                "_account":          matched["account"],
+                "_account_name":     matched["account_name"],
+                "_account_type":     "Customer",
+                "_posting_profile":  "AutoPost",
+                "_cash_code":        cash_code,
+                "_cash_code_prefix": pfx,
+                "_desc_prefix":      desc_prefix,
+                "_match_confidence": "HIGH" if score >= 92 else "MEDIUM",
+                "_needs_review":     score < 92,
+                "_review_reason":    f"Fuzzy score {score}/100 — verify name" if score < 92 else "",
+                "_invoice_number":   inv.get("invoice_number", ""),
+                "_raw_name":         customer_name,
+            }
+        else:
+            # Not in master — flag but keep Customer type per §5.1
+            reason = (f"'{customer_name}' not found in Account_Masterlist. "
+                      f"Add them with BC###### to resolve.")
+            log.append({"level": "WARN", "msg": f"Row {idx}: {reason}"})
+            is_cs = bool(cs_ticket)
+            desc_prefix = f"{customer_name} CS Ticket #{cs_ticket}_" if is_cs else ""
+            return {
+                "_account":          "",
+                "_account_name":     customer_name,
+                "_account_type":     "Customer",
+                "_posting_profile":  "AutoPost",
+                "_cash_code":        cash_code,
+                "_cash_code_prefix": pfx,
+                "_desc_prefix":      desc_prefix,
+                "_match_confidence": "LOW",
+                "_needs_review":     True,
+                "_review_reason":    reason,
+                "_invoice_number":   inv.get("invoice_number", ""),
+                "_raw_name":         customer_name,
+            }
+
+    # ── No invoice: try Zoho customer name directly ───────────────────────────
+    raw_customer = str(zrow.get("customer", "")).strip()
+    if raw_customer and raw_customer not in ("—", "-", "nan", ""):
+        matched, score = _fuzzy_lookup(raw_customer, lookup)
+        if matched:
+            cash_code, pfx = "AR001", ""
+            return {
+                "_account":          matched["account"],
+                "_account_name":     matched["account_name"],
+                "_account_type":     "Customer",
+                "_posting_profile":  "AutoPost",
+                "_cash_code":        cash_code,
+                "_cash_code_prefix": pfx,
+                "_desc_prefix":      "",
+                "_match_confidence": "HIGH" if score >= 92 else "MEDIUM",
+                "_needs_review":     score < 92,
+                "_review_reason":    "",
+                "_invoice_number":   "",
+                "_raw_name":         raw_customer,
+            }
+
+    # ── No match at all ───────────────────────────────────────────────────────
+    reason = (f"No invoice uploaded matching ${gross:,.2f}. "
+              f"Upload the invoice to resolve.") if gross else "No customer name and no invoice."
+    log.append({"level": "WARN", "msg": f"Row {idx}: {reason}"})
     return {
         "_account":          "",
-        "_account_name":     raw_name,
+        "_account_name":     raw_customer or "",
         "_account_type":     "Customer",
         "_posting_profile":  "AutoPost",
-        "_match_method":     "UNRESOLVED",
+        "_cash_code":        "",
+        "_cash_code_prefix": "",
+        "_desc_prefix":      "",
         "_match_confidence": "LOW",
         "_needs_review":     True,
         "_review_reason":    reason,
-        "_fuzzy_score":      0,
+        "_invoice_number":   "",
+        "_raw_name":         raw_customer or "",
     }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Payment term → cash code
+# BOA attachment + balance check
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _attach_boa(zoho_df, boa_df, log):
+    """Attach BOA posting date and description string to each Zoho row."""
+    zoho_df = zoho_df.copy()
+    if boa_df is None or boa_df.empty:
+        zoho_df["_boa_date"] = pd.NaT
+        zoho_df["_boa_description"] = ""
+        return zoho_df
+
+    boa_zoho = boa_df[boa_df.get("_is_zoho", pd.Series(False, index=boa_df.index))].copy()
+    if boa_zoho.empty:
+        zoho_df["_boa_date"] = pd.NaT
+        zoho_df["_boa_description"] = ""
+        log.append({"level": "WARN",
+                    "msg": "No 'ZOHO PAYMENTS' rows found in BOA file."})
+        return zoho_df
+
+    # Use the first (and usually only) ZOHO PAYMENTS row
+    boa_row = boa_zoho.iloc[0]
+    boa_date = pd.Timestamp(boa_row["date"]).normalize() if pd.notna(boa_row.get("date")) else pd.NaT
+    boa_desc = str(boa_row.get("description", ""))
+
+    zoho_df["_boa_date"]        = boa_date
+    zoho_df["_boa_description"] = boa_desc
+    return zoho_df
+
+
+def _check_balance(boa_df, zoho_df, log):
+    """Validate: sum(Zoho gross) - summary_fee == BOA net deposit."""
+    if boa_df is None or boa_df.empty or "_boa_amount" not in boa_df.columns:
+        return
+    boa_zoho = boa_df[boa_df.get("_is_zoho", pd.Series(False, index=boa_df.index))]
+    if boa_zoho.empty:
+        return
+
+    boa_net    = float(boa_zoho["_boa_amount"].sum())
+    zoho_gross = float(zoho_df["gross_amount"].fillna(0).sum()) if "gross_amount" in zoho_df.columns else 0
+
+    # Use authoritative summary fee
+    if "_summary_fee" in zoho_df.columns:
+        sf = pd.to_numeric(zoho_df["_summary_fee"].dropna(), errors="coerce").dropna()
+        zoho_fee = float(sf.iloc[0]) if not sf.empty else 0
+    else:
+        zoho_fee = float(zoho_df["fee"].fillna(0).sum()) if "fee" in zoho_df.columns else 0
+
+    zoho_net = zoho_gross - zoho_fee
+    diff = abs(boa_net - zoho_net)
+    tol  = max(abs(boa_net) * 0.005, 1.0)
+
+    if diff <= tol:
+        log.append({"level": "OK",
+                    "msg": f"Balance PASSED: BOA ${boa_net:,.2f} = "
+                           f"Zoho gross ${zoho_gross:,.2f} − fee ${zoho_fee:,.2f} = ${zoho_net:,.2f}"})
+    else:
+        log.append({"level": "WARN",
+                    "msg": f"Balance MISMATCH: BOA ${boa_net:,.2f} vs "
+                           f"Zoho net ${zoho_net:,.2f} (diff ${diff:,.2f})"})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _terms_to_cash_code(terms_str):
-    """Return (cash_code, description_prefix) from a payment terms string."""
     if not terms_str or str(terms_str).lower() in ("nan", ""):
         return "AR001", ""
-    terms_lower = terms_str.lower().strip()
-    for key, val in _TERMS_TO_CASH_CODE.items():
-        if key in terms_lower:
+    t = terms_str.lower().strip()
+    for key, val in _TERMS_MAP.items():
+        if key in t:
             return val
-    return "AR001", ""   # default: due on receipt
+    return "AR001", ""
 
 
 def _safe_float(val):
@@ -1158,35 +837,38 @@ def _safe_float(val):
 """
 builder.py — Build D365 journal entry rows from matched Zoho data.
 
-Rules source: Zoho_Payment_D365_Automation_Rules.docx §4 & §5
+Rules source: Zoho_Payment_D365_Automation_Rules.docx §5
 
-Per transaction (grouped by BOA posting date):
-  • 1 CREDIT line per customer payment
-  • 1 DEBIT line for ALL merchant fees (grouped per payout batch)
+Per payout batch:
+  • 1 CREDIT line per customer (§5.1)
+  • 1 DEBIT line for ALL grouped merchant fees (§5.2, §3.3)
 
-Special account handling (from real D365 reference data):
-  • Normal customers: Account type=Customer, Account=BC######, Posting Profile=AutoPost
-  • CS/repair tickets (individual in CS/PS Ticket column of master):
-    Account type=Customer, Account=BC######, Posting Profile=AutoPost
-    Description: "Name CS Ticket #XXX_ZOHO PAYMENTS DES:..."
-  • CS/repair tickets (individual NOT in master):
-    Account type=Ledger, Account=21040102-B1000002, Name=Temporary Receipt (flagged)
+Description format per §5.1 col 9 examples:
+  AR001 (standard):  "{BC######} {Account Name}_{BOA description}"
+  AR002 (MPP):       "MPP {BC######} {Account Name}_{BOA description}"
+  CS ticket:         "{Bill To Name} CS Ticket #{ticket}_{BOA description}"
+  No account yet:    "{Account Name}_{BOA description}"
+
+Debit description per §5.2:
+  Single:  "Zoho Merchant Fee {BC######} {Name}_{BOA description}"
+  Batch:   "Zoho Merchant Fee {BC1} {Name1}, {BC2} {Name2}_{BOA description}"
 """
 
 import re
 import pandas as pd
 import numpy as np
 
-_COMPANY          = "bwa"
-_POSTING_PROFILE  = "AutoPost"
-_DEBIT_ACCT_NAME  = "Outside Service (Finance)"
-_DEBIT_ACCT_TYPE  = "Ledger"
-_DEBIT_ACCT       = "43170111-U26C05001-B735350-UOA003"
-_DEBIT_CASH_CODE  = "OSF005"
-_CURRENCY         = "USD"
-_EXCHANGE_RATE    = 1.00
-_SALES_TAX_GROUP  = "AVATAX"
-_REVERSING_ENTRY  = "No"
+# Constants per §5.1 and §5.2
+_COMPANY         = "bwa"
+_POSTING_PROFILE = "AutoPost"
+_DEBIT_ACCT_NAME = "Outside Service (Finance)"
+_DEBIT_ACCT_TYPE = "Ledger"
+_DEBIT_ACCT      = "43170111-U26C05001-B735350-UOA003"
+_DEBIT_CASH_CODE = "OSF005"
+_CURRENCY        = "USD"
+_EXCHANGE_RATE   = 1.00
+_SALES_TAX_GROUP = "AVATAX"
+_REVERSING_ENTRY = "No"
 
 D365_COLUMNS = [
     "Date", "Voucher", "Account name", "Company", "Account type",
@@ -1203,20 +885,15 @@ D365_COLUMNS = [
 
 
 def build_journal_entries(matched_df, customer_df, offset_account="B1000002"):
-    log  = []
-    rows = []
+    log, rows = [], []
 
-    # Determine grouping date: use BOA posting date (_boa_date) if available,
-    # fall back to Zoho transaction date
     matched_df = matched_df.copy()
+
+    # Use BOA posting date as the D365 entry date per §5.1 col 1
     if "_boa_date" in matched_df.columns and matched_df["_boa_date"].notna().any():
-        matched_df["_group_date"] = pd.to_datetime(
-            matched_df["_boa_date"], errors="coerce"
-        )
+        matched_df["_group_date"] = pd.to_datetime(matched_df["_boa_date"], errors="coerce")
     elif "date" in matched_df.columns:
-        matched_df["_group_date"] = pd.to_datetime(
-            matched_df["date"], errors="coerce"
-        )
+        matched_df["_group_date"] = pd.to_datetime(matched_df["date"], errors="coerce")
     else:
         matched_df["_group_date"] = pd.NaT
 
@@ -1225,52 +902,56 @@ def build_journal_entries(matched_df, customer_df, offset_account="B1000002"):
     for group_date, group in groups:
         group_rows   = list(group.iterrows())
         multi_batch  = len(group_rows) > 1
-        credit_rows      = []
-        total_fee        = 0.0   # fallback: sum of per-txn fees
-        summary_fee      = None  # authoritative: from Zoho summary line
-        fee_desc_parts   = []
+        credit_rows  = []
+        total_fee    = 0.0
+        summary_fee  = None
+        fee_desc_parts = []
+
+        date_str = ""
+        if pd.notna(group_date):
+            try:
+                date_str = pd.Timestamp(group_date).strftime("%m/%d/%Y")
+            except Exception:
+                date_str = str(group_date)
 
         for _, zrow in group_rows:
             account       = str(zrow.get("_account", "")).strip()
             account_name  = str(zrow.get("_account_name", "")).strip()
-            account_type  = str(zrow.get("_account_type",  "Customer")).strip()
-            posting_prof  = str(zrow.get("_posting_profile", _POSTING_PROFILE)).strip()
+            cash_code     = str(zrow.get("_cash_code", "AR001")).strip() or "AR001"
+            cash_pfx      = str(zrow.get("_cash_code_prefix", "")).strip()
+            desc_prefix   = str(zrow.get("_desc_prefix", "")).strip()
             needs_review  = bool(zrow.get("_needs_review", False))
             review_reason = str(zrow.get("_review_reason", ""))
             confidence    = str(zrow.get("_match_confidence", "LOW"))
             gross         = _safe_float(zrow.get("gross_amount"))
             fee           = _safe_float(zrow.get("fee"))
             boa_desc      = str(zrow.get("_boa_description", "")).strip()
-            cash_code     = str(zrow.get("_cash_code", "")).strip()
-            cash_pfx      = str(zrow.get("_cash_code_prefix", "")).strip()
-            desc_prefix   = str(zrow.get("_desc_prefix", "")).strip()
 
-            # Default cash code if not set
-            if not cash_code:
-                cash_code = "AR001"
+            # Accumulate fee
+            if fee and fee > 0:
+                total_fee += fee
+            sf = _safe_float(zrow.get("_summary_fee"))
+            if sf and sf > 0:
+                summary_fee = sf
 
-            # Format entry date from BOA posting date
-            date_str = ""
-            if pd.notna(group_date):
-                try:
-                    date_str = pd.Timestamp(group_date).strftime("%m/%d/%Y")
-                except Exception:
-                    date_str = str(group_date)
-
-            # Build credit description
-            credit_desc = _build_credit_description(
-                cash_code, cash_pfx, desc_prefix,
-                account, account_name, boa_desc
+            # Build credit description per §5.1 col 9
+            credit_desc = _credit_description(
+                cash_code, cash_pfx, desc_prefix, account, account_name, boa_desc
             )
+
+            # Accumulate fee description parts for debit row
+            part = " ".join(filter(None, [account, account_name])).strip()
+            if part:
+                fee_desc_parts.append(part)
 
             credit_row = {
                 "Date":                  date_str,
                 "Voucher":               "",
                 "Account name":          account_name,
                 "Company":               _COMPANY,
-                "Account type":          account_type,
+                "Account type":          "Customer",   # always Customer per §5.1 col 5
                 "Account":               account,
-                "Posting profile":       posting_prof if account else "",
+                "Posting profile":       _POSTING_PROFILE if account else "",
                 "Cash code":             cash_code,
                 "Description":           credit_desc,
                 "Debit":                 "",
@@ -1296,39 +977,20 @@ def build_journal_entries(matched_df, customer_df, offset_account="B1000002"):
             credit_rows.append(credit_row)
             rows.append(credit_row)
 
-            if fee and fee > 0:
-                total_fee += fee
-
-            # Prefer the Zoho summary-level fee over per-txn sum
-            sf = _safe_float(zrow.get("_summary_fee"))
-            if sf and sf > 0:
-                summary_fee = sf
-
-            # Accumulate fee description parts
-            part = " ".join(filter(None, [account, account_name])).strip()
-            if part:
-                fee_desc_parts.append(part)
-
-        # ── Use Zoho summary fee (authoritative) over per-txn sum ───────────
-        # The summary line "Payments N $X −$Y $Z" is the source of truth per SOP.
-        # Never assume or recalculate — use exactly what Zoho reports.
+        # ── Debit row: use Zoho summary fee (authoritative) ───────────────────
         debit_fee = summary_fee if summary_fee else total_fee
-
-        # ── Single grouped debit row for all fees in this batch ───────────────
         if debit_fee > 0:
-            date_str = credit_rows[0]["Date"] if credit_rows else ""
-
             if multi_batch:
-                fee_name_str = ", ".join(fee_desc_parts)
-                debit_desc = f"Zoho Merchant Fee {fee_name_str}_{boa_desc}" if boa_desc else f"Zoho Merchant Fee {fee_name_str}"
+                fee_names = ", ".join(fee_desc_parts)
+                debit_desc = (f"Zoho Merchant Fee {fee_names}_{boa_desc}"
+                              if boa_desc else f"Zoho Merchant Fee {fee_names}")
             else:
-                # Single payment: "Zoho Merchant Fee_ {credit_desc without code prefix}"
-                base = credit_rows[0]["Description"] if credit_rows else ""
-                # Remove cash code prefix (e.g. "AR001: ") or MPP prefix from start
-                base_clean = re.sub(r"^(AR\d{3}:\s*|MPP\s+)", "", base)
-                debit_desc = f"Zoho Merchant Fee_ {base_clean}".strip()
+                # Single: use same name/account part as credit, prefix with "Zoho Merchant Fee "
+                single_part = fee_desc_parts[0] if fee_desc_parts else ""
+                debit_desc = (f"Zoho Merchant Fee {single_part}_{boa_desc}"
+                              if boa_desc else f"Zoho Merchant Fee {single_part}")
 
-            debit_row = {
+            rows.append({
                 "Date":                  date_str,
                 "Voucher":               "",
                 "Account name":          _DEBIT_ACCT_NAME,
@@ -1357,73 +1019,53 @@ def build_journal_entries(matched_df, customer_df, offset_account="B1000002"):
                 "_needs_review":         False,
                 "_review_reason":        "",
                 "_match_confidence":     "HIGH",
-            }
-            rows.append(debit_row)
-            log.append({
-                "level": "OK",
-                "msg": (f"Built {'batch' if multi_batch else 'single'} debit row "
-                        f"for {date_str or 'undated'} — fee ${debit_fee:.2f} "
-                        f"(source: {'Zoho summary' if summary_fee else 'per-txn sum'})")
             })
+            log.append({"level": "OK",
+                        "msg": f"Debit row: ${debit_fee:.2f} "
+                               f"({'summary' if summary_fee else 'per-txn sum'}) "
+                               f"for {date_str}"})
 
     if not rows:
-        log.append({"level": "WARN", "msg": "No journal entry rows were generated."})
+        log.append({"level": "WARN", "msg": "No journal entry rows generated."})
         return pd.DataFrame(columns=[c for c in D365_COLUMNS if not c.startswith("_")]), log
 
     journal_df = pd.DataFrame(rows)
     for col in D365_COLUMNS:
         if col not in journal_df.columns:
             journal_df[col] = ""
-
     return journal_df, log
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Description builders
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _build_credit_description(cash_code, cash_pfx, desc_prefix,
-                               account, account_name, boa_desc):
+def _credit_description(cash_code, cash_pfx, desc_prefix, account, account_name, boa_desc):
     """
-    Build the D365 credit line description.
+    Build credit line description per §5.1 col 9.
 
-    Normal (AR001):  "AR001: BC000649 Equity Now Inc_ZOHO PAYMENTS DES:..."
-    MPP    (AR002):  "MPP BC000327 Elite Functional Wellness_ZOHO PAYMENTS DES:..."
-    CS Ticket:       "Nicole Holovach CS Ticket #676_ZOHO PAYMENTS DES:..."
-
-    Rules:
-      - If desc_prefix is set (CS ticket), it replaces everything before the BOA desc
-      - If cash_pfx is "MPP ", no cash code token in description
-      - Otherwise, lead with "{cash_code}: "
+    Examples from rules doc:
+      AR001: "BC000571 Page Fit Inc. DBA Intoxx Fitness_ZOHO PAYMENTS DES:..."
+      AR002: "MPP BC000327 Elite Functional Wellness_ZOHO PAYMENTS DES:..."
+    
+    Note: cash code does NOT appear in the description string.
+    The description format is: [{MPP }]{BC######} {Name}_{BOA desc}
+    
+    CS ticket: "{Bill To} CS Ticket #{ticket}_{BOA desc}"
+    No account: "{Account Name}_{BOA desc}"
     """
     name_part = " ".join(filter(None, [account, account_name])).strip()
 
     if desc_prefix:
-        # CS ticket: "Nicole Holovach CS Ticket #676_ZOHO PAYMENTS DES:..."
-        if boa_desc:
-            return f"{desc_prefix}{boa_desc}"
-        return desc_prefix.rstrip("_")
+        # CS ticket path: "Paul Fuss CS Ticket #654_ZOHO PAYMENTS DES:..."
+        return f"{desc_prefix}{boa_desc}" if boa_desc else desc_prefix.rstrip("_")
 
     if cash_pfx:
-        # MPP: "MPP BC000327 Name_ZOHO PAYMENTS DES:..."
-        if boa_desc:
-            return f"{cash_pfx}{name_part}_{boa_desc}"
-        return f"{cash_pfx}{name_part}"
+        # MPP path: "MPP BC000327 Elite Functional Wellness_ZOHO PAYMENTS DES:..."
+        return f"{cash_pfx}{name_part}_{boa_desc}" if boa_desc else f"{cash_pfx}{name_part}"
 
-    # Standard format per SOP:
-    #   With account resolved:   "AR001: BC000649 Equity Now Inc_ZOHO PAYMENTS DES:..."
-    #   Without account (new):   "Legends Charter School_ZOHO PAYMENTS DES:..."
-    #   (no cash code prefix when account number is not yet in master)
     if account:
-        code_token = f"{cash_code}: " if cash_code else ""
-        if boa_desc:
-            return f"{code_token}{name_part}_{boa_desc}"
-        return f"{code_token}{name_part}"
-    else:
-        # Account not resolved yet — omit cash code prefix, just use name
-        if boa_desc:
-            return f"{account_name}_{boa_desc}"
-        return account_name
+        # Standard: "BC000571 Page Fit Inc._ZOHO PAYMENTS DES:..."
+        return f"{name_part}_{boa_desc}" if boa_desc else name_part
+
+    # No account resolved yet: "Legends Charter School_ZOHO PAYMENTS DES:..."
+    return f"{account_name}_{boa_desc}" if boa_desc else account_name
 
 
 def _safe_float(val):
