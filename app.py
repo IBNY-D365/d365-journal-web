@@ -51,7 +51,6 @@ def robust_read_boa_csv(file_io):
             break
             
     file_io.seek(0)
-    # Added engine='python' and on_bad_lines='skip' to absorb erratic CSV lines seamlessly
     df = pd.read_csv(
         file_io, 
         skiprows=skip_rows, 
@@ -59,7 +58,6 @@ def robust_read_boa_csv(file_io):
         on_bad_lines='skip'
     )
     
-    # Standardize column headers to avoid string matching case/whitespace mismatches
     df.columns = df.columns.str.strip().str.title()
     return df
 
@@ -94,19 +92,3 @@ def load_master_files():
         form_master = pd.read_excel("Form_Master_DB.xlsx", sheet_name="Sales_PRF")
         monthly_exp = pd.read_excel("Monthly Expense Record.xlsx")
         return cust_master, form_master, monthly_exp
-    except Exception:
-        return None, None, None
-
-cust_master, form_master, monthly_exp = load_master_files()
-
-# ==========================================
-# PROCESSING ENGINE (DETERMINISTIC PIPELINE)
-# ==========================================
-if boa_statement is not None:
-    if boa_statement.name.endswith('.csv'):
-        df_boa = robust_read_boa_csv(boa_statement)
-    else:
-        df_boa = pd.read_excel(boa_statement)
-        df_boa.columns = df_boa.columns.str.strip().str.title()
-        
-    output
