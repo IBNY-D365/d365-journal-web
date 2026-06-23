@@ -104,9 +104,12 @@ def extract_invoice_metadata_intelligent(pdf_file) -> Dict[str, Any]:
         inv_match = re.search(r"(INV-\d+)", full_text_clean, re.IGNORECASE)
         result["invoice_number"] = inv_match.group(1).strip() if inv_match else inv_num
         
-        # 2. Gross Amount Extraction
+        # 2. Gross Amount Extraction (With foolproof empty sequence check)
         all_decimals = [clean_numeric_value(n) for n in re.findall(r"\b\d+(?:[\.,]\d{2})+\b", full_text_clean)]
-        result["gross_amount"] = max(all_decimals) if all_decimals else 0.0
+        if len(all_decimals) > 0:
+            result["gross_amount"] = max(all_decimals)
+        else:
+            result["gross_amount"] = 0.0
         
         # 3. Personal "Bill To" Name Extraction
         bill_to_match = re.search(r"Bill\s+To\s*([A-Za-z0-9\s\.\,\-]+?)(?:\s*\d|\s*Ship\s*To|$)", full_text_clean, re.IGNORECASE)
@@ -272,7 +275,7 @@ else:
         row_description = str(row.get(desc_target, ''))
         row_net_amount = clean_numeric_value(row.get(amount_target, 0.0))
         
-        # CRITICAL FIX 1: Only grab "ZOHO PAYMENTS" that are positive deposits (blocks the negative -389.40 Zoho One fees)
+        # CRITICAL FIX 1: Only grab "ZOHO PAYMENTS" that are positive deposits (blocks negative fees)
         if "ZOHO PAYMENTS" in row_description.upper() and row_net_amount > 0:
             parsed_date = datetime.today().date()
             if date_target and pd.notna(row[date_target]):
@@ -357,7 +360,6 @@ else:
         for z_rec in matched_zoho:
             current_boa_description = str(boa_rec.description)
             
-            # CRITICAL FIX 2: Apply the bulletproof Normalization rules to match LLCs and minor misspellings
             norm_biz = normalize_name(z_rec.customer_name)
             norm_per = normalize_name(z_rec.fallback_personal_name)
             
@@ -383,7 +385,7 @@ else:
 
             # ASSIGNMENT EXECUTION
             if not matched_master_item:
-                # FALLBACK: Temporary Receipt Ledger (E.g. Paul Fuss)
+                # FALLBACK: Temporary Receipt Ledger
                 account_num = "21040102-B1000002"
                 account_type = "Ledger"
                 account_name = "Temporary Receipt"
@@ -392,7 +394,7 @@ else:
                 display_label = z_rec.customer_name if z_rec.customer_name else (z_rec.fallback_personal_name if z_rec.fallback_personal_name else "Unknown")
                 desc = f"{display_label} (UNRECORDED ENTITY)_{current_boa_description}"
             else:
-                # MASTER MATCH: Registered Entity (E.g. Underground Gym / Functional Holistic Healing)
+                # MASTER MATCH: Registered Entity 
                 master_item = matched_master_item
                 processed_accounts.append(master_item)
                 
