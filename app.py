@@ -76,21 +76,8 @@ def clean_numeric_value(val: Any) -> float:
 # =====================================================================
 # 3. ADVANCED EXTRACTION ENGINE
 # =====================================================================
-def parse_invoice_pdf(pdf_file) -> Optional[str]:
-    try:
-        reader = PdfReader(pdf_file)
-        full_text = ""
-        for page in reader.pages:
-            full_text += page.extract_text() or ""
-        match = re.search(r"Bill\s+to[:]?\s*(.*)", full_text, re.IGNORECASE)
-        if match:
-            return match.group(1).split('\n')[0].strip()
-    except Exception as e:
-        st.error(f"Error parsing PDF invoice: {e}")
-    return None
-
 def extract_invoice_metadata_intelligent(pdf_file) -> Dict[str, Any]:
-    """Extracts business name entries out of the Item & Description table row text."""
+    """Scans an invoice PDF to resolve true business name or personal fallback name."""
     result = {"customer_name": None, "invoice_number": None, "gross_amount": 0.0, "fallback_personal_name": None}
     try:
         reader = PdfReader(pdf_file)
@@ -100,39 +87,34 @@ def extract_invoice_metadata_intelligent(pdf_file) -> Dict[str, Any]:
             
         full_text_clean = " ".join(full_text.split())
         
+        # Extract invoice tracking code
         inv_num = pdf_file.name.replace(".pdf", "")
         inv_match = re.search(r"(INV-\d+)", full_text_clean, re.IGNORECASE)
         result["invoice_number"] = inv_match.group(1).strip() if inv_match else inv_num
         
+        # Get highest number value as gross amount
         all_decimals = [clean_numeric_value(n) for n in re.findall(r"\b\d+(?:[\.,]\d{2})+\b", full_text_clean)]
         result["gross_amount"] = max(all_decimals) if all_decimals else 0.0
         
+        # Extract 'Bill To' personal name
         bill_to_name = None
-        bill_to_match = re.search(r"Bill\s+to[:]?\s*(.*)", full_text, re.IGNORECASE)
+        bill_to_match = re.search(r"Bill\s+To\s*([^\n]+)", full_text, re.IGNORECASE)
         if bill_to_match:
-            bill_to_name = bill_to_match.group(1).split('\n')[0].strip()
-            
-        lines = full_text.split("\n")
-        detected_business = None
+            bill_to_name = bill_to_match.group(1).strip()
+        result["fallback_personal_name"] = bill_to_name
         
+        # Scrape lines specifically targeting corporate descriptions (e.g. Underground Gym, Functional Holistic)
+        lines = full_text.split("\n")
         for line in lines:
-            line_lower = line.lower()
-            # If line is part of the items description table row matching pattern
-            if "-" in line and ("item" not in line_lower and "description" not in line_lower and "sku" not in line_lower):
-                # Isolate sub-entities separated by hyphens (e.g., "- Underground Gym" or "- Functional Holistic Healing")
+            if "InBody" in line and "-" in line:
                 parts = line.split("-")
-                if len(parts) >= 2:
-                    candidate = parts[-1].strip() # Get trailing description text
-                    if "inbody" not in candidate.lower() and len(candidate) > 2:
-                        detected_business = candidate
-                        break
+                # Look for segments that aren't hardware keywords
+                for part in parts:
+                    candidate = part.strip()
+                    if candidate and "inbody" not in candidate.lower() and "malfunction" not in candidate.lower() and "check required" not in candidate.lower():
+                        result["customer_name"] = candidate
+                        return result
                         
-        if detected_business:
-            result["customer_name"] = detected_business
-        else:
-            result["customer_name"] = None
-            result["fallback_personal_name"] = bill_to_name
-            
     except Exception as e:
         st.error(f"Error executing intelligent metadata capture: {e}")
     return result
@@ -221,28 +203,16 @@ else:
             payment_term=term_val
         )
 
-    zoho_records: List[ZohoRecord] = []
-
-    # STEP B: LOAD INVOICE REPOSITORY
+    # STEP B: SCAN DIRECT INVOICE BACKUPS AND POPULATE INTEL CACHE
     invoice_cache = {}
     if uploaded_invoices:
         for inv in uploaded_invoices:
             meta = extract_invoice_metadata_intelligent(inv)
-            inv_id = meta["invoice_number"]
-            
-            invoice_cache[inv_id] = {
-                "resolved_name": meta["customer_name"],
-                "fallback_personal_name": meta["fallback_personal_name"]
-            }
-                
-            if meta["gross_amount"] > 0 and not any(r.invoice_number == inv_id for r in zoho_records):
-                zoho_records.append(ZohoRecord(
-                    customer_name=meta["customer_name"],
-                    gross_amount=meta["gross_amount"],
-                    merchant_fee=0.0,
-                    invoice_number=inv_id,
-                    fallback_personal_name=meta["fallback_personal_name"]
-                ))
+            if meta["invoice_number"]:
+                invoice_cache[meta["invoice_number"]] = {
+                    "resolved_name": meta["customer_name"],
+                    "fallback_personal_name": meta["fallback_personal_name"]
+                }
 
     # STEP C: PARSE BANK OF AMERICA REPORT
     if boa_file.name.endswith('.csv'):
@@ -265,10 +235,6 @@ else:
     amount_target = next((c for c in ['net amount', 'amount', 'net_amount'] if c in boa_df.columns), None)
     account_target = next((c for c in ['source account', 'account', 'account number', 'account_number'] if c in boa_df.columns), None)
 
-    if desc_target is None:
-        st.error("❌ Could not find a transaction 'Description' column variant in your Bank of America report.")
-        st.stop()
-
     boa_records: List[BOARecord] = []
     for _, row in boa_df.iterrows():
         row_description = str(row.get(desc_target, ''))
@@ -286,23 +252,10 @@ else:
                 source_account=str(row.get(account_target, '')).strip() if account_target else "3371"
             ))
 
-    # STEP D: DYNAMIC MULTI-SOURCE ZOHO INGESTION PIPELINE
+    # STEP D: PARSE PRIMARY ZOHO SUMMARY SHEET
+    raw_zoho_pool: List[ZohoRecord] = []
     if zoho_file.name.endswith('.pdf'):
-        pdf_records = parse_zoho_summary_pdf_bulletproof(zoho_file)
-        for pr in pdf_records:
-            if not any(r.invoice_number == pr.invoice_number for r in zoho_records):
-                zoho_records.append(pr)
-                
-        if not zoho_records or sum(z.gross_amount for z in zoho_records) == 0:
-            meta = extract_invoice_metadata_intelligent(zoho_file)
-            if meta["gross_amount"] > 0:
-                zoho_records = [ZohoRecord(
-                    customer_name=meta["customer_name"],
-                    gross_amount=meta["gross_amount"],
-                    merchant_fee=0.0,
-                    invoice_number=meta["invoice_number"],
-                    fallback_personal_name=meta["fallback_personal_name"]
-                )]
+        raw_zoho_pool = parse_zoho_summary_pdf_bulletproof(zoho_file)
     else:
         if zoho_file.name.endswith('.csv'):
             zoho_df = pd.read_csv(zoho_file)
@@ -310,24 +263,29 @@ else:
             zoho_df = pd.read_excel(zoho_file)
         zoho_df.columns = [str(c).strip() for c in zoho_df.columns]
         for _, row in zoho_df.iterrows():
-            zoho_records.append(ZohoRecord(
+            raw_zoho_pool.append(ZohoRecord(
                 customer_name=str(row['Customer']).strip() if pd.notna(row.get('Customer')) else None,
                 gross_amount=clean_numeric_value(row.get('Gross Amount', 0.0)),
                 merchant_fee=clean_numeric_value(row.get('Merchant Fee', 0.0)),
                 invoice_number=str(row['Invoice Number']).strip() if pd.notna(row.get('Invoice Number')) else None
             ))
 
-    # Apply global cross-reference lookup traces across the invoice cache
+    # CRITICAL DEDUPLICATION LAYER: Merge datasets tracking unique invoice keys only
+    zoho_records: List[ZohoRecord] = []
+    seen_invoices = set()
+
+    for r in raw_zoho_pool:
+        if r.invoice_number and r.invoice_number not in seen_invoices:
+            zoho_records.append(r)
+            seen_invoices.add(r.invoice_number)
+
+    # Cross-reference against invoice intelligence cache
     for z_rec in zoho_records:
-        if not z_rec.customer_name or z_rec.customer_name.strip() == "" or "customer" in str(z_rec.customer_name).lower():
-            if z_rec.invoice_number in invoice_cache:
-                z_rec.customer_name = invoice_cache[z_rec.invoice_number]["resolved_name"]
-                z_rec.fallback_personal_name = invoice_cache[z_rec.invoice_number]["fallback_personal_name"]
-            else:
-                matched_key = next((k for k in invoice_cache if z_rec.invoice_number and (k in z_rec.invoice_number or z_rec.invoice_number in k)), None)
-                if matched_key:
-                    z_rec.customer_name = invoice_cache[matched_key]["resolved_name"]
-                    z_rec.fallback_personal_name = invoice_cache[matched_key]["fallback_personal_name"]
+        if z_rec.invoice_number in invoice_cache:
+            cache_hit = invoice_cache[z_rec.invoice_number]
+            # Use business name first, otherwise log personal fallback fields
+            z_rec.customer_name = cache_hit["resolved_name"] if cache_hit["resolved_name"] else None
+            z_rec.fallback_personal_name = cache_hit["fallback_personal_name"]
 
     # =====================================================================
     # STEP E: TRANSACTION PROCESSING & BATCH RESOLUTION ENGINE
@@ -354,8 +312,7 @@ else:
             
         if abs((total_gross - total_fees) - boa_rec.net_amount) > 1.00:
             validation_errors.append(
-                f"🚨 **Mathematical Balance Discrepancy!** Bank Net: ${boa_rec.net_amount:.2f} | "
-                f"Calculated Target: ${(total_gross - total_fees):.2f}"
+                f"🚨 **Mathematical Balance Discrepancy!** Bank Net: ${boa_rec.net_amount:.2f} | Calculated Target: ${(total_gross - total_fees):.2f}"
             )
             continue
 
@@ -366,20 +323,20 @@ else:
         for z_rec in matched_zoho:
             current_boa_description = str(boa_rec.description)
             
-            # Form lookup key query candidate
-            query_name = z_rec.customer_name if z_rec.customer_name else ""
+            # Hierarchical lookup checking strategies
+            query_name = z_rec.customer_name if z_rec.customer_name else (z_rec.fallback_personal_name if z_rec.fallback_personal_name else "")
             query_key = query_name.lower().strip()
             
             matched_master_key = next((k for k in master_lookup if k in query_key or query_key in k), None) if query_key else None
             
-            # Alternate Suspense Routing Layer for Unrecorded Records
             if not matched_master_key:
+                # Suspense Fallback Routing Rules for Unrecorded Accounts
                 account_num = "21040102-B1000002"
                 account_type = "Ledger"
                 account_name = "Temporary Receipt"
                 cash_code = "AR012"
                 
-                display_label = z_rec.fallback_personal_name if z_rec.fallback_personal_name else query_name
+                display_label = z_rec.fallback_personal_name if z_rec.fallback_personal_name else (z_rec.customer_name if z_rec.customer_name else "Unknown")
                 desc = f"{display_label} (UNRECORDED ENTITY)_{current_boa_description}"
             else:
                 master_item = master_lookup[matched_master_key]
@@ -405,7 +362,7 @@ else:
                 "Release date": "", "Reversing entry": "No", "Reversing date": ""
             })
 
-        # 2. Generate Consolidated Grouped Debit Fee Line (Rule 3.3 Batch Multiplicity Rule)
+        # 2. Generate Consolidated Grouped Debit Fee Line
         if total_fees > 0:
             current_boa_description = str(boa_rec.description)
             if len(processed_accounts) == 1:
