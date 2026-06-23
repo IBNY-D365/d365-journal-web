@@ -41,9 +41,6 @@ D365_TEMPLATE_COLUMNS = [
     "Release date", "Reversing entry", "Reversing date"
 ]
 
-FORM_DB_PATH = "Form Master DB.xlsx"
-FORM_DB_PATH_CSV = "Form Master DB.csv"
-
 # =====================================================================
 # 2. DATA UTILITIES & MODELS
 # =====================================================================
@@ -88,21 +85,6 @@ def normalize_name(name: str) -> str:
     n = re.sub(r'\s+', '', n)
     return n
 
-def map_form_term_to_cash_code(term_str: str) -> str:
-    t = str(term_str).lower().strip()
-    if "ap" in t or "due on receipt" in t: return "due-on-receipt"
-    if "mpp" in t or "monthly" in t: return "monthly"
-    if "financ" in t: return "financing"
-    if "leas" in t: return "leasing"
-    if "net 1 day" in t: return "net 1 day"
-    if "net 10" in t: return "net 10 days"
-    if "net 25" in t: return "net 25 days"
-    if "net 30" in t: return "net 30 days"
-    if "net 40" in t: return "net 40 days"
-    if "net 45" in t: return "net 45 days"
-    if "net 60" in t: return "net 60 days"
-    return "due-on-receipt"
-
 # =====================================================================
 # 3. ADVANCED EXTRACTION ENGINE
 # =====================================================================
@@ -122,7 +104,7 @@ def extract_invoice_metadata_intelligent(pdf_file) -> Dict[str, Any]:
         inv_match = re.search(r"(INV-\d+)", full_text_clean, re.IGNORECASE)
         result["invoice_number"] = inv_match.group(1).strip() if inv_match else inv_num
         
-        # 2. Source of Truth Gross Amount Extraction
+        # 2. Source of Truth Gross Amount Extraction (Prioritizes "Payment Made", then "Total")
         pm_match = re.search(r"Payment\s*Made[^\d\$]*\$?([0-9,]+\.\d{2})", full_text_clean, re.IGNORECASE)
         if pm_match:
             result["gross_amount"] = clean_numeric_value(pm_match.group(1))
@@ -139,10 +121,10 @@ def extract_invoice_metadata_intelligent(pdf_file) -> Dict[str, Any]:
         if bill_to_match:
             result["fallback_personal_name"] = bill_to_match.group(1).strip()
             
-        # 4. Deep Target Search
+        # 4. Deep Target Search: Look specifically for "InBody570 - [Action] - [Name]"
         biz_matches = re.findall(r"InBody\d*\s*-\s*[^-]+?-\s*([A-Za-z0-9\s\.\,\&]+)", full_text_clean, re.IGNORECASE)
         for match in biz_matches:
-            candidate = re.sub(r'\d+\.\d{2}.*', '', match).strip() 
+            candidate = re.sub(r'\d+\.\d{2}.*', '', match).strip() # Strips out any trailing receipt quantities
             if candidate and not any(k in candidate.lower() for k in ["malfunction", "check required", "sku", "labor", "board", "cable", "loaner"]):
                 result["customer_name"] = candidate
                 return result
@@ -152,7 +134,6 @@ def extract_invoice_metadata_intelligent(pdf_file) -> Dict[str, Any]:
     return result
 
 def parse_zoho_summary_pdf_bulletproof(pdf_file) -> List[ZohoRecord]:
-    """Your Original Parser + The Missing Invoice Catcher"""
     records = []
     try:
         reader = PdfReader(pdf_file)
@@ -164,7 +145,6 @@ def parse_zoho_summary_pdf_bulletproof(pdf_file) -> List[ZohoRecord]:
         text_tokens = text_stream.split()
         
         for idx, token in enumerate(text_tokens):
-            # --- ORIGINAL RULE: MATCHING INV- ---
             if "INV-" in token.upper():
                 inv_id = re.sub(r'[^A-Za-z0-9\-]', '', token.upper())
                 
@@ -186,43 +166,6 @@ def parse_zoho_summary_pdf_bulletproof(pdf_file) -> List[ZohoRecord]:
                             merchant_fee=fee,
                             invoice_number=inv_id
                         ))
-                        
-            # --- NEW RULE: MATCHING ROWS WITHOUT INV- (Using AM/PM Anchor) ---
-            elif token.upper() in ["AM", "PM"]:
-                has_inv = False
-                for step in range(1, 15):
-                    if idx + step < len(text_tokens) and "INV-" in text_tokens[idx + step].upper():
-                        has_inv = True
-                        break
-                        
-                if not has_inv:
-                    forward_pool = []
-                    desc_tokens = []
-                    for step in range(1, 15):
-                        if idx + step < len(text_tokens):
-                            next_token = text_tokens[idx + step]
-                            potential_num = next_token.replace(",", "")
-                            if re.fullmatch(r"[-+]?\d+\.\d{2}", potential_num):
-                                forward_pool.append(abs(float(potential_num)))
-                            elif len(forward_pool) == 0:
-                                desc_tokens.append(next_token)
-                    
-                    if len(forward_pool) >= 1:
-                        gross = forward_pool[0]
-                        fee = forward_pool[1] if len(forward_pool) >= 2 else 0.0
-                        
-                        desc_str = " ".join(desc_tokens)
-                        cust_name = desc_str.replace("...", "").strip()
-                        cust_name = re.sub(r'[^a-zA-Z0-9\s]+$', '', cust_name).strip()
-                        
-                        if cust_name and len(cust_name) > 2 and gross > 0:
-                            if not any(r.gross_amount == gross and r.customer_name == cust_name for r in records):
-                                records.append(ZohoRecord(
-                                    customer_name=cust_name,
-                                    gross_amount=gross,
-                                    merchant_fee=fee,
-                                    invoice_number=None
-                                ))
     except Exception as e:
         st.error(f"Error executing summary parser: {e}")
     return records
@@ -248,8 +191,6 @@ uploaded_invoices = st.sidebar.file_uploader("3. Extra Customer Invoices (PDFs) 
 if not (boa_file and zoho_file):
     st.info("💡 Staging required: Please drop today's Bank of America report and matching Zoho summary sheet into the sidebar container panel.")
 else:
-    validation_errors = []
-    
     # -----------------------------------------------------------------
     # STEP A: LOAD MASTERLIST (WITH LLC / TICKET NORMALIZATION)
     # -----------------------------------------------------------------
@@ -273,10 +214,6 @@ else:
     master_lookup: Dict[str, AccountMasterItem] = {}
     for _, row in master_df.iterrows():
         name_val = str(row[ml_name_col]).strip()
-        
-        if not name_val or name_val.lower() == 'nan':
-            continue
-            
         num_val = str(row[ml_num_col]).strip()
         term_val = str(row.get(ml_term_col, 'due-on-receipt')).strip().lower() if ml_term_col else 'due-on-receipt'
         ticket_val = str(row.get(ml_ticket_col, '')).strip() if ml_ticket_col else ''
@@ -290,29 +227,7 @@ else:
         )
 
     # -----------------------------------------------------------------
-    # STEP B: LOAD FORM MASTER DB FROM GITHUB
-    # -----------------------------------------------------------------
-    form_db_lookup = {}
-    target_form_db = FORM_DB_PATH if os.path.exists(FORM_DB_PATH) else (FORM_DB_PATH_CSV if os.path.exists(FORM_DB_PATH_CSV) else None)
-    
-    if target_form_db:
-        fdf = pd.read_csv(target_form_db) if target_form_db.endswith('.csv') else pd.read_excel(target_form_db)
-        fdf.columns = [str(c).strip().lower() for c in fdf.columns]
-        biz_col = next((c for c in fdf.columns if 'business name' in c or 'customer' in c), None)
-        acct_col = next((c for c in fdf.columns if 'customer account' in c or 'account number' in c or 'account' in c), None)
-        term_col = next((c for c in fdf.columns if 'invoice sent' in c or 'term' in c), None)
-        
-        if biz_col and term_col:
-            for _, row in fdf.iterrows():
-                b_name = str(row[biz_col]).strip()
-                if not b_name or b_name.lower() == 'nan':
-                    continue
-                t_val = str(row[term_col]).strip()
-                a_val = str(row[acct_col]).strip() if acct_col and pd.notna(row[acct_col]) else ""
-                form_db_lookup[normalize_name(b_name)] = {"term": t_val, "account": a_val, "raw_name": b_name}
-
-    # -----------------------------------------------------------------
-    # STEP C: EXTRACT ALL UPLOADED INVOICES INTO CACHE
+    # STEP B: EXTRACT ALL UPLOADED INVOICES INTO CACHE
     # -----------------------------------------------------------------
     invoice_cache = {}
     invoice_sources_list = []
@@ -334,7 +249,7 @@ else:
                 ))
 
     # -----------------------------------------------------------------
-    # STEP D: PARSE BANK OF AMERICA REPORT
+    # STEP C: PARSE BANK OF AMERICA REPORT (DUPLICATE PROTECTION)
     # -----------------------------------------------------------------
     if boa_file.name.endswith('.csv'):
         raw_bytes = boa_file.read()
@@ -376,7 +291,7 @@ else:
             ))
 
     # -----------------------------------------------------------------
-    # STEP E: PARSE PRIMARY ZOHO SUMMARY SHEET & DEDUPLICATE
+    # STEP D: PARSE PRIMARY ZOHO SUMMARY SHEET & DEDUPLICATE
     # -----------------------------------------------------------------
     raw_zoho_pool: List[ZohoRecord] = []
     if zoho_file.name.endswith('.pdf'):
@@ -396,24 +311,22 @@ else:
             ))
 
     zoho_deduped_dict = {}
+
     for inv_rec in invoice_sources_list:
         if inv_rec.invoice_number:
             zoho_deduped_dict[inv_rec.invoice_number] = inv_rec
             
     for r in raw_zoho_pool:
-        if r.invoice_number:
-            if r.invoice_number not in zoho_deduped_dict:
-                zoho_deduped_dict[r.invoice_number] = r
-        else:
-            # Handles rows without invoices safely without overwriting
-            zoho_deduped_dict[f"no_inv_{r.customer_name}_{r.gross_amount}"] = r
+        if r.invoice_number and r.invoice_number not in zoho_deduped_dict:
+            zoho_deduped_dict[r.invoice_number] = r
             
     zoho_records = list(zoho_deduped_dict.values())
 
     # =====================================================================
-    # STEP F: TRANSACTION PROCESSING & HIERARCHY MATCHING ENGINE
+    # STEP E: TRANSACTION PROCESSING & HIERARCHY MATCHING ENGINE
     # =====================================================================
     all_journal_lines = []
+    validation_errors = []
 
     for boa_rec in boa_records:
         matched_zoho = [z for z in zoho_records if z.gross_amount > 0]
@@ -450,15 +363,12 @@ else:
             form_match = None
             
             for item in master_lookup.values():
-                # Check Business Name
                 if norm_biz and (norm_biz == item.norm_name or (len(norm_biz) >= 5 and (norm_biz in item.norm_name or item.norm_name in norm_biz))):
                     matched_master_item = item
                     break
-                # Check Personal Name
                 if norm_per and (norm_per == item.norm_name or (len(norm_per) >= 5 and (norm_per in item.norm_name or item.norm_name in norm_per))):
                     matched_master_item = item
                     break
-                # Check CS/PS Ticket Column
                 if item.norm_ticket:
                     if norm_per and (norm_per == item.norm_ticket or (len(norm_per) >= 5 and (norm_per in item.norm_ticket or item.norm_ticket in norm_per))):
                         matched_master_item = item
@@ -466,21 +376,12 @@ else:
                     if norm_biz and (norm_biz == item.norm_ticket or (len(norm_biz) >= 5 and (norm_biz in item.norm_ticket or item.norm_ticket in norm_biz))):
                         matched_master_item = item
                         break
-            
-            if form_db_lookup:
-                for q in [norm_biz, norm_per]:
-                    if q and len(q) >= 4:
-                        for k, v in form_db_lookup.items():
-                            k_str = str(k)
-                            if k_str and (q in k_str or k_str in q or k_str.startswith(q)):
-                                form_match = v
-                                break
-                    if form_match: break
 
             # ASSIGNMENT EXECUTION
             if not matched_master_item:
                 if form_match and form_match.get("account"):
-                    final_term = form_match.get("term", "due-on-receipt")
+                    # Safe dict call using .get() to prevent KeyErrors
+                    final_term = form_match.get("term", "due-on-receipt") 
                     term_info = CASH_CODE_MAPPING.get(map_form_term_to_cash_code(final_term), CASH_CODE_MAPPING['fallback'])
                     cash_code = term_info[0]
                     prefix = "MPP " if cash_code == "AR002" else ""
@@ -500,12 +401,12 @@ else:
                     display_label = z_rec.customer_name if z_rec.customer_name else (z_rec.fallback_personal_name if z_rec.fallback_personal_name else "Unknown")
                     desc = f"{display_label} (UNRECORDED ENTITY)_{current_boa_description}"
             else:
-                # MASTER MATCH: Registered Entity
+                # MASTER MATCH: Registered Entity (E.g. Underground Gym / Functional Holistic Healing)
                 master_item = matched_master_item
                 processed_accounts.append(master_item)
                 
-                final_term = form_match["term"] if form_match and form_match.get("term") and str(form_match.get("term")).lower() != 'nan' else master_item.payment_term
-                
+                # Safe dict call using .get() to prevent KeyErrors
+                final_term = form_match.get("term", "due-on-receipt") if form_match and form_match.get("term") and str(form_match.get("term")).lower() != 'nan' else master_item.payment_term
                 term_info = CASH_CODE_MAPPING.get(map_form_term_to_cash_code(final_term), CASH_CODE_MAPPING['fallback'])
                 cash_code = term_info[0]
                 prefix = "MPP " if cash_code == "AR002" else ""
