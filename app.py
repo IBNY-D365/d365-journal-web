@@ -92,6 +92,7 @@ def normalize_name(name: str) -> str:
     return n
 
 def map_form_term_to_cash_code(term_str: str) -> str:
+    """Translates the 'Invoice Sent' column from Form DB into standardized Cash Code keys."""
     t = str(term_str).lower().strip()
     if "ap" in t or "due on receipt" in t: return "due-on-receipt"
     if "mpp" in t or "monthly" in t: return "monthly"
@@ -153,22 +154,14 @@ def parse_zoho_summary_pdf_bulletproof(pdf_file) -> List[ZohoRecord]:
     records = []
     try:
         reader = PdfReader(pdf_file)
-        full_text = ""
+        text = ""
         for page in reader.pages:
-            full_text += page.extract_text() or ""
+            text += page.extract_text() + " "
             
-        if "All Transactions" in full_text:
-            transactions_text = full_text.split("All Transactions")[-1]
-        elif "Export" in full_text:
-            transactions_text = full_text.split("Export")[-1]
-        else:
-            transactions_text = full_text
-            
-        transactions_text = " ".join(transactions_text.split())
+        text = " ".join(text.split())
         
         # Surgical split using time chunks to perfectly capture all lines
-        time_pattern = r"\d{1,2}:\d{2}\s*(?:AM|PM)"
-        chunks = re.split(time_pattern, transactions_text, flags=re.IGNORECASE)
+        chunks = re.split(r"\d{1,2}:\d{2}\s*(?:AM|PM)", text, flags=re.IGNORECASE)
         
         for chunk in chunks[1:]: 
             amounts = re.findall(r"[-]?\$?[0-9,]+\.\d{2}", chunk)
@@ -183,8 +176,8 @@ def parse_zoho_summary_pdf_bulletproof(pdf_file) -> List[ZohoRecord]:
                 inv_id = inv_match.group(1).strip() if inv_match else None
                 
                 cust_name = re.sub(r'INV-\d+.*', '', desc, flags=re.IGNORECASE).strip() if inv_id else desc.strip()
-                cust_name = re.sub(r'\.\.\.$', '', cust_name).strip() 
-                if len(cust_name) < 2: cust_name = None
+                cust_name = re.sub(r'\.+$', '', cust_name).strip() 
+                if cust_name and len(cust_name) < 2: cust_name = None
                 
                 if gross > 0 and not any((r.invoice_number == inv_id and inv_id is not None) or (r.gross_amount == gross and r.customer_name == cust_name) for r in records):
                     records.append(ZohoRecord(
@@ -204,7 +197,6 @@ st.set_page_config(page_title="D365 General Journal Automation", layout="wide")
 st.title("D365 General Journal Automation Engine")
 st.subheader("Daily Operational Reconciliations Matrix")
 
-# Determine Masterlist Path
 target_masterlist = MASTERLIST_PATH if os.path.exists(MASTERLIST_PATH) else (MASTERLIST_PATH_CSV if os.path.exists(MASTERLIST_PATH_CSV) else None)
 if not target_masterlist:
     st.error("❌ Core configuration file `Account Masterlist` missing from your GitHub repository root folder.")
@@ -262,15 +254,23 @@ else:
             fdf = pd.read_excel(target_form_db)
         
         fdf.columns = [str(c).strip().lower() for c in fdf.columns]
-        biz_col = next((c for c in fdf.columns if 'business name' in c or 'customer' in c), None)
-        inv_sent_col = next((c for c in fdf.columns if 'invoice sent' in c or 'term' in c), None)
+        biz_col = next((c for c in fdf.columns if c == 'business name'), None)
+        acct_col = next((c for c in fdf.columns if c == 'customer account' or c == 'account number'), None)
+        term_col = next((c for c in fdf.columns if c == 'invoice sent' or c == 'payment term' or c == 'term'), None)
         
-        if biz_col and inv_sent_col:
+        if biz_col and term_col:
             for _, row in fdf.iterrows():
                 b_name = str(row[biz_col]).strip()
-                t_val = str(row[inv_sent_col]).strip()
-                if b_name and b_name.lower() != 'nan' and t_val and t_val.lower() != 'nan':
-                    form_db_lookup[normalize_name(b_name)] = t_val
+                t_val = str(row[term_col]).strip()
+                a_val = str(row[acct_col]).strip() if acct_col and pd.notna(row[acct_col]) else ""
+                
+                if b_name and b_name.lower() != 'nan':
+                    norm_b = normalize_name(b_name)
+                    form_db_lookup[norm_b] = {
+                        "term": t_val,
+                        "account": a_val,
+                        "raw_name": b_name
+                    }
     else:
         st.warning("⚠️ Form Master DB not found in repository root. Please ensure 'Form Master DB.xlsx' or '.csv' is uploaded to GitHub.")
 
@@ -340,7 +340,7 @@ else:
             ))
 
     # -----------------------------------------------------------------
-    # STEP E: PARSE ZOHO SUMMARY SHEET & DEDUPLICATE
+    # STEP E: PARSE PRIMARY ZOHO SUMMARY SHEET & DEDUPLICATE
     # -----------------------------------------------------------------
     raw_zoho_pool: List[ZohoRecord] = []
     if zoho_file.name.endswith('.pdf'):
@@ -377,36 +377,30 @@ else:
             z_rec.fallback_personal_name = cache_hit["fallback_personal_name"]
 
     # =====================================================================
-    # STEP F: TRANSACTION PROCESSING & HIERARCHY MATCHING ENGINE
+    # STEP F: TRANSACTION PROCESSING & ONE-TO-ONE BOA ANCHORING
     # =====================================================================
     all_journal_lines = []
     validation_errors = []
 
-    # TRUE ZOHO NET CALCULATION
+    # Calculate True Zoho Net First
     z_total_gross = sum(z.gross_amount for z in zoho_records)
     z_total_fees = sum(z.merchant_fee for z in zoho_records)
     z_net = round(z_total_gross - z_total_fees, 2)
 
     if z_total_gross == 0:
-        validation_errors.append("⚠️ **Data Ingestion Alert:** System failed to extract gross amounts. Check uploaded files.")
+        validation_errors.append("⚠️ **Data Ingestion Alert:** System failed to extract gross amounts.")
     else:
-        # EXACT MATCHING: Find the specific Bank of America deposit that matches this Zoho Net Amount
+        # Find the single exact Bank of America deposit match
         matched_boa = None
         for boa in boa_records:
             if abs(boa.net_amount - z_net) <= 1.00:
                 matched_boa = boa
                 break
-                
+
         if not matched_boa:
-            validation_errors.append(f"🚨 **Mathematical Balance Discrepancy!** Could not find a Bank of America deposit matching the calculated Zoho Net Amount (${z_net:.2f}). Total Gross: ${z_total_gross:.2f}, Total Fees: ${z_total_fees:.2f}.")
+            validation_errors.append(f"🚨 **Mathematical Balance Discrepancy!** No Bank of America deposit matches the calculated Zoho Net (${z_net:.2f}).")
         else:
-            # Map Offset Account safely
-            offset_acct = "B1000002"
-            for code, acct in OFFSET_ACCOUNT_ROUTING.items():
-                if code in matched_boa.source_account:
-                    offset_acct = acct
-                    break
-                    
+            offset_acct = OFFSET_ACCOUNT_ROUTING.get(matched_boa.source_account, "B1000002")
             processed_accounts = []
             
             # 1. Generate Credit Lines (Customer Segment)
@@ -417,63 +411,82 @@ else:
                 norm_per = normalize_name(z_rec.fallback_personal_name)
                 
                 matched_master_item = None
+                form_match = None
                 
-                # Intelligent Masterlist Lookups
+                # Check Masterlist First
                 for item in master_lookup.values():
-                    if norm_biz and len(norm_biz) >= 5:
-                        if norm_biz in item.norm_name or item.norm_name in norm_biz or item.norm_name.startswith(norm_biz):
-                            matched_master_item = item
-                            break
-                    if norm_per and len(norm_per) >= 5:
-                        if norm_per in item.norm_name or item.norm_name in norm_per or item.norm_name.startswith(norm_per):
-                            matched_master_item = item
-                            break
+                    if norm_biz and len(norm_biz) >= 4 and (norm_biz in item.norm_name or item.norm_name in norm_biz or item.norm_name.startswith(norm_biz)):
+                        matched_master_item = item
+                        break
+                    if norm_per and len(norm_per) >= 4 and (norm_per in item.norm_name or item.norm_name in norm_per or item.norm_name.startswith(norm_per)):
+                        matched_master_item = item
+                        break
                     if item.norm_ticket:
-                        if norm_per and len(norm_per) >= 5 and (norm_per in item.norm_ticket or item.norm_ticket in norm_per or item.norm_ticket.startswith(norm_per)):
+                        if norm_per and len(norm_per) >= 4 and (norm_per in item.norm_ticket or item.norm_ticket in norm_per or item.norm_ticket.startswith(norm_per)):
                             matched_master_item = item
                             break
-                        if norm_biz and len(norm_biz) >= 5 and (norm_biz in item.norm_ticket or item.norm_ticket in norm_biz or item.norm_ticket.startswith(norm_biz)):
+                        if norm_biz and len(norm_biz) >= 4 and (norm_biz in item.norm_ticket or item.norm_ticket in norm_biz or item.norm_ticket.startswith(norm_biz)):
                             matched_master_item = item
                             break
 
-                # Form DB Term Checks
-                final_payment_term = matched_master_item.payment_term if matched_master_item else "due-on-receipt"
-                form_term = None
+                # Check Form DB Second for Missing Masterlist Entries
                 for q in [norm_biz, norm_per]:
-                    if q and len(q) >= 5:
+                    if q and len(q) >= 4:
                         for k, v in form_db_lookup.items():
                             if q in k or k in q or k.startswith(q):
-                                form_term = v
+                                form_match = v
                                 break
-                    if form_term: break
-                    
-                if form_term:
-                    final_payment_term = map_form_term_to_cash_code(form_term)
+                    if form_match: break
 
                 # ASSIGNMENT EXECUTION
-                if not matched_master_item:
+                if matched_master_item:
+                    # Found in Main Masterlist
+                    final_term = matched_master_item.payment_term
+                    
+                    # Override term if Form DB dictates otherwise
+                    if form_match and form_match["term"] and str(form_match["term"]).lower() != 'nan':
+                        final_term = form_match["term"]
+                        
+                    term_info = CASH_CODE_MAPPING.get(map_form_term_to_cash_code(final_term), CASH_CODE_MAPPING['fallback'])
+                    cash_code = term_info[0]
+                    prefix = "MPP " if cash_code == "AR002" else ""
+                    
+                    account_num = matched_master_item.account_number
+                    account_type = "Customer"
+                    account_name = matched_master_item.account_name
+                    desc = f"{prefix}{account_num} {account_name}_{current_boa_description}"
+                    
+                    processed_accounts.append(matched_master_item)
+
+                elif form_match and form_match["account"]:
+                    # Found exclusively in Form DB with a Valid BC Account! Map as a real Customer!
+                    final_term = form_match["term"]
+                    
+                    term_info = CASH_CODE_MAPPING.get(map_form_term_to_cash_code(final_term), CASH_CODE_MAPPING['fallback'])
+                    cash_code = term_info[0]
+                    prefix = "MPP " if cash_code == "AR002" else ""
+                    
+                    account_num = form_match["account"]
+                    account_type = "Customer"
+                    account_name = form_match["raw_name"]
+                    desc = f"{prefix}{account_num} {account_name}_{current_boa_description}"
+                    
+                    # Store pseudo-master item for fee grouping
+                    processed_accounts.append(AccountMasterItem(account_number=account_num, account_name=account_name, payment_term=final_term, norm_name="", norm_ticket=""))
+
+                else:
+                    # FALLBACK: Temporary Receipt Ledger
                     account_num = "21040102-B1000002"
                     account_type = "Ledger"
                     account_name = "Temporary Receipt"
                     
-                    term_info = CASH_CODE_MAPPING.get(final_payment_term, CASH_CODE_MAPPING['fallback'])
+                    final_term = form_match["term"] if form_match else "due-on-receipt"
+                    term_info = CASH_CODE_MAPPING.get(map_form_term_to_cash_code(final_term), CASH_CODE_MAPPING['fallback'])
                     cash_code = term_info[0]
                     
                     display_label = z_rec.customer_name if z_rec.customer_name else (z_rec.fallback_personal_name if z_rec.fallback_personal_name else "Unknown")
                     desc = f"{display_label} (UNRECORDED ENTITY)_{current_boa_description}"
-                else:
-                    master_item = matched_master_item
-                    processed_accounts.append(master_item)
-                    
-                    term_info = CASH_CODE_MAPPING.get(final_payment_term, CASH_CODE_MAPPING['fallback'])
-                    cash_code = term_info[0]
-                    prefix = "MPP " if cash_code == "AR002" else ""
-                    
-                    account_num = master_item.account_number
-                    account_type = "Customer"
-                    account_name = master_item.account_name
-                    desc = f"{prefix}{account_num} {account_name}_{current_boa_description}"
-                
+
                 all_journal_lines.append({
                     "Date": matched_boa.date, "Voucher": "", "Account name": account_name,
                     "Company": "bwa", "Account type": account_type, "Account": account_num,
@@ -489,12 +502,12 @@ else:
             if z_total_fees > 0:
                 if len(processed_accounts) == 1:
                     acc = processed_accounts[0]
-                    fee_desc = f"Zoho Merchant Fee {acc.account_number} {acc.account_name}_{str(matched_boa.description)}"
+                    fee_desc = f"Zoho Merchant Fee {acc.account_number} {acc.account_name}_{current_boa_description}"
                 elif len(processed_accounts) > 1:
                     account_strings = ", ".join([f"{a.account_number} {a.account_name}" for a in processed_accounts])
-                    fee_desc = f"Zoho Merchant Fee {account_strings}_{str(matched_boa.description)}"
+                    fee_desc = f"Zoho Merchant Fee {account_strings}_{current_boa_description}"
                 else:
-                    fee_desc = f"Zoho Merchant Fee (Unresolved Suspense Pool Batch)_{str(matched_boa.description)}"
+                    fee_desc = f"Zoho Merchant Fee (Unresolved Suspense Pool Batch)_{current_boa_description}"
 
                 all_journal_lines.append({
                     "Date": matched_boa.date, "Voucher": "", "Account name": "Outside Service (Finance)",
