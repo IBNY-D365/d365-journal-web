@@ -133,8 +133,8 @@ st.set_page_config(page_title="D365 General Journal Automation", layout="wide")
 st.title("D365 General Journal Automation Engine")
 st.subheader("Daily Operational Reconciliations Matrix")
 
-# Locate Permanent Masterlist inside GitHub Repository Root Folder Workspace
-MASTERLIST_PATH = "Account_Masterlist.xlsx"
+# UPDATED: Matches the exact filename with a space present in your GitHub repository screenshot
+MASTERLIST_PATH = "Account Masterlist.xlsx"
 
 if not os.path.exists(MASTERLIST_PATH):
     st.error(f"❌ Core configuration file `{MASTERLIST_PATH}` missing from your GitHub repository root folder. Please commit it to your repository.")
@@ -287,7 +287,7 @@ else:
             processed_accounts.append(master_item)
             
             term_info = CASH_CODE_MAPPING.get(master_item.payment_term, CASH_CODE_MAPPING['fallback'])
-            cash_code = term_info[0] # Fixed Tuple index access mapping pattern safely
+            cash_code = term_info[0]
             prefix = "MPP " if cash_code == "AR002" else ""
             
             current_boa_description = str(boa_rec.description)
