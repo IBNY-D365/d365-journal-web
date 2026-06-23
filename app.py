@@ -75,7 +75,7 @@ def clean_numeric_value(val: Any) -> float:
         return 0.0
 
 def normalize_entity_name(name: str) -> str:
-    """Strips suffixes like LLC, INC, punctuation, and normalizes spacing for accurate matching."""
+    """Strips suffixes like LLC, INC, punctuation, and normalizes spacing for Masterlist cross-referencing."""
     if not name or pd.isna(name):
         return ""
     name = str(name).lower()
@@ -84,40 +84,47 @@ def normalize_entity_name(name: str) -> str:
     return " ".join(name.split())
 
 # =====================================================================
-# 3. ADVANCED EXTRACTION ENGINE
+# 3. ADVANCED EXTRACTION ENGINE WITH MASTERLIST NER
 # =====================================================================
-def extract_invoice_metadata_intelligent(pdf_file) -> Dict[str, Any]:
-    """Scans an invoice PDF text stream globally to resolve true business name or personal fallback name."""
+def extract_invoice_metadata_intelligent(pdf_file, known_entities: List[str]) -> Dict[str, Any]:
+    """Scans invoice text against the exact Masterlist database to guarantee correct names."""
     result = {"customer_name": None, "invoice_number": None, "gross_amount": 0.0, "fallback_personal_name": None}
     try:
+        pdf_file.seek(0)
         reader = PdfReader(pdf_file)
-        full_text = ""
-        for page in reader.pages:
-            full_text += page.extract_text() or ""
-            
+        full_text = " ".join(page.extract_text() or "" for page in reader.pages)
         full_text_clean = " ".join(full_text.split())
         
+        # Search space formatted identically to the masterlist keys
+        search_space = normalize_entity_name(full_text_clean)
+        
+        # Extract Invoice Number
         inv_num = pdf_file.name.replace(".pdf", "")
         inv_match = re.search(r"(INV-\d+)", full_text_clean, re.IGNORECASE)
-        result["invoice_number"] = inv_match.group(1).strip() if inv_match else inv_num
+        result["invoice_number"] = inv_match.group(1).upper() if inv_match else inv_num
         
+        # Extract Gross Amount
         all_decimals = [clean_numeric_value(n) for n in re.findall(r"\b\d+(?:[\.,]\d{2})+\b", full_text_clean)]
         result["gross_amount"] = max(all_decimals) if all_decimals else 0.0
         
-        bill_to_match = re.search(r"Bill\s+To\s*([A-Za-z0-9\s\.\,\-]+?)(?:\s*\d|\s*Ship\s*To|$)", full_text_clean, re.IGNORECASE)
-        if bill_to_match:
-            result["fallback_personal_name"] = bill_to_match.group(1).strip()
+        # NER Customer Matching: Find the masterlist name inside the invoice text
+        valid_entities = [e for e in known_entities if len(e) > 3]
+        valid_entities.sort(key=len, reverse=True) # Sort so "Underground Gym" hits before "Gym"
         
-        biz_matches = re.findall(r"InBody\d*\s*-\s*([A-Za-z0-9\s\.\,]+?)\s*-\s*([A-Za-z0-9\s\.\,]+?)", full_text_clean, re.IGNORECASE)
-        for match_group in biz_matches:
-            for segment in match_group:
-                candidate = segment.strip()
-                if candidate and not any(k in candidate.lower() for k in ["malfunction", "check required", "sku", "labor", "board", "cable"]):
-                    result["customer_name"] = candidate
-                    return result
-                    
+        for entity in valid_entities:
+            # Exact whole-word matching inside the cleaned document text
+            if f" {entity} " in f" {search_space} ":
+                result["customer_name"] = entity
+                break
+                
+        # Last resort fallback if masterlist name is completely missing from document
+        if not result["customer_name"]:
+            bill_to_match = re.search(r"Bill\s+To[:\s]*([A-Za-z0-9\s\.\,\-\&]+?)(?:\s+Ship|\s+Date|\s+INV-|$)", full_text_clean, re.IGNORECASE)
+            if bill_to_match:
+                result["fallback_personal_name"] = bill_to_match.group(1).strip()
+                
     except Exception as e:
-        st.error(f"Error executing intelligent metadata capture: {e}")
+        st.error(f"Error executing intelligent metadata capture on {pdf_file.name}: {e}")
     return result
 
 def parse_zoho_summary_pdf_bulletproof(pdf_file) -> List[ZohoRecord]:
@@ -189,7 +196,7 @@ else:
     ml_ticket_col = next((master_headers_lower[k] for k in ['cs/ps ticket', 'ticket'] if k in master_headers_lower), None)
     
     if not ml_name_col or not ml_num_col:
-        st.error(f"❌ Could not identify definitive baseline 'Account Name' or 'Account' tracking headers. Available headers: {list(master_df.columns)}")
+        st.error(f"❌ Could not identify definitive baseline 'Account Name' or 'Account' tracking headers.")
         st.stop()
         
     master_lookup: Dict[str, AccountMasterItem] = {}
@@ -219,18 +226,15 @@ else:
             if ticket_key:
                 ticket_lookup[ticket_key] = item
 
-    # FIXED LOGIC: Only parse the explicitly uploaded extra invoices here to build our strict filter.
-    invoice_cache = {}
+    # Compile the known entities from masterlist to cross-reference against the PDFs
+    known_entity_keys = list(master_lookup.keys()) + list(ticket_lookup.keys())
+
+    # STEP B: PARSE UPLOADED SUPPORTING INVOICES
     invoice_sources_list = []
-    
     if uploaded_invoices:
         for inv in uploaded_invoices:
-            meta = extract_invoice_metadata_intelligent(inv)
-            if meta["invoice_number"]:
-                invoice_cache[meta["invoice_number"]] = {
-                    "resolved_name": meta["customer_name"],
-                    "fallback_personal_name": meta["fallback_personal_name"]
-                }
+            meta = extract_invoice_metadata_intelligent(inv, known_entity_keys)
+            if meta["gross_amount"] > 0:
                 invoice_sources_list.append(ZohoRecord(
                     customer_name=meta["customer_name"],
                     gross_amount=meta["gross_amount"],
@@ -277,7 +281,7 @@ else:
                 source_account=str(row.get(account_target, '')).strip() if account_target else "3371"
             ))
 
-    # STEP D: PARSE PRIMARY ZOHO SUMMARY SHEET
+    # STEP D: PARSE PRIMARY ZOHO SUMMARY SHEET & RESOLVE CONFLICTS
     raw_zoho_pool: List[ZohoRecord] = []
     if zoho_file.name.endswith('.pdf'):
         raw_zoho_pool = parse_zoho_summary_pdf_bulletproof(zoho_file)
@@ -295,41 +299,18 @@ else:
                 invoice_number=str(row['Invoice Number']).strip() if pd.notna(row.get('Invoice Number')) else None
             ))
 
-    if not raw_zoho_pool or sum(r.gross_amount for r in raw_zoho_pool) == 0:
-        raw_zoho_pool = invoice_sources_list
-
-    # Strict tracking deduplication layer targeting unique invoice strings only
-    zoho_records: List[ZohoRecord] = []
-    seen_invoices = set()
-
-    for r in raw_zoho_pool:
-        if r.invoice_number and r.invoice_number not in seen_invoices:
-            zoho_records.append(r)
-            seen_invoices.add(r.invoice_number)
-
-    # --- NEW STRICT FILTERING LOGIC ---
-    # If you uploaded specific invoices, filter the Zoho Summary noise out. Only keep exactly what you uploaded.
-    if invoice_cache:
-        filtered_zoho = []
-        target_invoices = set(invoice_cache.keys())
-        
-        for z in zoho_records:
-            if z.invoice_number in target_invoices:
-                filtered_zoho.append(z)
-        
-        # Inject any uploaded invoices that the summary parser completely missed
-        found_invoices = set(z.invoice_number for z in filtered_zoho)
-        for inv_source in invoice_sources_list:
-            if inv_source.invoice_number not in found_invoices:
-                filtered_zoho.append(inv_source)
-                
-        zoho_records = filtered_zoho
-
-    for z_rec in zoho_records:
-        if z_rec.invoice_number in invoice_cache:
-            cache_hit = invoice_cache[z_rec.invoice_number]
-            z_rec.customer_name = cache_hit["resolved_name"] if cache_hit["resolved_name"] else z_rec.customer_name
-            z_rec.fallback_personal_name = cache_hit["fallback_personal_name"]
+    # --- STRICT OVERRIDE LOGIC ---
+    if uploaded_invoices and len(invoice_sources_list) > 0:
+        # If user uploaded supporting invoices, bypass the noisy Zoho PDF and strictly use the clean invoices.
+        zoho_records = invoice_sources_list
+    else:
+        # Deduplicate raw_zoho_pool if no invoices were provided.
+        zoho_records = []
+        seen_invoices = set()
+        for r in raw_zoho_pool:
+            if r.invoice_number and r.invoice_number not in seen_invoices:
+                zoho_records.append(r)
+                seen_invoices.add(r.invoice_number)
 
     # =====================================================================
     # STEP E: TRANSACTION PROCESSING & BATCH RESOLUTION ENGINE
@@ -368,15 +349,21 @@ else:
             current_boa_description = str(boa_rec.description)
             master_item = None
             
+            # Lookup name against normalized master dictionary
             if z_rec.customer_name:
                 query_key = normalize_entity_name(z_rec.customer_name)
-                matched_master_key = next((k for k in master_lookup if k and (k == query_key or k in query_key or query_key in k)), None)
-                if matched_master_key:
-                    master_item = master_lookup[matched_master_key]
+                if query_key in master_lookup:
+                    master_item = master_lookup[query_key]
+                elif query_key in ticket_lookup:
+                    master_item = ticket_lookup[query_key]
+                else:
+                    matched_key = next((k for k in master_lookup if k in query_key or query_key in k), None)
+                    if matched_key:
+                        master_item = master_lookup[matched_key]
             
             if not master_item and z_rec.fallback_personal_name:
                 fallback_key = normalize_entity_name(z_rec.fallback_personal_name)
-                matched_ticket_key = next((k for k in ticket_lookup if k and (k == fallback_key or k in fallback_key or fallback_key in k)), None)
+                matched_ticket_key = next((k for k in ticket_lookup if fallback_key in k or k in fallback_key), None)
                 if matched_ticket_key:
                     master_item = ticket_lookup[matched_ticket_key]
 
@@ -444,13 +431,4 @@ else:
         output_df = pd.DataFrame(all_journal_lines, columns=D365_TEMPLATE_COLUMNS)
         st.dataframe(output_df)
         
-        buffer = io.BytesIO()
-        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-            output_df.to_excel(writer, index=False, sheet_name="Journal Lines")
-        
-        st.download_button(
-            label="📥 Download Generated D365 Journal Import Sheet",
-            data=buffer.getvalue(),
-            file_name="D365_General_Journal_Import.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+        buffer = io.
