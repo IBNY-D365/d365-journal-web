@@ -3,9 +3,10 @@ import pandas as pd
 from pypdf import PdfReader
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
-from datetime import datetime, date
+from datetime import datetime
 import re
 import io
+import os
 
 # =====================================================================
 # 1. HARDCODED CONFIGURATIONS & MAPPINGS (From Specification Document)
@@ -44,7 +45,7 @@ D365_TEMPLATE_COLUMNS = [
 # 2. DATA UTILITIES & MODELS
 # =====================================================================
 class BOARecord(BaseModel):
-    date: date
+    date: Any
     description: str
     net_amount: float
     source_account: str
@@ -66,7 +67,6 @@ def clean_numeric_value(val: Any) -> float:
         return 0.0
     if isinstance(val, (int, float)):
         return float(val)
-    
     cleaned_str = str(val).strip().replace('$', '').replace(',', '')
     try:
         return float(cleaned_str)
@@ -83,7 +83,6 @@ def parse_invoice_pdf(pdf_file) -> Optional[str]:
         full_text = ""
         for page in reader.pages:
             full_text += page.extract_text() or ""
-        
         match = re.search(r"Bill\s+to[:]?\s*(.*)", full_text, re.IGNORECASE)
         if match:
             return match.group(1).split('\n')[0].strip()
@@ -91,27 +90,62 @@ def parse_invoice_pdf(pdf_file) -> Optional[str]:
         st.error(f"Error parsing PDF invoice: {e}")
     return None
 
+def parse_zoho_pdf(pdf_file) -> List[ZohoRecord]:
+    """Fallback extraction regex engine to read Zoho Gross and Fees from raw PDF strings."""
+    records = []
+    try:
+        reader = PdfReader(pdf_file)
+        full_text = ""
+        for page in reader.pages:
+            full_text += page.extract_text() or ""
+        
+        # Regex to locate matching customer groups, invoices, and amounts
+        # Customize these patterns to match your specific Zoho PDF export text layout exactly
+        gross_matches = re.findall(r"Gross\s*Amount[:]?\s*([\d\.\,\$]+)", full_text, re.IGNORECASE)
+        fee_matches = re.findall(r"Merchant\s*Fee[:]?\s*([\d\.\,\$]+)", full_text, re.IGNORECASE)
+        inv_matches = re.findall(r"Invoice\s*Number[:]?\s*([A-Za-z0-9\-]+)", full_text, re.IGNORECASE)
+        cust_matches = re.findall(r"Customer[:]?\s*(.*)", full_text, re.IGNORECASE)
+        
+        max_loops = max(len(gross_matches), 1)
+        for i in range(max_loops):
+            gross = clean_numeric_value(gross_matches[i]) if i < len(gross_matches) else 0.0
+            fee = clean_numeric_value(fee_matches[i]) if i < len(fee_matches) else 0.0
+            inv = inv_matches[i].strip() if i < len(inv_matches) else None
+            cust = cust_matches[i].split('\n')[0].strip() if i < len(cust_matches) else None
+            
+            if gross > 0 or fee > 0:
+                records.append(ZohoRecord(customer_name=cust, gross_amount=gross, merchant_fee=fee, invoice_number=inv))
+    except Exception as e:
+        st.error(f"Error parsing Zoho PDF Summary: {e}")
+    return records
+
 # =====================================================================
 # 4. STREAMLIT INTERFACE SETUP
 # =====================================================================
 st.set_page_config(page_title="D365 General Journal Automation", layout="wide")
 st.title("D365 General Journal Automation Engine")
-st.subheader("Automate Zoho Payment Reconciliations into D365 Templates")
+st.subheader("Daily Operational Reconciliations Matrix")
 
-# Keep all uploader elements organized globally in the sidebar
-st.sidebar.header("Data Sources Upload")
-masterlist_file = st.sidebar.file_uploader("1. Account Masterlist (Excel)", type=["xlsx"])
-boa_file = st.sidebar.file_uploader("2. Bank of America Report (CSV)", type=["csv"])
-zoho_file = st.sidebar.file_uploader("3. Zoho Transaction Summary (CSV/XLSX)", type=["csv", "xlsx"])
-uploaded_invoices = st.sidebar.file_uploader("4. Backup Customer Invoices (PDFs)", type=["pdf"], accept_multiple_files=True)
+# Locate Permanent Masterlist inside GitHub Repository Root Folder Workspace
+MASTERLIST_PATH = "Account_Masterlist.xlsx"
 
-if not (masterlist_file and boa_file and zoho_file):
-    st.info("💡 Complete the layout configuration requirements by dropping your Source Masterlist, Bank Reports, and Zoho Summaries into the sidebar panel.")
+if not os.path.exists(MASTERLIST_PATH):
+    st.error(f"❌ Core configuration file `{MASTERLIST_PATH}` missing from your GitHub repository root folder. Please commit it to your repository.")
+    st.stop()
+
+# Interactive User Panel Upload Areas
+st.sidebar.header("📅 Daily Variable Inputs")
+boa_file = st.sidebar.file_uploader("1. Bank of America Report (Excel/CSV)", type=["xlsx", "csv"])
+zoho_file = st.sidebar.file_uploader("2. Zoho Transaction Summary (PDF/Excel/CSV)", type=["pdf", "xlsx", "csv"])
+uploaded_invoices = st.sidebar.file_uploader("3. Customer Invoices (PDFs)", type=["pdf"], accept_multiple_files=True)
+
+if not (boa_file and zoho_file):
+    st.info("💡 Staging required: Please drop today's Bank of America report and matching Zoho summary sheet into the sidebar container panel.")
 else:
     # -----------------------------------------------------------------
-    # STEP A: LOAD MASTERLIST
+    # STEP A: LOAD PERMANENT MASTERLIST FROM GITHUB WORKSPACE
     # -----------------------------------------------------------------
-    master_df = pd.read_excel(masterlist_file)
+    master_df = pd.read_excel(MASTERLIST_PATH)
     master_lookup: Dict[str, AccountMasterItem] = {}
     for _, row in master_df.iterrows():
         name_key = str(row['Account Name']).strip().lower()
@@ -122,7 +156,7 @@ else:
         )
 
     # -----------------------------------------------------------------
-    # STEP B: LOAD INVOICE REPOSITORY (If any names are missing)
+    # STEP B: LOAD INVOICE REPOSITORY (If names are missing)
     # -----------------------------------------------------------------
     invoice_cache = {}
     if uploaded_invoices:
@@ -133,26 +167,26 @@ else:
                 invoice_cache[inv_id] = extracted_name
 
     # -----------------------------------------------------------------
-    # STEP C: PARSE OPERATIONAL FILES WITH EXTRACTION PROTECTION
+    # STEP C: DYNAMIC PARSING FOR BANK OF AMERICA (EXCEL & CSV SUPPORT)
     # -----------------------------------------------------------------
-    boa_df = pd.read_csv(boa_file)
+    if boa_file.name.endswith('.csv'):
+        boa_df = pd.read_csv(boa_file)
+    else:
+        boa_df = pd.read_excel(boa_file)
     
-    # Strip spaces and normalize headers to lowercase
-    normalized_headers = {str(col).strip().lower(): str(col) for col in boa_df.columns}
+    boa_df.columns = [str(col).strip().lower() for col in boa_df.columns]
     
-    # Locate headers safely using flexible string mapping match variants
-    desc_target = next((normalized_headers[k] for k in ['description', 'transaction description', 'payee', 'memo'] if k in normalized_headers), None)
-    date_target = next((normalized_headers[k] for k in ['posting date', 'date', 'transaction date'] if k in normalized_headers), None)
-    amount_target = next((normalized_headers[k] for k in ['net amount', 'amount', 'net_amount'] if k in normalized_headers), None)
-    account_target = next((normalized_headers[k] for k in ['source account', 'account', 'account number', 'account_number'] if k in normalized_headers), None)
+    desc_target = next((c for c in ['description', 'transaction description', 'payee', 'memo'] if c in boa_df.columns), None)
+    date_target = next((c for c in ['posting date', 'date', 'transaction date'] if c in boa_df.columns), None)
+    amount_target = next((c for c in ['net amount', 'amount', 'net_amount'] if c in boa_df.columns), None)
+    account_target = next((c for c in ['source account', 'account', 'account number', 'account_number'] if c in boa_df.columns), None)
             
     if desc_target is None:
-        st.error("❌ Could not find a transaction 'Description' column variant in your Bank of America CSV. Please review file headers.")
+        st.error("❌ Could not find a transaction 'Description' column variant in your Bank of America report. Please check file headers.")
         st.stop()
 
     boa_records: List[BOARecord] = []
     for _, row in boa_df.iterrows():
-        # Variables extracted fresh per row, avoiding any scope leaks
         row_description = str(row.get(desc_target, ''))
         
         if "ZOHO" in row_description.upper():  # Rule 3.1 Filtering Logic
@@ -170,38 +204,46 @@ else:
                 source_account=str(row.get(account_target, '')).strip() if account_target else ""
             ))
 
-    # Zoho Summary Parsing Block
-    if zoho_file.name.endswith('.csv'):
-        zoho_df = pd.read_csv(zoho_file)
-    else:
-        zoho_df = pd.read_excel(zoho_file)
-        
+    # -----------------------------------------------------------------
+    # STEP D: DYNAMIC PARSING FOR ZOHO SUMMARY (PDF, EXCEL & CSV SUPPORT)
+    # -----------------------------------------------------------------
     zoho_records: List[ZohoRecord] = []
-    for _, row in zoho_df.iterrows():
-        cust_name = str(row['Customer']).strip() if pd.notna(row.get('Customer')) else None
-        inv_num = str(row['Invoice Number']).strip() if pd.notna(row.get('Invoice Number')) else None
-        
-        # Rule 3.2: Fallback context mapping lookup via invoice parsing engine cache
-        if not cust_name and inv_num in invoice_cache:
-            cust_name = invoice_cache[inv_num]
+    
+    if zoho_file.name.endswith('.pdf'):
+        zoho_records = parse_zoho_pdf(zoho_file)
+    else:
+        if zoho_file.name.endswith('.csv'):
+            zoho_df = pd.read_csv(zoho_file)
+        else:
+            zoho_df = pd.read_excel(zoho_file)
             
-        zoho_records.append(ZohoRecord(
-            customer_name=cust_name,
-            gross_amount=clean_numeric_value(row.get('Gross Amount', 0.0)),
-            merchant_fee=clean_numeric_value(row.get('Merchant Fee', 0.0)),
-            invoice_number=inv_num
-        ))
+        # Standardize strings
+        zoho_df.columns = [str(c).strip() for c in zoho_df.columns]
+        
+        for _, row in zoho_df.iterrows():
+            cust_name = str(row['Customer']).strip() if pd.notna(row.get('Customer')) else None
+            inv_num = str(row['Invoice Number']).strip() if pd.notna(row.get('Invoice Number')) else None
+            
+            if not cust_name and inv_num in invoice_cache:
+                cust_name = invoice_cache[inv_num]
+                
+            zoho_records.append(ZohoRecord(
+                customer_name=cust_name,
+                gross_amount=clean_numeric_value(row.get('Gross Amount', 0.0)),
+                merchant_fee=clean_numeric_value(row.get('Merchant Fee', 0.0)),
+                invoice_number=inv_num
+            ))
 
     # -----------------------------------------------------------------
-    # STEP D: PROCESSING EXECUTION & VALIDATION MATRIX
+    # STEP E: PROCESSING EXECUTION & VALIDATION MATRIX
     # -----------------------------------------------------------------
     all_journal_lines = []
     validation_errors = []
 
+    # Process all parsed records dynamically regardless of size (1, 10, or 30 rows)
     for boa_rec in boa_records:
         matched_zoho = zoho_records  
         
-        # Rule 3.3 Balance Invariant Validation
         total_gross = sum(z.gross_amount for z in matched_zoho)
         total_fees = sum(z.merchant_fee for z in matched_zoho)
         calculated_net = total_gross - total_fees
@@ -220,4 +262,78 @@ else:
 
         processed_accounts = []
         
-        # 1. Generate Credit
+        # 1. Generate Credit Lines
+        for z_rec in matched_zoho:
+            if not z_rec.customer_name:
+                validation_errors.append(f"❌ Missing Customer Profile Reference for Invoice Tracker ID: {z_rec.invoice_number}")
+                continue
+                
+            name_key = z_rec.customer_name.lower()
+            if name_key not in master_lookup:
+                validation_errors.append(f"❌ Unregistered Ledger Entity: '{z_rec.customer_name}' absent from database lookup.")
+                continue
+                
+            master_item = master_lookup[name_key]
+            processed_accounts.append(master_item)
+            
+            cash_code, _ = CASH_CODE_MAPPING.get(master_item.payment_term, CASH_CODE_MAPPING['fallback'])
+            prefix = "MPP " if cash_code == "AR002" else ""
+            
+            current_boa_description = str(boa_rec.description)
+            desc = f"{prefix}{master_item.account_number} {master_item.account_name}_{current_boa_description}"
+            
+            all_journal_lines.append({
+                "Date": boa_rec.date, "Voucher": "", "Account name": master_item.account_name,
+                "Company": "bwa", "Account type": "Customer", "Account": master_item.account_number,
+                "Posting Profile": "AutoPost", "Cash code": cash_code, "Description": desc,
+                "Debit": "", "Credit": z_rec.gross_amount, "Item sales tax group": "", "Sales tax code": "",
+                "Offset company": "bwa", "Bank Account Type": "Bank", "Offset account": offset_acct,
+                "Offset transaction text": "", "Currency": "USD", "Exchange rate": 1.00,
+                "Item sales tax group2": "", "Sales group": "AVATAX", "Withholding tax group": "",
+                "Release date": "", "Reversing entry": "No", "Reversing date": ""
+            })
+
+        # 2. Generate Grouped Debit Fee Line (Rule 3.3 Multiple Customer Payments)
+        if total_fees > 0 and len(processed_accounts) > 0:
+            current_boa_description = str(boa_rec.description)
+            if len(processed_accounts) == 1:
+                acc = processed_accounts[0]
+                fee_desc = f"Zoho Merchant Fee {acc.account_number} {acc.account_name}_{current_boa_description}"
+            else:
+                account_strings = ", ".join([f"{a.account_number} {a.account_name}" for a in processed_accounts])
+                fee_desc = f"Zoho Merchant Fee {account_strings}_{current_boa_description}"
+
+            all_journal_lines.append({
+                "Date": boa_rec.date, "Voucher": "", "Account name": "Outside Service (Finance)",
+                "Company": "bwa", "Account type": "Ledger", "Account": "43170111-U26C05001-B735350-UOA003",
+                "Posting Profile": "", "Cash code": "OSF005", "Description": fee_desc,
+                "Debit": total_fees, "Credit": "", "Item sales tax group": "", "Sales tax code": "",
+                "Offset company": "bwa", "Bank Account Type": "Bank", "Offset account": offset_acct,
+                "Offset transaction text": "", "Currency": "USD", "Exchange rate": 1.00,
+                "Item sales tax group2": "", "Sales group": "AVATAX", "Withholding tax group": "",
+                "Release date": "", "Reversing entry": "No", "Reversing date": ""
+            })
+
+    # -----------------------------------------------------------------
+    # STEP F: DISPLAY INTERACTIVE METRICS & EXPORT DOWNLOADS
+    # -----------------------------------------------------------------
+    if validation_errors:
+        st.error("### Pipeline Validation Discrepancies Checked")
+        for error in validation_errors:
+            st.markdown(error)
+
+    if all_journal_lines:
+        st.success(f"### Transformed {len(all_journal_lines)} Journal Lines Successfully!")
+        output_df = pd.DataFrame(all_journal_lines, columns=D365_TEMPLATE_COLUMNS)
+        st.dataframe(output_df)
+        
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+            output_df.to_excel(writer, index=False, sheet_name="Journal Lines")
+        
+        st.download_button(
+            label="📥 Download Generated D365 Journal Import Sheet",
+            data=buffer.getvalue(),
+            file_name="D365_General_Journal_Import.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
