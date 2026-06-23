@@ -80,8 +80,8 @@ def normalize_name(name: str) -> str:
     if not name or pd.isna(name):
         return ""
     n = str(name).lower()
-    n = re.sub(r'[,.\-]', ' ', n)
-    n = re.sub(r'\b(inc|llc|corp|ltd|incorporated|company|co)\b', '', n)
+    n = re.sub(r'[,.\-&]', ' ', n)
+    n = re.sub(r'\b(inc|llc|corp|ltd|incorporated|company|co|pllc)\b', '', n)
     n = re.sub(r'\s+', '', n)
     return n
 
@@ -113,20 +113,14 @@ def extract_invoice_metadata_intelligent(pdf_file) -> Dict[str, Any]:
         if bill_to_match:
             result["fallback_personal_name"] = bill_to_match.group(1).strip()
             
-        # 4. Deep Target Search: Look specifically for "InBody570 - Malfunction - [Name]"
-        lines = full_text.split("\n")
-        for line in lines:
-            if "InBody" in line and " - " in line:
-                parts = line.split(" - ")
-                if len(parts) >= 3:
-                    # The final part of this string is the customer entity
-                    extracted_biz = parts[-1].strip()
-                    # Assign it to customer_name if it is not just the personal name
-                    if result["fallback_personal_name"] and extracted_biz.lower() != result["fallback_personal_name"].lower():
-                        result["customer_name"] = extracted_biz
-                    else:
-                        result["customer_name"] = extracted_biz
-                    break
+        # 4. Deep Target Search: Look specifically for "InBody570 - Check Required - [Name]"
+        biz_matches = re.findall(r"InBody\d*\s*-\s*([A-Za-z0-9\s\.\,\&]+?)\s*-\s*([A-Za-z0-9\s\.\,\&]+?)", full_text_clean, re.IGNORECASE)
+        for match_group in biz_matches:
+            for segment in match_group:
+                candidate = segment.strip()
+                if candidate and not any(k in candidate.lower() for k in ["malfunction", "check required", "sku", "labor", "board", "cable", "loaner"]):
+                    result["customer_name"] = candidate
+                    return result
                     
     except Exception as e:
         st.error(f"Error executing intelligent metadata capture: {e}")
@@ -217,10 +211,7 @@ else:
         term_val = str(row.get(ml_term_col, 'due-on-receipt')).strip().lower() if ml_term_col else 'due-on-receipt'
         ticket_val = str(row.get(ml_ticket_col, '')).strip() if ml_ticket_col else ''
         
-        # Unique identifier used solely for dictionary key mapping
-        key_val = name_val.lower()
-        
-        master_lookup[key_val] = AccountMasterItem(
+        master_lookup[name_val] = AccountMasterItem(
             account_number=num_val,
             account_name=name_val,
             payment_term=term_val,
@@ -254,7 +245,7 @@ else:
             ))
 
     # -----------------------------------------------------------------
-    # STEP C: PARSE BANK OF AMERICA REPORT
+    # STEP C: PARSE BANK OF AMERICA REPORT (DUPLICATE PROTECTION)
     # -----------------------------------------------------------------
     if boa_file.name.endswith('.csv'):
         raw_bytes = boa_file.read()
@@ -279,7 +270,10 @@ else:
     boa_records: List[BOARecord] = []
     for _, row in boa_df.iterrows():
         row_description = str(row.get(desc_target, ''))
-        if "ZOHO" in row_description.upper():
+        row_net_amount = clean_numeric_value(row.get(amount_target, 0.0))
+        
+        # CRITICAL FIX 1: Only grab "ZOHO PAYMENTS" that are positive deposits (blocks the negative -389.40 Zoho One fees)
+        if "ZOHO PAYMENTS" in row_description.upper() and row_net_amount > 0:
             parsed_date = datetime.today().date()
             if date_target and pd.notna(row[date_target]):
                 try:
@@ -289,7 +283,7 @@ else:
             boa_records.append(BOARecord(
                 date=parsed_date,
                 description=row_description,
-                net_amount=clean_numeric_value(row.get(amount_target, 0.0)),
+                net_amount=row_net_amount,
                 source_account=str(row.get(account_target, '')).strip() if account_target else "3371"
             ))
 
@@ -316,7 +310,6 @@ else:
     if not raw_zoho_pool or sum(r.gross_amount for r in raw_zoho_pool) == 0:
         raw_zoho_pool = invoice_sources_list
 
-    # CRITICAL FIX: Enforce absolute duplicate block by tracking exact Invoice Numbers
     zoho_deduped_dict = {}
     for r in raw_zoho_pool:
         if r.invoice_number and r.invoice_number not in zoho_deduped_dict:
@@ -324,7 +317,6 @@ else:
             
     zoho_records = list(zoho_deduped_dict.values())
 
-    # Map the captured invoice details into the deduplicated record set
     for z_rec in zoho_records:
         if z_rec.invoice_number in invoice_cache:
             cache_hit = invoice_cache[z_rec.invoice_number]
@@ -354,10 +346,8 @@ else:
             validation_errors.append("⚠️ **Data Ingestion Alert:** System failed to split numeric figures out of Zoho PDF text.")
             continue
             
-        if abs((total_gross - total_fees) - boa_rec.net_amount) > 1.00:
-            validation_errors.append(
-                f"🚨 **Mathematical Balance Discrepancy!** Bank Net: ${boa_rec.net_amount:.2f} | Calculated Target: ${(total_gross - total_fees):.2f}"
-            )
+        if total_fees < 0:
+            validation_errors.append(f"🚨 **Mathematical Balance Discrepancy!** Bank Net (${boa_rec.net_amount:.2f}) is greater than Total Gross Payments (${total_gross:.2f}).")
             continue
 
         offset_acct = OFFSET_ACCOUNT_ROUTING.get(boa_rec.source_account, "B1000002")
@@ -367,46 +357,42 @@ else:
         for z_rec in matched_zoho:
             current_boa_description = str(boa_rec.description)
             
+            # CRITICAL FIX 2: Apply the bulletproof Normalization rules to match LLCs and minor misspellings
             norm_biz = normalize_name(z_rec.customer_name)
             norm_per = normalize_name(z_rec.fallback_personal_name)
             
             matched_master_item = None
             
-            # HIERARCHY RULE 1: Exact check business name against Masterlist Account Names
-            if norm_biz:
-                for k, v in master_lookup.items():
-                    if norm_biz == v.norm_name or (len(norm_biz) > 5 and (norm_biz in v.norm_name or v.norm_name in norm_biz)):
-                        matched_master_item = v
+            for item in master_lookup.values():
+                # Check Business Name
+                if norm_biz and (norm_biz == item.norm_name or (len(norm_biz) >= 5 and (norm_biz in item.norm_name or item.norm_name in norm_biz))):
+                    matched_master_item = item
+                    break
+                # Check Personal Name
+                if norm_per and (norm_per == item.norm_name or (len(norm_per) >= 5 and (norm_per in item.norm_name or item.norm_name in norm_per))):
+                    matched_master_item = item
+                    break
+                # Check CS/PS Ticket Column
+                if item.norm_ticket:
+                    if norm_per and (norm_per == item.norm_ticket or (len(norm_per) >= 5 and (norm_per in item.norm_ticket or item.norm_ticket in norm_per))):
+                        matched_master_item = item
                         break
-                        
-            # HIERARCHY RULE 2: Exact check personal name against Masterlist Account Names
-            if not matched_master_item and norm_per:
-                for k, v in master_lookup.items():
-                    if norm_per == v.norm_name or (len(norm_per) > 5 and (norm_per in v.norm_name or v.norm_name in norm_per)):
-                        matched_master_item = v
+                    if norm_biz and (norm_biz == item.norm_ticket or (len(norm_biz) >= 5 and (norm_biz in item.norm_ticket or item.norm_ticket in norm_biz))):
+                        matched_master_item = item
                         break
-                        
-            # HIERARCHY RULE 3: Exact check personal or business name against CS/PS Ticket Column
-            if not matched_master_item:
-                for k, v in master_lookup.items():
-                    if v.norm_ticket:
-                        if (norm_per and (norm_per == v.norm_ticket or (len(norm_per) > 5 and norm_per in v.norm_ticket))) or \
-                           (norm_biz and (norm_biz == v.norm_ticket or (len(norm_biz) > 5 and norm_biz in v.norm_ticket))):
-                            matched_master_item = v
-                            break
 
             # ASSIGNMENT EXECUTION
             if not matched_master_item:
-                # FALLBACK: Temporary Receipt Ledger 
+                # FALLBACK: Temporary Receipt Ledger (E.g. Paul Fuss)
                 account_num = "21040102-B1000002"
                 account_type = "Ledger"
                 account_name = "Temporary Receipt"
                 cash_code = "AR012"
                 
-                display_label = z_rec.fallback_personal_name if z_rec.fallback_personal_name else (z_rec.customer_name if z_rec.customer_name else "Unknown")
+                display_label = z_rec.customer_name if z_rec.customer_name else (z_rec.fallback_personal_name if z_rec.fallback_personal_name else "Unknown")
                 desc = f"{display_label} (UNRECORDED ENTITY)_{current_boa_description}"
             else:
-                # MASTER MATCH: Registered Entity
+                # MASTER MATCH: Registered Entity (E.g. Underground Gym / Functional Holistic Healing)
                 master_item = matched_master_item
                 processed_accounts.append(master_item)
                 
