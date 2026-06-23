@@ -104,8 +104,8 @@ def extract_invoice_metadata_intelligent(pdf_file) -> Dict[str, Any]:
         inv_match = re.search(r"(INV-\d+)", full_text_clean, re.IGNORECASE)
         result["invoice_number"] = inv_match.group(1).strip() if inv_match else inv_num
         
-        # 2. Gross Amount Extraction (With foolproof empty sequence check)
-        all_decimals = [clean_numeric_value(n) for n in re.findall(r"\b\d+(?:[\.,]\d{2})+\b", full_text_clean)]
+        # 2. Gross Amount Extraction (CRITICAL FIX: Handles thousands commas)
+        all_decimals = [clean_numeric_value(n) for n in re.findall(r"\b\d+(?:,\d{3})*\.\d{2}\b", full_text_clean)]
         if len(all_decimals) > 0:
             result["gross_amount"] = max(all_decimals)
         else:
@@ -148,7 +148,7 @@ def parse_zoho_summary_pdf_bulletproof(pdf_file) -> List[ZohoRecord]:
                 for step in range(1, 15):
                     if idx + step < len(text_tokens):
                         potential_num = text_tokens[idx + step]
-                        if re.search(r"\d+\.\d{2}", potential_num):
+                        if re.search(r"\d+(?:,\d{3})*\.\d{2}", potential_num):
                             forward_pool.append(clean_numeric_value(potential_num))
                 
                 if len(forward_pool) >= 1:
@@ -275,7 +275,7 @@ else:
         row_description = str(row.get(desc_target, ''))
         row_net_amount = clean_numeric_value(row.get(amount_target, 0.0))
         
-        # CRITICAL FIX 1: Only grab "ZOHO PAYMENTS" that are positive deposits (blocks negative fees)
+        # Only grab positive "ZOHO PAYMENTS" deposits to avoid pulling in subtraction fees
         if "ZOHO PAYMENTS" in row_description.upper() and row_net_amount > 0:
             parsed_date = datetime.today().date()
             if date_target and pd.notna(row[date_target]):
@@ -394,7 +394,7 @@ else:
                 display_label = z_rec.customer_name if z_rec.customer_name else (z_rec.fallback_personal_name if z_rec.fallback_personal_name else "Unknown")
                 desc = f"{display_label} (UNRECORDED ENTITY)_{current_boa_description}"
             else:
-                # MASTER MATCH: Registered Entity 
+                # MASTER MATCH: Registered Entity
                 master_item = matched_master_item
                 processed_accounts.append(master_item)
                 
