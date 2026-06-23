@@ -202,7 +202,6 @@ else:
             payment_term=term_val
         )
 
-    # FIXED: Initialized the Zoho tracking records array globally at the top of the scope block
     zoho_records: List[ZohoRecord] = []
 
     # -----------------------------------------------------------------
@@ -241,7 +240,7 @@ else:
     boa_records: List[BOARecord] = []
     for _, row in boa_df.iterrows():
         row_description = str(row.get(desc_target, ''))
-        if "ZOHO" in row_description.upper(): [cite: 17]
+        if "ZOHO" in row_description.upper():
             parsed_date = datetime.today().date()
             if date_target and pd.notna(row[date_target]):
                 try:
@@ -320,21 +319,21 @@ else:
             validation_errors.append("⚠️ **Data Ingestion Alert:** System failed to split numeric figures out of Zoho PDF text. Drop matching invoice files below to manual override execution paths.")
             continue
             
-        if abs((total_gross - total_fees) - boa_rec.net_amount) > 1.00: [cite: 31]
+        if abs((total_gross - total_fees) - boa_rec.net_amount) > 1.00:
             validation_errors.append(
                 f"🚨 **Mathematical Balance Discrepancy!** Bank Net: ${boa_rec.net_amount:.2f} | "
                 f"Calculated Target: ${(total_gross - total_fees):.2f} (Gross Payments: ${total_gross:.2f}, Zoho Fees: ${total_fees:.2f})"
             )
             continue
 
-        offset_acct = OFFSET_ACCOUNT_ROUTING.get(boa_rec.source_account) [cite: 38, 41]
+        offset_acct = OFFSET_ACCOUNT_ROUTING.get(boa_rec.source_account)
         if not offset_acct:
             validation_errors.append(f"❌ Unmapped Bank of America Routing Target Base Account: {boa_rec.source_account}")
             continue
 
         processed_accounts = []
         
-        # 1. Generate Credit Lines (Customer Segment) [cite: 37, 38]
+        # 1. Generate Credit Lines (Customer Segment)
         for z_rec in matched_zoho:
             if not z_rec.customer_name:
                 validation_errors.append(f"❌ Missing Customer Profile Reference for Invoice Tracker ID: {z_rec.invoice_number}")
@@ -352,10 +351,10 @@ else:
             
             term_info = CASH_CODE_MAPPING.get(master_item.payment_term, CASH_CODE_MAPPING['fallback'])
             cash_code = term_info[0]
-            prefix = "MPP " if cash_code == "AR002" else "" [cite: 35, 38]
+            prefix = "MPP " if cash_code == "AR002" else ""
             
             current_boa_description = str(boa_rec.description)
-            desc = f"{prefix}{master_item.account_number} {master_item.account_name}_{current_boa_description}" [cite: 38, 39]
+            desc = f"{prefix}{master_item.account_number} {master_item.account_name}_{current_boa_description}"
             
             all_journal_lines.append({
                 "Date": boa_rec.date, "Voucher": "", "Account name": master_item.account_name,
@@ -365,18 +364,18 @@ else:
                 "Offset company": "bwa", "Bank Account Type": "Bank", "Offset account": offset_acct,
                 "Offset transaction text": "", "Currency": "USD", "Exchange rate": 1.00,
                 "Item sales tax group2": "", "Sales tax group": "AVATAX", "Withholding tax group": "",
-                "Release date": "", "Reversing entry": "No", "Reversing date": "" [cite: 38]
+                "Release date": "", "Reversing entry": "No", "Reversing date": ""
             })
 
-        # 2. Generate Consolidated Grouped Debit Fee Line (Rule 3.3 Batch Multiplicity Rule) [cite: 29, 30, 40, 41]
+        # 2. Generate Consolidated Grouped Debit Fee Line (Rule 3.3 Batch Multiplicity Rule)
         if total_fees > 0 and len(processed_accounts) > 0:
             current_boa_description = str(boa_rec.description)
             if len(processed_accounts) == 1:
                 acc = processed_accounts[0]
-                fee_desc = f"Zoho Merchant Fee {acc.account_number} {acc.account_name}_{current_boa_description}" [cite: 41, 42]
+                fee_desc = f"Zoho Merchant Fee {acc.account_number} {acc.account_name}_{current_boa_description}"
             else:
                 account_strings = ", ".join([f"{a.account_number} {a.account_name}" for a in processed_accounts])
-                fee_desc = f"Zoho Merchant Fee {account_strings}_{current_boa_description}" [cite: 41, 42]
+                fee_desc = f"Zoho Merchant Fee {account_strings}_{current_boa_description}"
 
             all_journal_lines.append({
                 "Date": boa_rec.date, "Voucher": "", "Account name": "Outside Service (Finance)",
@@ -386,7 +385,7 @@ else:
                 "Offset company": "bwa", "Bank Account Type": "Bank", "Offset account": offset_acct,
                 "Offset transaction text": "", "Currency": "USD", "Exchange rate": 1.00,
                 "Item sales tax group2": "", "Sales tax group": "AVATAX", "Withholding tax group": "",
-                "Release date": "", "Reversing entry": "No", "Reversing date": "" [cite: 41]
+                "Release date": "", "Reversing entry": "No", "Reversing date": ""
             })
 
     # STEP F: DISPLAY INTERACTIVE METRICS & EXPORT DOWNLOADS
