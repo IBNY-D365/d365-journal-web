@@ -82,7 +82,6 @@ def clean_numeric_value(val: Any) -> float:
         return 0.0
 
 def normalize_name(name: str) -> str:
-    """Removes LLC, INC, spaces, dots, and punctuation to guarantee exact cross-matching."""
     if not name or pd.isna(name):
         return ""
     n = str(name).lower()
@@ -92,7 +91,6 @@ def normalize_name(name: str) -> str:
     return n
 
 def map_form_term_to_cash_code(term_str: str) -> str:
-    """Translates the 'Invoice Sent' column from Form DB into standardized Cash Code keys."""
     t = str(term_str).lower().strip()
     if "ap" in t or "due on receipt" in t: return "due-on-receipt"
     if "mpp" in t or "monthly" in t: return "monthly"
@@ -154,14 +152,21 @@ def parse_zoho_summary_pdf_bulletproof(pdf_file) -> List[ZohoRecord]:
     records = []
     try:
         reader = PdfReader(pdf_file)
-        text = ""
+        full_text = ""
         for page in reader.pages:
-            text += page.extract_text() + " "
+            full_text += page.extract_text() or ""
             
-        text = " ".join(text.split())
+        if "All Transactions" in full_text:
+            transactions_text = full_text.split("All Transactions")[-1]
+        elif "Export" in full_text:
+            transactions_text = full_text.split("Export")[-1]
+        else:
+            transactions_text = full_text
+            
+        transactions_text = " ".join(transactions_text.split())
         
-        # Surgical split using time chunks to perfectly capture all lines
-        chunks = re.split(r"\d{1,2}:\d{2}\s*(?:AM|PM)", text, flags=re.IGNORECASE)
+        # Surgical split using time chunks
+        chunks = re.split(r"\d{1,2}:\d{2}\s*(?:AM|PM)", transactions_text, flags=re.IGNORECASE)
         
         for chunk in chunks[1:]: 
             amounts = re.findall(r"[-]?\$?[0-9,]+\.\d{2}", chunk)
@@ -176,7 +181,7 @@ def parse_zoho_summary_pdf_bulletproof(pdf_file) -> List[ZohoRecord]:
                 inv_id = inv_match.group(1).strip() if inv_match else None
                 
                 cust_name = re.sub(r'INV-\d+.*', '', desc, flags=re.IGNORECASE).strip() if inv_id else desc.strip()
-                cust_name = re.sub(r'\.+$', '', cust_name).strip() 
+                cust_name = re.sub(r'\.\.\.$', '', cust_name).strip() 
                 if cust_name and len(cust_name) < 2: cust_name = None
                 
                 if gross > 0 and not any((r.invoice_number == inv_id and inv_id is not None) or (r.gross_amount == gross and r.customer_name == cust_name) for r in records):
@@ -254,9 +259,9 @@ else:
             fdf = pd.read_excel(target_form_db)
         
         fdf.columns = [str(c).strip().lower() for c in fdf.columns]
-        biz_col = next((c for c in fdf.columns if c == 'business name'), None)
-        acct_col = next((c for c in fdf.columns if c == 'customer account' or c == 'account number'), None)
-        term_col = next((c for c in fdf.columns if c == 'invoice sent' or c == 'payment term' or c == 'term'), None)
+        biz_col = next((c for c in fdf.columns if 'business name' in c or 'customer' in c), None)
+        acct_col = next((c for c in fdf.columns if 'customer account' in c or 'account number' in c or 'account' in c), None)
+        term_col = next((c for c in fdf.columns if 'invoice sent' in c or 'payment term' in c or 'term' in c), None)
         
         if biz_col and term_col:
             for _, row in fdf.iterrows():
@@ -272,7 +277,7 @@ else:
                         "raw_name": b_name
                     }
     else:
-        st.warning("⚠️ Form Master DB not found in repository root. Please ensure 'Form Master DB.xlsx' or '.csv' is uploaded to GitHub.")
+        st.warning("⚠️ Form Master DB not found in repository root. Please ensure 'Form Master DB.xlsx' or 'Form Master DB.csv' is committed to GitHub.")
 
     # -----------------------------------------------------------------
     # STEP C: EXTRACT ALL UPLOADED INVOICES
@@ -382,7 +387,6 @@ else:
     all_journal_lines = []
     validation_errors = []
 
-    # Calculate True Zoho Net First
     z_total_gross = sum(z.gross_amount for z in zoho_records)
     z_total_fees = sum(z.merchant_fee for z in zoho_records)
     z_net = round(z_total_gross - z_total_fees, 2)
@@ -390,7 +394,6 @@ else:
     if z_total_gross == 0:
         validation_errors.append("⚠️ **Data Ingestion Alert:** System failed to extract gross amounts.")
     else:
-        # Find the single exact Bank of America deposit match
         matched_boa = None
         for boa in boa_records:
             if abs(boa.net_amount - z_net) <= 1.00:
@@ -398,12 +401,11 @@ else:
                 break
 
         if not matched_boa:
-            validation_errors.append(f"🚨 **Mathematical Balance Discrepancy!** No Bank of America deposit matches the calculated Zoho Net (${z_net:.2f}).")
+            validation_errors.append(f"🚨 **Mathematical Balance Discrepancy!** No Bank of America deposit matches the calculated Zoho Net (${z_net:.2f}). Total Gross: ${z_total_gross:.2f}, Total Fees: ${z_total_fees:.2f}")
         else:
             offset_acct = OFFSET_ACCOUNT_ROUTING.get(matched_boa.source_account, "B1000002")
             processed_accounts = []
             
-            # 1. Generate Credit Lines (Customer Segment)
             for z_rec in zoho_records:
                 current_boa_description = str(matched_boa.description)
                 
@@ -430,20 +432,18 @@ else:
                             break
 
                 # Check Form DB Second for Missing Masterlist Entries
-                for q in [norm_biz, norm_per]:
-                    if q and len(q) >= 4:
-                        for k, v in form_db_lookup.items():
-                            if q in k or k in q or k.startswith(q):
-                                form_match = v
-                                break
-                    if form_match: break
+                if form_db_lookup:
+                    for q in [norm_biz, norm_per]:
+                        if q and len(q) >= 4:
+                            for k, v in form_db_lookup.items():
+                                if q in k or k in q or k.startswith(q):
+                                    form_match = v
+                                    break
+                        if form_match: break
 
                 # ASSIGNMENT EXECUTION
                 if matched_master_item:
-                    # Found in Main Masterlist
                     final_term = matched_master_item.payment_term
-                    
-                    # Override term if Form DB dictates otherwise
                     if form_match and form_match["term"] and str(form_match["term"]).lower() != 'nan':
                         final_term = form_match["term"]
                         
@@ -459,9 +459,7 @@ else:
                     processed_accounts.append(matched_master_item)
 
                 elif form_match and form_match["account"]:
-                    # Found exclusively in Form DB with a Valid BC Account! Map as a real Customer!
                     final_term = form_match["term"]
-                    
                     term_info = CASH_CODE_MAPPING.get(map_form_term_to_cash_code(final_term), CASH_CODE_MAPPING['fallback'])
                     cash_code = term_info[0]
                     prefix = "MPP " if cash_code == "AR002" else ""
@@ -471,11 +469,9 @@ else:
                     account_name = form_match["raw_name"]
                     desc = f"{prefix}{account_num} {account_name}_{current_boa_description}"
                     
-                    # Store pseudo-master item for fee grouping
                     processed_accounts.append(AccountMasterItem(account_number=account_num, account_name=account_name, payment_term=final_term, norm_name="", norm_ticket=""))
 
                 else:
-                    # FALLBACK: Temporary Receipt Ledger
                     account_num = "21040102-B1000002"
                     account_type = "Ledger"
                     account_name = "Temporary Receipt"
@@ -498,16 +494,15 @@ else:
                     "Release date": "", "Reversing entry": "No", "Reversing date": ""
                 })
 
-            # 2. Generate Consolidated Grouped Debit Fee Line
             if z_total_fees > 0:
                 if len(processed_accounts) == 1:
                     acc = processed_accounts[0]
-                    fee_desc = f"Zoho Merchant Fee {acc.account_number} {acc.account_name}_{current_boa_description}"
+                    fee_desc = f"Zoho Merchant Fee {acc.account_number} {acc.account_name}_{str(matched_boa.description)}"
                 elif len(processed_accounts) > 1:
                     account_strings = ", ".join([f"{a.account_number} {a.account_name}" for a in processed_accounts])
-                    fee_desc = f"Zoho Merchant Fee {account_strings}_{current_boa_description}"
+                    fee_desc = f"Zoho Merchant Fee {account_strings}_{str(matched_boa.description)}"
                 else:
-                    fee_desc = f"Zoho Merchant Fee (Unresolved Suspense Pool Batch)_{current_boa_description}"
+                    fee_desc = f"Zoho Merchant Fee (Unresolved Suspense Pool Batch)_{str(matched_boa.description)}"
 
                 all_journal_lines.append({
                     "Date": matched_boa.date, "Voucher": "", "Account name": "Outside Service (Finance)",
@@ -520,7 +515,6 @@ else:
                     "Release date": "", "Reversing entry": "No", "Reversing date": ""
                 })
 
-    # STEP F: DISPLAY INTERACTIVE METRICS & EXPORT DOWNLOADS
     if validation_errors:
         st.error("### Pipeline Validation Discrepancies Checked")
         for error in validation_errors:
