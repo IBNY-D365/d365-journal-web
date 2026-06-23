@@ -9,7 +9,7 @@ import io
 import os
 
 # =====================================================================
-# 1. HARDCODED CONFIGURATIONS & MAPPINGS
+# 1. HARDCODED CONFIGURATIONS & MAPPINGS (From Specification Document)
 # =====================================================================
 CASH_CODE_MAPPING = {
     "due-on-receipt": ("AR001", "AR Collection_AP"),
@@ -61,7 +61,8 @@ class AccountMasterItem(BaseModel):
     account_number: str
     account_name: str
     payment_term: str
-    cs_ps_ticket: Optional[str] = None
+    norm_name: str
+    norm_ticket: str
 
 def clean_numeric_value(val: Any) -> float:
     if pd.isna(val) or val is None:
@@ -74,57 +75,61 @@ def clean_numeric_value(val: Any) -> float:
     except ValueError:
         return 0.0
 
-def normalize_entity_name(name: str) -> str:
-    """Strips suffixes like LLC, INC, punctuation, and normalizes spacing for Masterlist cross-referencing."""
+def normalize_name(name: str) -> str:
+    """Removes LLC, INC, spaces, and punctuation to guarantee exact cross-matching."""
     if not name or pd.isna(name):
         return ""
-    name = str(name).lower()
-    name = re.sub(r'[.,\-\'"&]', '', name)
-    name = re.sub(r'\b(llc|inc|ltd|corp|co|pllc|pc)\b', '', name)
-    return " ".join(name.split())
+    n = str(name).lower()
+    n = re.sub(r'[,.\-]', ' ', n)
+    n = re.sub(r'\b(inc|llc|corp|ltd|incorporated|company|co)\b', '', n)
+    n = re.sub(r'\s+', '', n)
+    return n
 
 # =====================================================================
-# 3. ADVANCED EXTRACTION ENGINE WITH MASTERLIST NER
+# 3. ADVANCED EXTRACTION ENGINE
 # =====================================================================
-def extract_invoice_metadata_intelligent(pdf_file, known_entities: List[str]) -> Dict[str, Any]:
-    """Scans invoice text against the exact Masterlist database to guarantee correct names."""
+def extract_invoice_metadata_intelligent(pdf_file) -> Dict[str, Any]:
+    """Scans the invoice to capture the business entity from the item string & Bill To name."""
     result = {"customer_name": None, "invoice_number": None, "gross_amount": 0.0, "fallback_personal_name": None}
     try:
-        pdf_file.seek(0)
         reader = PdfReader(pdf_file)
-        full_text = " ".join(page.extract_text() or "" for page in reader.pages)
+        full_text = ""
+        for page in reader.pages:
+            full_text += page.extract_text() or ""
+            
         full_text_clean = " ".join(full_text.split())
         
-        # Search space formatted identically to the masterlist keys
-        search_space = normalize_entity_name(full_text_clean)
-        
-        # Extract Invoice Number
+        # 1. Invoice Number Extraction
         inv_num = pdf_file.name.replace(".pdf", "")
         inv_match = re.search(r"(INV-\d+)", full_text_clean, re.IGNORECASE)
-        result["invoice_number"] = inv_match.group(1).upper() if inv_match else inv_num
+        result["invoice_number"] = inv_match.group(1).strip() if inv_match else inv_num
         
-        # Extract Gross Amount
+        # 2. Gross Amount Extraction
         all_decimals = [clean_numeric_value(n) for n in re.findall(r"\b\d+(?:[\.,]\d{2})+\b", full_text_clean)]
         result["gross_amount"] = max(all_decimals) if all_decimals else 0.0
         
-        # NER Customer Matching: Find the masterlist name inside the invoice text
-        valid_entities = [e for e in known_entities if len(e) > 3]
-        valid_entities.sort(key=len, reverse=True) # Sort so "Underground Gym" hits before "Gym"
-        
-        for entity in valid_entities:
-            # Exact whole-word matching inside the cleaned document text
-            if f" {entity} " in f" {search_space} ":
-                result["customer_name"] = entity
-                break
-                
-        # Last resort fallback if masterlist name is completely missing from document
-        if not result["customer_name"]:
-            bill_to_match = re.search(r"Bill\s+To[:\s]*([A-Za-z0-9\s\.\,\-\&]+?)(?:\s+Ship|\s+Date|\s+INV-|$)", full_text_clean, re.IGNORECASE)
-            if bill_to_match:
-                result["fallback_personal_name"] = bill_to_match.group(1).strip()
-                
+        # 3. Personal "Bill To" Name Extraction
+        bill_to_match = re.search(r"Bill\s+To\s*([A-Za-z0-9\s\.\,\-]+?)(?:\s*\d|\s*Ship\s*To|$)", full_text_clean, re.IGNORECASE)
+        if bill_to_match:
+            result["fallback_personal_name"] = bill_to_match.group(1).strip()
+            
+        # 4. Deep Target Search: Look specifically for "InBody570 - Malfunction - [Name]"
+        lines = full_text.split("\n")
+        for line in lines:
+            if "InBody" in line and " - " in line:
+                parts = line.split(" - ")
+                if len(parts) >= 3:
+                    # The final part of this string is the customer entity
+                    extracted_biz = parts[-1].strip()
+                    # Assign it to customer_name if it is not just the personal name
+                    if result["fallback_personal_name"] and extracted_biz.lower() != result["fallback_personal_name"].lower():
+                        result["customer_name"] = extracted_biz
+                    else:
+                        result["customer_name"] = extracted_biz
+                    break
+                    
     except Exception as e:
-        st.error(f"Error executing intelligent metadata capture on {pdf_file.name}: {e}")
+        st.error(f"Error executing intelligent metadata capture: {e}")
     return result
 
 def parse_zoho_summary_pdf_bulletproof(pdf_file) -> List[ZohoRecord]:
@@ -161,7 +166,7 @@ def parse_zoho_summary_pdf_bulletproof(pdf_file) -> List[ZohoRecord]:
                             invoice_number=inv_id
                         ))
     except Exception as e:
-        st.error(f"Error executing token stream layout parser: {e}")
+        st.error(f"Error executing summary parser: {e}")
     return records
 
 # =====================================================================
@@ -185,65 +190,72 @@ uploaded_invoices = st.sidebar.file_uploader("3. Extra Customer Invoices (PDFs) 
 if not (boa_file and zoho_file):
     st.info("💡 Staging required: Please drop today's Bank of America report and matching Zoho summary sheet into the sidebar container panel.")
 else:
-    # STEP A: LOAD MASTERLIST
-    master_df = pd.read_excel(MASTERLIST_PATH)
+    # -----------------------------------------------------------------
+    # STEP A: LOAD MASTERLIST (WITH LLC / TICKET NORMALIZATION)
+    # -----------------------------------------------------------------
+    if MASTERLIST_PATH.endswith('.csv'):
+        master_df = pd.read_csv(MASTERLIST_PATH)
+    else:
+        master_df = pd.read_excel(MASTERLIST_PATH)
+        
     master_df.columns = [str(col).strip() for col in master_df.columns]
     master_headers_lower = {str(col).lower(): str(col) for col in master_df.columns}
     
     ml_name_col = next((master_headers_lower[k] for k in ['account name', 'name', 'customer name'] if k in master_headers_lower), None)
-    ml_num_col = next((master_headers_lower[k] for k in ['account', 'account #', 'account number', 'account no'] if k in master_headers_lower), None)
+    ml_num_col = next((master_headers_lower[k] for k in ['account #', 'account number', 'account no', 'account'] if k in master_headers_lower), None)
     ml_term_col = next((master_headers_lower[k] for k in ['payment term', 'payment terms', 'terms'] if k in master_headers_lower), None)
-    ml_ticket_col = next((master_headers_lower[k] for k in ['cs/ps ticket', 'ticket'] if k in master_headers_lower), None)
+    ml_ticket_col = next((master_headers_lower[k] for k in ['cs/ps ticket', 'ticket', 'cs/ps'] if k in master_headers_lower), None)
     
     if not ml_name_col or not ml_num_col:
-        st.error(f"❌ Could not identify definitive baseline 'Account Name' or 'Account' tracking headers.")
+        st.error("❌ Could not identify definitive baseline 'Account Name' or 'Account #' tracking headers inside Masterlist spreadsheet.")
         st.stop()
         
     master_lookup: Dict[str, AccountMasterItem] = {}
-    ticket_lookup: Dict[str, AccountMasterItem] = {}
-    
     for _, row in master_df.iterrows():
         name_val = str(row[ml_name_col]).strip()
-        name_key = normalize_entity_name(name_val)
-        
         num_val = str(row[ml_num_col]).strip()
         term_val = str(row.get(ml_term_col, 'due-on-receipt')).strip().lower() if ml_term_col else 'due-on-receipt'
+        ticket_val = str(row.get(ml_ticket_col, '')).strip() if ml_ticket_col else ''
         
-        ticket_val = str(row[ml_ticket_col]).strip() if ml_ticket_col and pd.notna(row[ml_ticket_col]) else ""
+        # Unique identifier used solely for dictionary key mapping
+        key_val = name_val.lower()
         
-        item = AccountMasterItem(
+        master_lookup[key_val] = AccountMasterItem(
             account_number=num_val,
             account_name=name_val,
             payment_term=term_val,
-            cs_ps_ticket=ticket_val
+            norm_name=normalize_name(name_val),
+            norm_ticket=normalize_name(ticket_val)
         )
-        
-        if name_key:
-            master_lookup[name_key] = item
-            
-        if ticket_val:
-            ticket_key = normalize_entity_name(ticket_val)
-            if ticket_key:
-                ticket_lookup[ticket_key] = item
 
-    # Compile the known entities from masterlist to cross-reference against the PDFs
-    known_entity_keys = list(master_lookup.keys()) + list(ticket_lookup.keys())
-
-    # STEP B: PARSE UPLOADED SUPPORTING INVOICES
+    # -----------------------------------------------------------------
+    # STEP B: EXTRACT ALL INVOICES INTO CACHE
+    # -----------------------------------------------------------------
+    invoice_cache = {}
     invoice_sources_list = []
+    
+    all_pdf_drops = []
     if uploaded_invoices:
-        for inv in uploaded_invoices:
-            meta = extract_invoice_metadata_intelligent(inv, known_entity_keys)
-            if meta["gross_amount"] > 0:
-                invoice_sources_list.append(ZohoRecord(
-                    customer_name=meta["customer_name"],
-                    gross_amount=meta["gross_amount"],
-                    merchant_fee=0.0,
-                    invoice_number=meta["invoice_number"],
-                    fallback_personal_name=meta["fallback_personal_name"]
-                ))
+        all_pdf_drops.extend(uploaded_invoices)
 
+    for inv in all_pdf_drops:
+        meta = extract_invoice_metadata_intelligent(inv)
+        if meta["invoice_number"]:
+            invoice_cache[meta["invoice_number"]] = {
+                "resolved_name": meta["customer_name"],
+                "fallback_personal_name": meta["fallback_personal_name"]
+            }
+            invoice_sources_list.append(ZohoRecord(
+                customer_name=meta["customer_name"],
+                gross_amount=meta["gross_amount"],
+                merchant_fee=0.0,
+                invoice_number=meta["invoice_number"],
+                fallback_personal_name=meta["fallback_personal_name"]
+            ))
+
+    # -----------------------------------------------------------------
     # STEP C: PARSE BANK OF AMERICA REPORT
+    # -----------------------------------------------------------------
     if boa_file.name.endswith('.csv'):
         raw_bytes = boa_file.read()
         lines = raw_bytes.decode('utf-8').splitlines()
@@ -281,7 +293,9 @@ else:
                 source_account=str(row.get(account_target, '')).strip() if account_target else "3371"
             ))
 
-    # STEP D: PARSE PRIMARY ZOHO SUMMARY SHEET & RESOLVE CONFLICTS
+    # -----------------------------------------------------------------
+    # STEP D: PARSE PRIMARY ZOHO SUMMARY SHEET & DEDUPLICATE
+    # -----------------------------------------------------------------
     raw_zoho_pool: List[ZohoRecord] = []
     if zoho_file.name.endswith('.pdf'):
         raw_zoho_pool = parse_zoho_summary_pdf_bulletproof(zoho_file)
@@ -299,21 +313,26 @@ else:
                 invoice_number=str(row['Invoice Number']).strip() if pd.notna(row.get('Invoice Number')) else None
             ))
 
-    # --- STRICT OVERRIDE LOGIC ---
-    if uploaded_invoices and len(invoice_sources_list) > 0:
-        # If user uploaded supporting invoices, bypass the noisy Zoho PDF and strictly use the clean invoices.
-        zoho_records = invoice_sources_list
-    else:
-        # Deduplicate raw_zoho_pool if no invoices were provided.
-        zoho_records = []
-        seen_invoices = set()
-        for r in raw_zoho_pool:
-            if r.invoice_number and r.invoice_number not in seen_invoices:
-                zoho_records.append(r)
-                seen_invoices.add(r.invoice_number)
+    if not raw_zoho_pool or sum(r.gross_amount for r in raw_zoho_pool) == 0:
+        raw_zoho_pool = invoice_sources_list
+
+    # CRITICAL FIX: Enforce absolute duplicate block by tracking exact Invoice Numbers
+    zoho_deduped_dict = {}
+    for r in raw_zoho_pool:
+        if r.invoice_number and r.invoice_number not in zoho_deduped_dict:
+            zoho_deduped_dict[r.invoice_number] = r
+            
+    zoho_records = list(zoho_deduped_dict.values())
+
+    # Map the captured invoice details into the deduplicated record set
+    for z_rec in zoho_records:
+        if z_rec.invoice_number in invoice_cache:
+            cache_hit = invoice_cache[z_rec.invoice_number]
+            z_rec.customer_name = cache_hit["resolved_name"] if cache_hit["resolved_name"] else z_rec.customer_name
+            z_rec.fallback_personal_name = cache_hit["fallback_personal_name"]
 
     # =====================================================================
-    # STEP E: TRANSACTION PROCESSING & BATCH RESOLUTION ENGINE
+    # STEP E: TRANSACTION PROCESSING & HIERARCHY MATCHING ENGINE
     # =====================================================================
     all_journal_lines = []
     validation_errors = []
@@ -347,27 +366,38 @@ else:
         # 1. Generate Credit Lines (Customer Segment)
         for z_rec in matched_zoho:
             current_boa_description = str(boa_rec.description)
-            master_item = None
             
-            # Lookup name against normalized master dictionary
-            if z_rec.customer_name:
-                query_key = normalize_entity_name(z_rec.customer_name)
-                if query_key in master_lookup:
-                    master_item = master_lookup[query_key]
-                elif query_key in ticket_lookup:
-                    master_item = ticket_lookup[query_key]
-                else:
-                    matched_key = next((k for k in master_lookup if k in query_key or query_key in k), None)
-                    if matched_key:
-                        master_item = master_lookup[matched_key]
+            norm_biz = normalize_name(z_rec.customer_name)
+            norm_per = normalize_name(z_rec.fallback_personal_name)
             
-            if not master_item and z_rec.fallback_personal_name:
-                fallback_key = normalize_entity_name(z_rec.fallback_personal_name)
-                matched_ticket_key = next((k for k in ticket_lookup if fallback_key in k or k in fallback_key), None)
-                if matched_ticket_key:
-                    master_item = ticket_lookup[matched_ticket_key]
+            matched_master_item = None
+            
+            # HIERARCHY RULE 1: Exact check business name against Masterlist Account Names
+            if norm_biz:
+                for k, v in master_lookup.items():
+                    if norm_biz == v.norm_name or (len(norm_biz) > 5 and (norm_biz in v.norm_name or v.norm_name in norm_biz)):
+                        matched_master_item = v
+                        break
+                        
+            # HIERARCHY RULE 2: Exact check personal name against Masterlist Account Names
+            if not matched_master_item and norm_per:
+                for k, v in master_lookup.items():
+                    if norm_per == v.norm_name or (len(norm_per) > 5 and (norm_per in v.norm_name or v.norm_name in norm_per)):
+                        matched_master_item = v
+                        break
+                        
+            # HIERARCHY RULE 3: Exact check personal or business name against CS/PS Ticket Column
+            if not matched_master_item:
+                for k, v in master_lookup.items():
+                    if v.norm_ticket:
+                        if (norm_per and (norm_per == v.norm_ticket or (len(norm_per) > 5 and norm_per in v.norm_ticket))) or \
+                           (norm_biz and (norm_biz == v.norm_ticket or (len(norm_biz) > 5 and norm_biz in v.norm_ticket))):
+                            matched_master_item = v
+                            break
 
-            if not master_item:
+            # ASSIGNMENT EXECUTION
+            if not matched_master_item:
+                # FALLBACK: Temporary Receipt Ledger 
                 account_num = "21040102-B1000002"
                 account_type = "Ledger"
                 account_name = "Temporary Receipt"
@@ -376,7 +406,10 @@ else:
                 display_label = z_rec.fallback_personal_name if z_rec.fallback_personal_name else (z_rec.customer_name if z_rec.customer_name else "Unknown")
                 desc = f"{display_label} (UNRECORDED ENTITY)_{current_boa_description}"
             else:
+                # MASTER MATCH: Registered Entity
+                master_item = matched_master_item
                 processed_accounts.append(master_item)
+                
                 term_info = CASH_CODE_MAPPING.get(master_item.payment_term, CASH_CODE_MAPPING['fallback'])
                 cash_code = term_info[0]
                 prefix = "MPP " if cash_code == "AR002" else ""
@@ -431,4 +464,13 @@ else:
         output_df = pd.DataFrame(all_journal_lines, columns=D365_TEMPLATE_COLUMNS)
         st.dataframe(output_df)
         
-        buffer = io.
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+            output_df.to_excel(writer, index=False, sheet_name="Journal Lines")
+        
+        st.download_button(
+            label="📥 Download Generated D365 Journal Import Sheet",
+            data=buffer.getvalue(),
+            file_name="D365_General_Journal_Import.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
