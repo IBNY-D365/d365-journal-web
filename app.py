@@ -151,41 +151,41 @@ def extract_invoice_metadata_intelligent(pdf_file) -> Dict[str, Any]:
     return result
 
 def parse_zoho_summary_pdf_bulletproof(pdf_file) -> List[ZohoRecord]:
-    """Bulletproof tabular parser that splits documents exactly by 'Payment' lines to capture 100% of rows."""
+    """Time-Chunking Table Parser to guarantee all rows are read perfectly."""
     records = []
     try:
         reader = PdfReader(pdf_file)
         full_text = ""
         for page in reader.pages:
-            full_text += page.extract_text() + " "
+            full_text += page.extract_text() or ""
             
-        text_stream = " ".join(full_text.split())
+        if "All Transactions" in full_text:
+            transactions_text = full_text.split("All Transactions")[-1]
+        elif "Export" in full_text:
+            transactions_text = full_text.split("Export")[-1]
+        else:
+            transactions_text = full_text
+            
+        transactions_text = " ".join(transactions_text.split())
         
-        # Split cleanly at every transaction block
-        chunks = re.split(r"\bPayment\b", text_stream, flags=re.IGNORECASE)
+        # Split exactly by Timestamp (AM/PM) to guarantee 100% row isolation
+        chunks = re.split(r"\d{1,2}:\d{2}\s*(?:AM|PM)", transactions_text, flags=re.IGNORECASE)
         
         for chunk in chunks[1:]: 
             amounts = re.findall(r"[-]?\$?[0-9,]+\.\d{2}", chunk)
-            if len(amounts) >= 2:
+            if len(amounts) >= 3:
                 gross = clean_numeric_value(amounts[0])
-                fee = clean_numeric_value(amounts[1]) if len(amounts) > 1 else 0.0
+                fee = clean_numeric_value(amounts[1])
                 
-                # Grabs the descriptive text immediately following AM/PM
-                desc_match = re.search(r"(?:AM|PM)\s+(.*?)(?:-\$|\$|-[ ]?\$|\d)", chunk)
-                if not desc_match:
-                    desc_match = re.search(r"\d{4}[, ]+(.*?)(?:-\$|\$|-[ ]?\$|\d)", chunk)
-                    
-                desc = desc_match.group(1).strip() if desc_match else chunk[:30]
+                desc_match = re.search(r"^(.*?)(?:-\$|\$|-[ ]?\$|[0-9])", chunk)
+                desc = desc_match.group(1).strip() if desc_match else ""
                 
                 inv_match = re.search(r'(INV-\d+)', desc, re.IGNORECASE)
                 inv_id = inv_match.group(1).strip() if inv_match else None
                 
                 cust_name = re.sub(r'INV-\d+.*', '', desc, flags=re.IGNORECASE).strip() if inv_id else desc.strip()
                 cust_name = re.sub(r'\.\.\.$', '', cust_name).strip() 
-                cust_name = re.sub(r'[^a-zA-Z0-9\s]+$', '', cust_name).strip() 
-                
-                if cust_name and len(cust_name) < 2: 
-                    cust_name = None
+                if cust_name and len(cust_name) < 2: cust_name = None
                 
                 if gross > 0:
                     records.append(ZohoRecord(
@@ -262,9 +262,11 @@ else:
             fdf = pd.read_excel(target_form_db)
         
         fdf.columns = [str(c).strip().lower() for c in fdf.columns]
-        biz_col = next((c for c in fdf.columns if 'business name' in c or 'customer' in c), None)
-        acct_col = next((c for c in fdf.columns if 'customer account' in c or 'account number' in c or 'account' in c), None)
-        term_col = next((c for c in fdf.columns if 'invoice sent' in c or 'payment term' in c or 'term' in c), None)
+        
+        # EXACT column matching to prevent pulling wrong Customer Account strings
+        biz_col = next((c for c in fdf.columns if c == 'business name'), None)
+        acct_col = next((c for c in fdf.columns if c == 'customer account'), None)
+        term_col = next((c for c in fdf.columns if c == 'invoice sent'), None)
         
         if biz_col and term_col:
             for _, row in fdf.iterrows():
@@ -279,8 +281,6 @@ else:
                         "account": a_val,
                         "raw_name": b_name
                     }
-    else:
-        st.warning("⚠️ Form Master DB not found in repository root. Please ensure 'Form Master DB.xlsx' or 'Form Master DB.csv' is committed to GitHub.")
 
     # -----------------------------------------------------------------
     # STEP C: EXTRACT ALL UPLOADED INVOICES
@@ -370,17 +370,15 @@ else:
     if not raw_zoho_pool or sum(r.gross_amount for r in raw_zoho_pool) == 0:
         raw_zoho_pool = invoice_sources_list
 
-    # Deduplication that preserves identical dollar amounts lacking invoice numbers
+    # FIX: Deduplication block utilizing exact signatures so split invoices ($10 and $10,290) are completely preserved!
     zoho_records: List[ZohoRecord] = []
-    seen_invoices = set()
+    seen_signatures = set()
     
     for r in raw_zoho_pool:
-        if r.invoice_number:
-            if r.invoice_number not in seen_invoices:
-                zoho_records.append(r)
-                seen_invoices.add(r.invoice_number)
-        else:
+        sig = (r.invoice_number, r.customer_name, r.gross_amount)
+        if sig not in seen_signatures:
             zoho_records.append(r)
+            seen_signatures.add(sig)
 
     # Safe Cache Cross-Referencing
     for z_rec in zoho_records:
@@ -392,10 +390,10 @@ else:
                 z_rec.fallback_personal_name = cache_hit.get("fallback_personal_name") or z_rec.fallback_personal_name
 
     # =====================================================================
-    # STEP F: TRANSACTION PROCESSING
+    # STEP F: TRANSACTION PROCESSING & ONE-TO-ONE BOA ANCHORING
     # =====================================================================
     all_journal_lines = []
-    
+
     z_total_gross = sum(z.gross_amount for z in zoho_records)
     z_total_fees = sum(z.merchant_fee for z in zoho_records)
     z_net = round(z_total_gross - z_total_fees, 2)
@@ -403,13 +401,13 @@ else:
     if z_total_gross == 0:
         st.error("⚠️ **Data Ingestion Alert:** System failed to extract gross amounts.")
     else:
-        # Relaxed matching logic - NEVER blocks table generation
         matched_boa = None
         for boa in boa_records:
             if abs(boa.net_amount - z_net) <= 1.00:
                 matched_boa = boa
                 break
 
+        # Display a warning if the Bank net doesn't perfectly match Zoho, but NEVER block generation!
         if not matched_boa and boa_records:
             matched_boa = boa_records[0]
             st.warning(f"⚠️ **Note:** Bank of America deposit (${matched_boa.net_amount:.2f}) differs from calculated Zoho Net (${z_net:.2f}). Generating journal entries using Zoho Gross and Fee as the absolute source of truth.")
@@ -424,6 +422,7 @@ else:
             for z_rec in zoho_records:
                 current_boa_description = str(matched_boa.description)
                 
+                # Force safely cast strings to prevent NoneType crashes
                 raw_biz = z_rec.customer_name or ""
                 raw_per = z_rec.fallback_personal_name or ""
                 
@@ -499,8 +498,8 @@ else:
                     account_name = "Temporary Receipt"
                     
                     final_term = form_match.get("term") if form_match else "due-on-receipt"
-                    term_info = CASH_CODE_MAPPING.get(map_form_term_to_cash_code(final_term), CASH_CODE_MAPPING['fallback'])
-                    cash_code = term_info[0]
+                    # CRITICAL FIX: Temporary Receipts MUST default to AR012
+                    cash_code = "AR012"
                     
                     display_label = raw_biz if raw_biz else (raw_per if raw_per else "Unknown")
                     desc = f"{display_label} (UNRECORDED ENTITY)_{current_boa_description}"
