@@ -76,7 +76,6 @@ def clean_numeric_value(val: Any) -> float:
         return 0.0
 
 def normalize_name(name: str) -> str:
-    """Removes LLC, INC, spaces, dots, and punctuation to guarantee exact cross-matching."""
     if not name or pd.isna(name):
         return ""
     n = str(name).lower()
@@ -86,7 +85,6 @@ def normalize_name(name: str) -> str:
     return n
 
 def map_form_term_to_cash_code(term_str: str) -> str:
-    """Translates the 'Invoice Sent' column from Form DB into standardized Cash Code dictionary keys."""
     t = str(term_str).lower().strip()
     if "ap" in t or "due on receipt" in t: return "due-on-receipt"
     if "mpp" in t or "monthly" in t: return "monthly"
@@ -105,7 +103,6 @@ def map_form_term_to_cash_code(term_str: str) -> str:
 # 3. ADVANCED EXTRACTION ENGINE
 # =====================================================================
 def extract_invoice_metadata_intelligent(pdf_file) -> Dict[str, Any]:
-    """Scans the invoice to capture the precise Paid Amount and business entity."""
     result = {"customer_name": None, "invoice_number": None, "gross_amount": 0.0, "fallback_personal_name": None}
     try:
         reader = PdfReader(pdf_file)
@@ -146,7 +143,7 @@ def extract_invoice_metadata_intelligent(pdf_file) -> Dict[str, Any]:
     return result
 
 def parse_zoho_summary_pdf_bulletproof(pdf_file) -> List[ZohoRecord]:
-    """Robust tabular regex parser that captures records with OR without an INV- prefix."""
+    """Captures all transaction rows perfectly, even if the description lacks an INV- tracking number."""
     records = []
     try:
         reader = PdfReader(pdf_file)
@@ -165,26 +162,26 @@ def parse_zoho_summary_pdf_bulletproof(pdf_file) -> List[ZohoRecord]:
             gross = clean_numeric_value(m[1])
             fee = clean_numeric_value(m[2])
             
-            # Clean truncated dots out of descriptions (e.g. "InBody New Yo...")
-            desc_text = re.sub(r'\.\.\.$', '', desc_text).strip()
-            
             inv_match = re.search(r'(INV-\d+)', desc_text, re.IGNORECASE)
-            inv_id = inv_match.group(1) if inv_match else None
+            inv_id = inv_match.group(1).strip() if inv_match else None
             
-            # If there's no INV ID, the remaining text string is the customer entity directly
-            cust_name = re.sub(r'INV-\d+', '', desc_text, flags=re.IGNORECASE).strip() if not inv_id else None
-            if cust_name and len(cust_name) < 2: 
+            cust_name = re.sub(r'INV-\d+.*', '', desc_text, flags=re.IGNORECASE).strip()
+            cust_name = re.sub(r'\.\.\.$', '', cust_name).strip() # Removes the dot truncation
+            if len(cust_name) < 2:
                 cust_name = None
+                
+            if not cust_name and not inv_id:
+                cust_name = re.sub(r'\.\.\.$', '', desc_text).strip()
                 
             if gross > 0:
                 records.append(ZohoRecord(
-                    customer_name=cust_name if cust_name else None,
+                    customer_name=cust_name,
                     gross_amount=gross,
                     merchant_fee=fee,
                     invoice_number=inv_id
                 ))
     except Exception as e:
-        st.error(f"Error executing summary parser: {e}")
+        st.error(f"Error executing tabular summary parser: {e}")
     return records
 
 # =====================================================================
@@ -204,8 +201,6 @@ st.sidebar.header("📅 Daily Variable Inputs")
 boa_file = st.sidebar.file_uploader("1. Bank of America Report (Excel/CSV)", type=["xlsx", "csv"])
 zoho_file = st.sidebar.file_uploader("2. Zoho Transaction Summary (PDF/Excel/CSV)", type=["pdf", "xlsx", "csv"])
 uploaded_invoices = st.sidebar.file_uploader("3. Extra Customer Invoices (PDFs) [Optional]", type=["pdf"], accept_multiple_files=True)
-
-# NEW 4TH INPUT: Form Master DB parsing for missing cash codes
 form_db_file = st.sidebar.file_uploader("4. Form Master DB (Excel/CSV) [Optional]", type=["xlsx", "csv"])
 
 if not (boa_file and zoho_file):
@@ -227,10 +222,6 @@ else:
     ml_term_col = next((master_headers_lower[k] for k in ['payment term', 'payment terms', 'terms'] if k in master_headers_lower), None)
     ml_ticket_col = next((master_headers_lower[k] for k in ['cs/ps ticket', 'ticket', 'cs/ps'] if k in master_headers_lower), None)
     
-    if not ml_name_col or not ml_num_col:
-        st.error("❌ Could not identify definitive baseline 'Account Name' or 'Account #' tracking headers inside Masterlist spreadsheet.")
-        st.stop()
-        
     master_lookup: Dict[str, AccountMasterItem] = {}
     for _, row in master_df.iterrows():
         name_val = str(row[ml_name_col]).strip()
@@ -268,7 +259,7 @@ else:
                     form_db_lookup[normalize_name(b_name)] = t_val
 
     # -----------------------------------------------------------------
-    # STEP C: EXTRACT ALL UPLOADED INVOICES INTO CACHE
+    # STEP C: EXTRACT UPLOADED INVOICES
     # -----------------------------------------------------------------
     invoice_cache = {}
     invoice_sources_list = []
@@ -357,7 +348,6 @@ else:
 
     zoho_deduped_dict = {}
     for r in raw_zoho_pool:
-        # Use invoice number if present, otherwise group by unique CustomerName + Amount bounds
         key = r.invoice_number if r.invoice_number else f"{r.customer_name}_{r.gross_amount}"
         if key not in zoho_deduped_dict:
             zoho_deduped_dict[key] = r
@@ -391,11 +381,11 @@ else:
                 z.merchant_fee = each_fee
 
         if total_gross == 0:
-            validation_errors.append("⚠️ **Data Ingestion Alert:** System failed to extract gross amounts. Ensure invoices are uploaded.")
+            validation_errors.append("⚠️ **Data Ingestion Alert:** System failed to extract gross amounts.")
             continue
             
         if abs((total_gross - total_fees) - boa_rec.net_amount) > 1.00:
-            validation_errors.append(f"🚨 **Mathematical Balance Discrepancy!** Bank Net (${boa_rec.net_amount:.2f}) does not match Target (${(total_gross - total_fees):.2f}).")
+            validation_errors.append(f"🚨 **Mathematical Balance Discrepancy!** Bank Net (${boa_rec.net_amount:.2f}) does not match Total Gross Payments (${total_gross:.2f}).")
             continue
 
         offset_acct = OFFSET_ACCOUNT_ROUTING.get(boa_rec.source_account, "B1000002")
@@ -410,27 +400,37 @@ else:
             
             matched_master_item = None
             
+            # Smart Lookup: Finds truncated strings (e.g., "InBody New Yo" matches "InBody New York")
             for item in master_lookup.values():
-                if norm_biz and (norm_biz == item.norm_name or (len(norm_biz) >= 5 and (norm_biz in item.norm_name or item.norm_name in norm_biz))):
-                    matched_master_item = item
-                    break
-                if norm_per and (norm_per == item.norm_name or (len(norm_per) >= 5 and (norm_per in item.norm_name or item.norm_name in norm_per))):
-                    matched_master_item = item
-                    break
-                if item.norm_ticket:
-                    if norm_per and (norm_per == item.norm_ticket or (len(norm_per) >= 5 and (norm_per in item.norm_ticket or item.norm_ticket in norm_per))):
+                if norm_biz and len(norm_biz) >= 5:
+                    if norm_biz in item.norm_name or item.norm_name in norm_biz or item.norm_name.startswith(norm_biz):
                         matched_master_item = item
                         break
-                    if norm_biz and (norm_biz == item.norm_ticket or (len(norm_biz) >= 5 and (norm_biz in item.norm_ticket or item.norm_ticket in norm_biz))):
+                if norm_per and len(norm_per) >= 5:
+                    if norm_per in item.norm_name or item.norm_name in norm_per or item.norm_name.startswith(norm_per):
+                        matched_master_item = item
+                        break
+                if item.norm_ticket:
+                    if norm_per and len(norm_per) >= 5 and (norm_per in item.norm_ticket or item.norm_ticket in norm_per or item.norm_ticket.startswith(norm_per)):
+                        matched_master_item = item
+                        break
+                    if norm_biz and len(norm_biz) >= 5 and (norm_biz in item.norm_ticket or item.norm_ticket in norm_biz or item.norm_ticket.startswith(norm_biz)):
                         matched_master_item = item
                         break
 
-            # DYNAMIC PAYMENT TERM OVERRIDE: Prioritize the Form Master DB if a match is found
+            # Smart Form DB Payment Term Cross-Referencing
             final_payment_term = matched_master_item.payment_term if matched_master_item else "due-on-receipt"
-            if norm_biz and norm_biz in form_db_lookup:
-                final_payment_term = map_form_term_to_cash_code(form_db_lookup[norm_biz])
-            elif norm_per and norm_per in form_db_lookup:
-                final_payment_term = map_form_term_to_cash_code(form_db_lookup[norm_per])
+            form_term = None
+            for q in [norm_biz, norm_per]:
+                if q and len(q) >= 5:
+                    for k, v in form_db_lookup.items():
+                        if q in k or k in q or k.startswith(q):
+                            form_term = v
+                            break
+                if form_term: break
+                
+            if form_term:
+                final_payment_term = map_form_term_to_cash_code(form_term)
 
             # ASSIGNMENT EXECUTION
             if not matched_master_item:
