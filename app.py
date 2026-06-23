@@ -80,7 +80,7 @@ def normalize_name(name: str) -> str:
     if not name or pd.isna(name):
         return ""
     n = str(name).lower()
-    n = re.sub(r'[,.-&]', ' ', n)
+    n = re.sub(r'[,.\-&]', ' ', n)
     n = re.sub(r'\b(inc|llc|corp|ltd|incorporated|company|co|pllc)\b', '', n)
     n = re.sub(r'\s+', '', n)
     return n
@@ -96,7 +96,7 @@ def extract_invoice_metadata_intelligent(pdf_file) -> Dict[str, Any]:
         full_text = ""
         for page in reader.pages:
             full_text += page.extract_text() or ""
-        
+            
         full_text_clean = " ".join(full_text.split())
         
         # 1. Invoice Number Extraction
@@ -128,7 +128,7 @@ def extract_invoice_metadata_intelligent(pdf_file) -> Dict[str, Any]:
             if candidate and not any(k in candidate.lower() for k in ["malfunction", "check required", "sku", "labor", "board", "cable", "loaner"]):
                 result["customer_name"] = candidate
                 return result
-                
+                    
     except Exception as e:
         st.error(f"Error executing intelligent metadata capture: {e}")
     return result
@@ -140,7 +140,7 @@ def parse_zoho_summary_pdf_bulletproof(pdf_file) -> List[ZohoRecord]:
         full_text = ""
         for page in reader.pages:
             full_text += page.extract_text() or ""
-        
+            
         text_stream = full_text.replace("\n", " ").replace("$", " ")
         text_tokens = text_stream.split()
         
@@ -180,7 +180,7 @@ st.subheader("Daily Operational Reconciliations Matrix")
 MASTERLIST_PATH = "Account Masterlist.xlsx"
 
 if not os.path.exists(MASTERLIST_PATH):
-    st.error(f"❌ Core configuration file {MASTERLIST_PATH} missing from your GitHub repository root folder. Please commit it to your repository.")
+    st.error(f"❌ Core configuration file `{MASTERLIST_PATH}` missing from your GitHub repository root folder. Please commit it to your repository.")
     st.stop()
 
 st.sidebar.header("📅 Daily Variable Inputs")
@@ -198,15 +198,15 @@ else:
         master_df = pd.read_csv(MASTERLIST_PATH)
     else:
         master_df = pd.read_excel(MASTERLIST_PATH)
-
+        
     master_df.columns = [str(col).strip() for col in master_df.columns]
     master_headers_lower = {str(col).lower(): str(col) for col in master_df.columns}
-
+    
     ml_name_col = next((master_headers_lower[k] for k in ['account name', 'name', 'customer name'] if k in master_headers_lower), None)
     ml_num_col = next((master_headers_lower[k] for k in ['account #', 'account number', 'account no', 'account'] if k in master_headers_lower), None)
     ml_term_col = next((master_headers_lower[k] for k in ['payment term', 'payment terms', 'terms'] if k in master_headers_lower), None)
     ml_ticket_col = next((master_headers_lower[k] for k in ['cs/ps ticket', 'ticket', 'cs/ps'] if k in master_headers_lower), None)
-
+    
     if not ml_name_col or not ml_num_col:
         st.error("❌ Could not identify definitive baseline 'Account Name' or 'Account #' tracking headers inside Masterlist spreadsheet.")
         st.stop()
@@ -231,7 +231,7 @@ else:
     # -----------------------------------------------------------------
     invoice_cache = {}
     invoice_sources_list = []
-
+    
     if uploaded_invoices:
         for inv in uploaded_invoices:
             meta = extract_invoice_metadata_intelligent(inv)
@@ -264,7 +264,7 @@ else:
         boa_df = pd.read_csv(boa_file, skiprows=skip_count)
     else:
         boa_df = pd.read_excel(boa_file)
-
+    
     boa_df.columns = [str(col).strip().lower() for col in boa_df.columns]
     desc_target = next((c for c in ['description', 'transaction description', 'payee', 'memo'] if c in boa_df.columns), None)
     date_target = next((c for c in ['posting date', 'date', 'transaction date'] if c in boa_df.columns), None)
@@ -276,6 +276,7 @@ else:
         row_description = str(row.get(desc_target, ''))
         row_net_amount = clean_numeric_value(row.get(amount_target, 0.0))
         
+        # CRITICAL FIX 1: Blocks negative subscriptions (-$389.40) to prevent the 7-row duplication error
         if "ZOHO PAYMENTS" in row_description.upper() and row_net_amount > 0:
             parsed_date = datetime.today().date()
             if date_target and pd.notna(row[date_target]):
@@ -310,12 +311,15 @@ else:
                 invoice_number=str(row['Invoice Number']).strip() if pd.notna(row.get('Invoice Number')) else None
             ))
 
+    # CRITICAL FIX 2: Priority Merge - Use uploaded invoices as the absolute source of truth for amounts & names
     zoho_deduped_dict = {}
-
+    
+    # Priority 1: Direct Invoices
     for inv_rec in invoice_sources_list:
         if inv_rec.invoice_number:
             zoho_deduped_dict[inv_rec.invoice_number] = inv_rec
             
+    # Priority 2: Zoho Summary (fills in any missing lines not uploaded)
     for r in raw_zoho_pool:
         if r.invoice_number and r.invoice_number not in zoho_deduped_dict:
             zoho_deduped_dict[r.invoice_number] = r
@@ -360,15 +364,17 @@ else:
             norm_per = normalize_name(z_rec.fallback_personal_name)
             
             matched_master_item = None
-            form_match = None
             
             for item in master_lookup.values():
+                # Check Business Name
                 if norm_biz and (norm_biz == item.norm_name or (len(norm_biz) >= 5 and (norm_biz in item.norm_name or item.norm_name in norm_biz))):
                     matched_master_item = item
                     break
+                # Check Personal Name
                 if norm_per and (norm_per == item.norm_name or (len(norm_per) >= 5 and (norm_per in item.norm_name or item.norm_name in norm_per))):
                     matched_master_item = item
                     break
+                # Check CS/PS Ticket Column
                 if item.norm_ticket:
                     if norm_per and (norm_per == item.norm_ticket or (len(norm_per) >= 5 and (norm_per in item.norm_ticket or item.norm_ticket in norm_per))):
                         matched_master_item = item
@@ -379,35 +385,20 @@ else:
 
             # ASSIGNMENT EXECUTION
             if not matched_master_item:
-                if form_match and form_match.get("account"):
-                    # Safe dict call using .get() to prevent KeyErrors
-                    final_term = form_match.get("term", "due-on-receipt") 
-                    term_info = CASH_CODE_MAPPING.get(map_form_term_to_cash_code(final_term), CASH_CODE_MAPPING['fallback'])
-                    cash_code = term_info[0]
-                    prefix = "MPP " if cash_code == "AR002" else ""
-                    
-                    account_num = form_match["account"]
-                    account_type = "Customer"
-                    account_name = form_match.get("raw_name", "Unknown")
-                    desc = f"{prefix}{account_num} {account_name}_{current_boa_description}"
-                    processed_accounts.append(AccountMasterItem(account_number=account_num, account_name=account_name, payment_term=str(final_term), norm_name="", norm_ticket=""))
-                else:
-                    # FALLBACK: Temporary Receipt Ledger (E.g. Paul Fuss)
-                    account_num = "21040102-B1000002"
-                    account_type = "Ledger"
-                    account_name = "Temporary Receipt"
-                    cash_code = "AR012"
-                    
-                    display_label = z_rec.customer_name if z_rec.customer_name else (z_rec.fallback_personal_name if z_rec.fallback_personal_name else "Unknown")
-                    desc = f"{display_label} (UNRECORDED ENTITY)_{current_boa_description}"
+                # FALLBACK: Temporary Receipt Ledger (E.g. Paul Fuss)
+                account_num = "21040102-B1000002"
+                account_type = "Ledger"
+                account_name = "Temporary Receipt"
+                cash_code = "AR012"
+                
+                display_label = z_rec.customer_name if z_rec.customer_name else (z_rec.fallback_personal_name if z_rec.fallback_personal_name else "Unknown")
+                desc = f"{display_label} (UNRECORDED ENTITY)_{current_boa_description}"
             else:
                 # MASTER MATCH: Registered Entity (E.g. Underground Gym / Functional Holistic Healing)
                 master_item = matched_master_item
                 processed_accounts.append(master_item)
                 
-                # Safe dict call using .get() to prevent KeyErrors
-                final_term = form_match.get("term", "due-on-receipt") if form_match and form_match.get("term") and str(form_match.get("term")).lower() != 'nan' else master_item.payment_term
-                term_info = CASH_CODE_MAPPING.get(map_form_term_to_cash_code(final_term), CASH_CODE_MAPPING['fallback'])
+                term_info = CASH_CODE_MAPPING.get(master_item.payment_term, CASH_CODE_MAPPING['fallback'])
                 cash_code = term_info[0]
                 prefix = "MPP " if cash_code == "AR002" else ""
                 
