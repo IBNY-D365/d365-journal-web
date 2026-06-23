@@ -9,7 +9,7 @@ import io
 import os
 
 # =====================================================================
-# 1. HARDCODED CONFIGURATIONS & MAPPINGS (From Specification Document)
+# 1. HARDCODED CONFIGURATIONS & MAPPINGS
 # =====================================================================
 CASH_CODE_MAPPING = {
     "due-on-receipt": ("AR001", "AR Collection_AP"),
@@ -61,6 +61,7 @@ class AccountMasterItem(BaseModel):
     account_number: str
     account_name: str
     payment_term: str
+    cs_ps_ticket: Optional[str] = None  # NEW: Added field for ticket matching
 
 def clean_numeric_value(val: Any) -> float:
     if pd.isna(val) or val is None:
@@ -72,6 +73,18 @@ def clean_numeric_value(val: Any) -> float:
         return float(cleaned_str)
     except ValueError:
         return 0.0
+
+def normalize_entity_name(name: str) -> str:
+    """Strips suffixes like LLC, INC, punctuation, and normalizes spacing for accurate matching."""
+    if not name or pd.isna(name):
+        return ""
+    name = str(name).lower()
+    # Strip punctuation
+    name = re.sub(r'[.,\-\'"&]', '', name)
+    # Strip corporate suffixes globally (using word boundaries)
+    name = re.sub(r'\b(llc|inc|ltd|corp|co|pllc|pc)\b', '', name)
+    # Clean up any leftover double spaces
+    return " ".join(name.split())
 
 # =====================================================================
 # 3. ADVANCED EXTRACTION ENGINE
@@ -85,24 +98,19 @@ def extract_invoice_metadata_intelligent(pdf_file) -> Dict[str, Any]:
         for page in reader.pages:
             full_text += page.extract_text() or ""
             
-        # Normalize all line breaks and layout gaps into a single continuous stream
         full_text_clean = " ".join(full_text.split())
         
-        # Extract invoice tracking code
         inv_num = pdf_file.name.replace(".pdf", "")
         inv_match = re.search(r"(INV-\d+)", full_text_clean, re.IGNORECASE)
         result["invoice_number"] = inv_match.group(1).strip() if inv_match else inv_num
         
-        # Get highest number value as gross amount
         all_decimals = [clean_numeric_value(n) for n in re.findall(r"\b\d+(?:[\.,]\d{2})+\b", full_text_clean)]
         result["gross_amount"] = max(all_decimals) if all_decimals else 0.0
         
-        # Extract 'Bill To' personal name accurately from clean stream
         bill_to_match = re.search(r"Bill\s+To\s*([A-Za-z0-9\s\.\,\-]+?)(?:\s*\d|\s*Ship\s*To|$)", full_text_clean, re.IGNORECASE)
         if bill_to_match:
             result["fallback_personal_name"] = bill_to_match.group(1).strip()
         
-        # Scrape item description patterns safely from the flattened clean space stream
         biz_matches = re.findall(r"InBody\d*\s*-\s*([A-Za-z0-9\s\.\,]+?)\s*-\s*([A-Za-z0-9\s\.\,]+?)", full_text_clean, re.IGNORECASE)
         for match_group in biz_matches:
             for segment in match_group:
@@ -179,27 +187,44 @@ else:
     master_headers_lower = {str(col).lower(): str(col) for col in master_df.columns}
     
     ml_name_col = next((master_headers_lower[k] for k in ['account name', 'name', 'customer name'] if k in master_headers_lower), None)
-    ml_num_col = next((master_headers_lower[k] for k in ['account #', 'account number', 'account no', 'account'] if k in master_headers_lower), None)
+    # Safely target Account Number columns to prevent KeyError
+    ml_num_col = next((master_headers_lower[k] for k in ['account', 'account #', 'account number', 'account no'] if k in master_headers_lower), None)
     ml_term_col = next((master_headers_lower[k] for k in ['payment term', 'payment terms', 'terms'] if k in master_headers_lower), None)
+    ml_ticket_col = next((master_headers_lower[k] for k in ['cs/ps ticket', 'ticket'] if k in master_headers_lower), None)
     
     if not ml_name_col or not ml_num_col:
-        st.error("❌ Could not identify definitive baseline 'Account Name' or 'Account #' tracking headers inside Masterlist spreadsheet.")
+        st.error(f"❌ Could not identify definitive baseline 'Account Name' or 'Account' tracking headers. Available headers: {list(master_df.columns)}")
         st.stop()
         
     master_lookup: Dict[str, AccountMasterItem] = {}
+    ticket_lookup: Dict[str, AccountMasterItem] = {}
+    
     for _, row in master_df.iterrows():
         name_val = str(row[ml_name_col]).strip()
-        name_key = name_val.lower()
+        name_key = normalize_entity_name(name_val)  # Apply LLC/INC cleanup
+        
         num_val = str(row[ml_num_col]).strip()
         term_val = str(row.get(ml_term_col, 'due-on-receipt')).strip().lower() if ml_term_col else 'due-on-receipt'
         
-        master_lookup[name_key] = AccountMasterItem(
+        # Capture CS/PS Ticket
+        ticket_val = str(row[ml_ticket_col]).strip() if ml_ticket_col and pd.notna(row[ml_ticket_col]) else ""
+        
+        item = AccountMasterItem(
             account_number=num_val,
             account_name=name_val,
-            payment_term=term_val
+            payment_term=term_val,
+            cs_ps_ticket=ticket_val
         )
+        
+        if name_key:
+            master_lookup[name_key] = item
+            
+        # Register the CS/PS ticket name for fallback searches
+        if ticket_val:
+            ticket_key = normalize_entity_name(ticket_val)
+            if ticket_key:
+                ticket_lookup[ticket_key] = item
 
-    # FIXED: Re-ordered code structure cleanly to eliminate any NameErrors or unresolved loops
     invoice_cache = {}
     invoice_sources_list = []
     
@@ -280,11 +305,9 @@ else:
                 invoice_number=str(row['Invoice Number']).strip() if pd.notna(row.get('Invoice Number')) else None
             ))
 
-    # Fallback directly to the unified invoice metadata pool if sheet pulls 0 entries
     if not raw_zoho_pool or sum(r.gross_amount for r in raw_zoho_pool) == 0:
         raw_zoho_pool = invoice_sources_list
 
-    # Strict tracking deduplication layer targeting unique invoice strings only
     zoho_records: List[ZohoRecord] = []
     seen_invoices = set()
 
@@ -293,7 +316,6 @@ else:
             zoho_records.append(r)
             seen_invoices.add(r.invoice_number)
 
-    # Final execution loop across the multi-payment search hierarchy
     for z_rec in zoho_records:
         if z_rec.invoice_number in invoice_cache:
             cache_hit = invoice_cache[z_rec.invoice_number]
@@ -336,13 +358,24 @@ else:
         for z_rec in matched_zoho:
             current_boa_description = str(boa_rec.description)
             
-            query_name = z_rec.customer_name if z_rec.customer_name else (z_rec.fallback_personal_name if z_rec.fallback_personal_name else "")
-            query_key = query_name.lower().strip()
+            master_item = None
             
-            matched_master_key = next((k for k in master_lookup if k in query_key or query_key in k), None) if query_key else None
+            # --- MATCHING LOGIC STAGE 1: Match by Company Name ---
+            if z_rec.customer_name:
+                query_key = normalize_entity_name(z_rec.customer_name)
+                matched_master_key = next((k for k in master_lookup if k and (k == query_key or k in query_key or query_key in k)), None)
+                if matched_master_key:
+                    master_item = master_lookup[matched_master_key]
             
-            if not matched_master_key:
-                # Updated exact specifications for the Ledger Suspense target matching your D365 blueprint screenshots
+            # --- MATCHING LOGIC STAGE 2: Fallback to CS/PS Ticket using Personal Name ---
+            if not master_item and z_rec.fallback_personal_name:
+                fallback_key = normalize_entity_name(z_rec.fallback_personal_name)
+                matched_ticket_key = next((k for k in ticket_lookup if k and (k == fallback_key or k in fallback_key or fallback_key in k)), None)
+                if matched_ticket_key:
+                    master_item = ticket_lookup[matched_ticket_key]
+
+            # --- PROCESS THE RESULT ---
+            if not master_item:
                 account_num = "21040102-B1000002"
                 account_type = "Ledger"
                 account_name = "Temporary Receipt"
@@ -351,9 +384,7 @@ else:
                 display_label = z_rec.fallback_personal_name if z_rec.fallback_personal_name else (z_rec.customer_name if z_rec.customer_name else "Unknown")
                 desc = f"{display_label} (UNRECORDED ENTITY)_{current_boa_description}"
             else:
-                master_item = master_lookup[matched_master_key]
                 processed_accounts.append(master_item)
-                
                 term_info = CASH_CODE_MAPPING.get(master_item.payment_term, CASH_CODE_MAPPING['fallback'])
                 cash_code = term_info[0]
                 prefix = "MPP " if cash_code == "AR002" else ""
