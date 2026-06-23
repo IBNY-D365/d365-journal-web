@@ -81,7 +81,7 @@ def clean_numeric_value(val: Any) -> float:
     except ValueError:
         return 0.0
 
-def normalize_name(name: str) -> str:
+def normalize_name(name: Any) -> str:
     """Removes LLC, INC, spaces, dots, and punctuation to guarantee exact cross-matching."""
     if not name or pd.isna(name):
         return ""
@@ -377,10 +377,9 @@ else:
                 zoho_records.append(r)
                 seen_invoices.add(r.invoice_number)
         else:
-            # Safely appends missing invoice entries without overwriting identical dollar amounts
             zoho_records.append(r)
 
-    # 100% Safe Cache Mapping - Avoids KeyErrors by using safe .get() handlers
+    # Safe Cache Cross-Referencing
     for z_rec in zoho_records:
         inv_key = z_rec.invoice_number if z_rec.invoice_number else z_rec.customer_name
         if inv_key and inv_key in invoice_cache:
@@ -417,34 +416,42 @@ else:
             for z_rec in zoho_records:
                 current_boa_description = str(matched_boa.description)
                 
-                norm_biz = normalize_name(z_rec.customer_name)
-                norm_per = normalize_name(z_rec.fallback_personal_name)
+                # Force safely cast strings to prevent NoneType crashes
+                raw_biz = z_rec.customer_name or ""
+                raw_per = z_rec.fallback_personal_name or ""
+                
+                norm_biz = normalize_name(raw_biz)
+                norm_per = normalize_name(raw_per)
                 
                 matched_master_item = None
                 form_match = None
                 
-                # Check Masterlist First
+                # Safe Masterlist Search
                 for item in master_lookup.values():
-                    if norm_biz and len(norm_biz) >= 4 and (norm_biz in item.norm_name or item.norm_name in norm_biz or item.norm_name.startswith(norm_biz)):
+                    i_name = str(item.norm_name) if item.norm_name else ""
+                    i_ticket = str(item.norm_ticket) if item.norm_ticket else ""
+                    
+                    if norm_biz and len(norm_biz) >= 4 and (norm_biz in i_name or i_name in norm_biz or i_name.startswith(norm_biz)):
                         matched_master_item = item
                         break
-                    if norm_per and len(norm_per) >= 4 and (norm_per in item.norm_name or item.norm_name in norm_per or item.norm_name.startswith(norm_per)):
+                    if norm_per and len(norm_per) >= 4 and (norm_per in i_name or i_name in norm_per or i_name.startswith(norm_per)):
                         matched_master_item = item
                         break
-                    if item.norm_ticket:
-                        if norm_per and len(norm_per) >= 4 and (norm_per in item.norm_ticket or item.norm_ticket in norm_per or item.norm_ticket.startswith(norm_per)):
+                    if i_ticket:
+                        if norm_per and len(norm_per) >= 4 and (norm_per in i_ticket or i_ticket in norm_per or i_ticket.startswith(norm_per)):
                             matched_master_item = item
                             break
-                        if norm_biz and len(norm_biz) >= 4 and (norm_biz in item.norm_ticket or item.norm_ticket in norm_biz or item.norm_ticket.startswith(norm_biz)):
+                        if norm_biz and len(norm_biz) >= 4 and (norm_biz in i_ticket or i_ticket in norm_biz or i_ticket.startswith(norm_biz)):
                             matched_master_item = item
                             break
 
-                # Check Form DB Second for Missing Masterlist Entries
+                # Safe Form DB Search
                 if form_db_lookup:
                     for q in [norm_biz, norm_per]:
                         if q and len(q) >= 4:
                             for k, v in form_db_lookup.items():
-                                if q in k or k in q or k.startswith(q):
+                                k_str = str(k) if k else ""
+                                if q in k_str or k_str in q or k_str.startswith(q):
                                     form_match = v
                                     break
                         if form_match: break
@@ -452,7 +459,7 @@ else:
                 # ASSIGNMENT EXECUTION
                 if matched_master_item:
                     final_term = matched_master_item.payment_term
-                    if form_match and form_match["term"] and str(form_match["term"]).lower() != 'nan':
+                    if form_match and form_match.get("term") and str(form_match.get("term")).lower() != 'nan':
                         final_term = form_match["term"]
                         
                     term_info = CASH_CODE_MAPPING.get(map_form_term_to_cash_code(final_term), CASH_CODE_MAPPING['fallback'])
@@ -466,29 +473,29 @@ else:
                     
                     processed_accounts.append(matched_master_item)
 
-                elif form_match and form_match["account"]:
-                    final_term = form_match["term"]
+                elif form_match and form_match.get("account"):
+                    final_term = form_match.get("term")
                     term_info = CASH_CODE_MAPPING.get(map_form_term_to_cash_code(final_term), CASH_CODE_MAPPING['fallback'])
                     cash_code = term_info[0]
                     prefix = "MPP " if cash_code == "AR002" else ""
                     
                     account_num = form_match["account"]
                     account_type = "Customer"
-                    account_name = form_match["raw_name"]
+                    account_name = form_match.get("raw_name", "Unknown")
                     desc = f"{prefix}{account_num} {account_name}_{current_boa_description}"
                     
-                    processed_accounts.append(AccountMasterItem(account_number=account_num, account_name=account_name, payment_term=final_term, norm_name="", norm_ticket=""))
+                    processed_accounts.append(AccountMasterItem(account_number=account_num, account_name=account_name, payment_term=str(final_term), norm_name="", norm_ticket=""))
 
                 else:
                     account_num = "21040102-B1000002"
                     account_type = "Ledger"
                     account_name = "Temporary Receipt"
                     
-                    final_term = form_match["term"] if form_match else "due-on-receipt"
+                    final_term = form_match.get("term") if form_match else "due-on-receipt"
                     term_info = CASH_CODE_MAPPING.get(map_form_term_to_cash_code(final_term), CASH_CODE_MAPPING['fallback'])
                     cash_code = term_info[0]
                     
-                    display_label = z_rec.customer_name if z_rec.customer_name else (z_rec.fallback_personal_name if z_rec.fallback_personal_name else "Unknown")
+                    display_label = raw_biz if raw_biz else (raw_per if raw_per else "Unknown")
                     desc = f"{display_label} (UNRECORDED ENTITY)_{current_boa_description}"
 
                 all_journal_lines.append({
