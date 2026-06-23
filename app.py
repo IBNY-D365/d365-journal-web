@@ -77,7 +77,7 @@ def clean_numeric_value(val: Any) -> float:
 # 3. ADVANCED EXTRACTION ENGINE
 # =====================================================================
 def extract_invoice_metadata_intelligent(pdf_file) -> Dict[str, Any]:
-    """Scans an invoice PDF to resolve true business name or personal fallback name."""
+    """Scans an invoice PDF text stream globally to resolve true business name or personal fallback name."""
     result = {"customer_name": None, "invoice_number": None, "gross_amount": 0.0, "fallback_personal_name": None}
     try:
         reader = PdfReader(pdf_file)
@@ -85,6 +85,7 @@ def extract_invoice_metadata_intelligent(pdf_file) -> Dict[str, Any]:
         for page in reader.pages:
             full_text += page.extract_text() or ""
             
+        # Normalize all line breaks and layout gaps into a single continuous stream
         full_text_clean = " ".join(full_text.split())
         
         # Extract invoice tracking code
@@ -96,25 +97,20 @@ def extract_invoice_metadata_intelligent(pdf_file) -> Dict[str, Any]:
         all_decimals = [clean_numeric_value(n) for n in re.findall(r"\b\d+(?:[\.,]\d{2})+\b", full_text_clean)]
         result["gross_amount"] = max(all_decimals) if all_decimals else 0.0
         
-        # Extract 'Bill To' personal name
-        bill_to_name = None
-        bill_to_match = re.search(r"Bill\s+To\s*([^\n]+)", full_text, re.IGNORECASE)
+        # Extract 'Bill To' personal name accurately from clean stream
+        bill_to_match = re.search(r"Bill\s+To\s*([A-Za-z0-9\s\.\,\-]+?)(?:\s*\d|\s*Ship\s*To|$)", full_text_clean, re.IGNORECASE)
         if bill_to_match:
-            bill_to_name = bill_to_match.group(1).strip()
-        result["fallback_personal_name"] = bill_to_name
+            result["fallback_personal_name"] = bill_to_match.group(1).strip()
         
-        # Scrape lines specifically targeting corporate descriptions (e.g. Underground Gym, Functional Holistic)
-        lines = full_text.split("\n")
-        for line in lines:
-            if "InBody" in line and "-" in line:
-                parts = line.split("-")
-                # Look for segments that aren't hardware keywords
-                for part in parts:
-                    candidate = part.strip()
-                    if candidate and "inbody" not in candidate.lower() and "malfunction" not in candidate.lower() and "check required" not in candidate.lower():
-                        result["customer_name"] = candidate
-                        return result
-                        
+        # Scrape item description patterns safely from the flattened clean space stream
+        biz_matches = re.findall(r"InBody\d*\s*-\s*([A-Za-z0-9\s\.\,]+?)\s*-\s*([A-Za-z0-9\s\.\,]+?)", full_text_clean, re.IGNORECASE)
+        for match_group in biz_matches:
+            for segment in match_group:
+                candidate = segment.strip()
+                if candidate and not any(k in candidate.lower() for k in ["malfunction", "check required", "sku", "labor", "board", "cable"]):
+                    result["customer_name"] = candidate
+                    return result
+                    
     except Exception as e:
         st.error(f"Error executing intelligent metadata capture: {e}")
     return result
@@ -205,14 +201,28 @@ else:
 
     # STEP B: SCAN DIRECT INVOICE BACKUPS AND POPULATE INTEL CACHE
     invoice_cache = {}
+    invoice_sources_list = []
+    
+    all_pdf_drops = []
     if uploaded_invoices:
-        for inv in uploaded_invoices:
-            meta = extract_invoice_metadata_intelligent(inv)
-            if meta["invoice_number"]:
-                invoice_cache[meta["invoice_number"]] = {
-                    "resolved_name": meta["customer_name"],
-                    "fallback_personal_name": meta["fallback_personal_name"]
-                }
+        all_pdf_drops.extend(uploaded_invoices)
+    if zoho_file.name.endswith('.pdf') and zoho_file not in evils: # Avoid duplicate object trace paths
+        all_pdf_drops.append(zoho_file)
+
+    for inv in all_pdf_drops:
+        meta = extract_invoice_metadata_intelligent(inv)
+        if meta["invoice_number"]:
+            invoice_cache[meta["invoice_number"]] = {
+                "resolved_name": meta["customer_name"],
+                "fallback_personal_name": meta["fallback_personal_name"]
+            }
+            invoice_sources_list.append(ZohoRecord(
+                customer_name=meta["customer_name"],
+                gross_amount=meta["gross_amount"],
+                merchant_fee=0.0,
+                invoice_number=meta["invoice_number"],
+                fallback_personal_name=meta["fallback_personal_name"]
+            ))
 
     # STEP C: PARSE BANK OF AMERICA REPORT
     if boa_file.name.endswith('.csv'):
@@ -270,7 +280,11 @@ else:
                 invoice_number=str(row['Invoice Number']).strip() if pd.notna(row.get('Invoice Number')) else None
             ))
 
-    # CRITICAL DEDUPLICATION LAYER: Merge datasets tracking unique invoice keys only
+    # INGESTION PROTECTION: Fallback directly to the localized invoice source pool if summary outputs 0 lines
+    if not raw_zoho_pool or sum(r.gross_amount for r in raw_zoho_pool) == 0:
+        raw_zoho_pool = invoice_sources_list
+
+    # CRITICAL DEDUPLICATION LAYER: Ensure strict unique matching sets based on invoice id keys
     zoho_records: List[ZohoRecord] = []
     seen_invoices = set()
 
@@ -279,12 +293,11 @@ else:
             zoho_records.append(r)
             seen_invoices.add(r.invoice_number)
 
-    # Cross-reference against invoice intelligence cache
+    # Cross-reference against invoice metadata cache
     for z_rec in zoho_records:
         if z_rec.invoice_number in invoice_cache:
             cache_hit = invoice_cache[z_rec.invoice_number]
-            # Use business name first, otherwise log personal fallback fields
-            z_rec.customer_name = cache_hit["resolved_name"] if cache_hit["resolved_name"] else None
+            z_rec.customer_name = cache_hit["resolved_name"] if cache_hit["resolved_name"] else z_rec.customer_name
             z_rec.fallback_personal_name = cache_hit["fallback_personal_name"]
 
     # =====================================================================
@@ -323,14 +336,14 @@ else:
         for z_rec in matched_zoho:
             current_boa_description = str(boa_rec.description)
             
-            # Hierarchical lookup checking strategies
+            # Hierarchical search query string resolution array
             query_name = z_rec.customer_name if z_rec.customer_name else (z_rec.fallback_personal_name if z_rec.fallback_personal_name else "")
             query_key = query_name.lower().strip()
             
             matched_master_key = next((k for k in master_lookup if k in query_key or query_key in k), None) if query_key else None
             
             if not matched_master_key:
-                # Suspense Fallback Routing Rules for Unrecorded Accounts
+                # Precise Fallback Rule mapping for missing entries
                 account_num = "21040102-B1000002"
                 account_type = "Ledger"
                 account_name = "Temporary Receipt"
