@@ -3,7 +3,7 @@ import pandas as pd
 from pypdf import PdfReader
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
-from datetime import datetime
+from datetime import datetime, date
 import re
 import io
 
@@ -44,7 +44,7 @@ D365_TEMPLATE_COLUMNS = [
 # 2. DATA UTILITIES & MODELS
 # =====================================================================
 class BOARecord(BaseModel):
-    date: datetime.date
+    date: date
     description: str
     net_amount: float
     source_account: str
@@ -220,79 +220,4 @@ else:
 
         processed_accounts = []
         
-        # 1. Generate Credit Lines
-        for z_rec in matched_zoho:
-            if not z_rec.customer_name:
-                validation_errors.append(f"❌ Missing Customer Profile Reference for Invoice Tracker ID: {z_rec.invoice_number}")
-                continue
-                
-            name_key = z_rec.customer_name.lower()
-            if name_key not in master_lookup:
-                validation_errors.append(f"❌ Unregistered Ledger Entity: '{z_rec.customer_name}' absent from database lookup.")
-                continue
-                
-            master_item = master_lookup[name_key]
-            processed_accounts.append(master_item)
-            
-            cash_code, _ = CASH_CODE_MAPPING.get(master_item.payment_term, CASH_CODE_MAPPING['fallback'])
-            prefix = "MPP " if cash_code == "AR002" else ""
-            
-            # Pure string extraction, decoupling any property paths
-            current_boa_description = str(boa_rec.description)
-            desc = f"{prefix}{master_item.account_number} {master_item.account_name}_{current_boa_description}"
-            
-            all_journal_lines.append({
-                "Date": boa_rec.date, "Voucher": "", "Account name": master_item.account_name,
-                "Company": "bwa", "Account type": "Customer", "Account": master_item.account_number,
-                "Posting Profile": "AutoPost", "Cash code": cash_code, "Description": desc,
-                "Debit": "", "Credit": z_rec.gross_amount, "Item sales tax group": "", "Sales tax code": "",
-                "Offset company": "bwa", "Bank Account Type": "Bank", "Offset account": offset_acct,
-                "Offset transaction text": "", "Currency": "USD", "Exchange rate": 1.00,
-                "Item sales tax group2": "", "Sales group": "AVATAX", "Withholding tax group": "",
-                "Release date": "", "Reversing entry": "No", "Reversing date": ""
-            })
-
-        # 2. Generate Grouped Debit Fee Line (Rule 3.3 Multiple Customer Payments)
-        if total_fees > 0 and len(processed_accounts) > 0:
-            current_boa_description = str(boa_rec.description)
-            if len(processed_accounts) == 1:
-                acc = processed_accounts[0]
-                fee_desc = f"Zoho Merchant Fee {acc.account_number} {acc.account_name}_{current_boa_description}"
-            else:
-                account_strings = ", ".join([f"{a.account_number} {a.account_name}" for a in processed_accounts])
-                fee_desc = f"Zoho Merchant Fee {account_strings}_{current_boa_description}"
-
-            all_journal_lines.append({
-                "Date": boa_rec.date, "Voucher": "", "Account name": "Outside Service (Finance)",
-                "Company": "bwa", "Account type": "Ledger", "Account": "43170111-U26C05001-B735350-UOA003",
-                "Posting Profile": "", "Cash code": "OSF005", "Description": fee_desc,
-                "Debit": total_fees, "Credit": "", "Item sales tax group": "", "Sales tax code": "",
-                "Offset company": "bwa", "Bank Account Type": "Bank", "Offset account": offset_acct,
-                "Offset transaction text": "", "Currency": "USD", "Exchange rate": 1.00,
-                "Item sales tax group2": "", "Sales group": "AVATAX", "Withholding tax group": "",
-                "Release date": "", "Reversing entry": "No", "Reversing date": ""
-            })
-
-    # -----------------------------------------------------------------
-    # STEP E: DISPLAY INTERACTIVE METRICS & EXPORT DOWNLOADS
-    # -----------------------------------------------------------------
-    if validation_errors:
-        st.error("### Pipeline Validation Discrepancies Checked")
-        for error in validation_errors:
-            st.markdown(error)
-
-    if all_journal_lines:
-        st.success("### Ready D365 Import Template Matrix Transformed Successfully!")
-        output_df = pd.DataFrame(all_journal_lines, columns=D365_TEMPLATE_COLUMNS)
-        st.dataframe(output_df)
-        
-        buffer = io.BytesIO()
-        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-            output_df.to_excel(writer, index=False, sheet_name="Journal Lines")
-        
-        st.download_button(
-            label="📥 Download Generated D365 Journal Import Sheet",
-            data=buffer.getvalue(),
-            file_name="D365_General_Journal_Import.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+        # 1. Generate Credit
