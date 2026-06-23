@@ -76,6 +76,7 @@ def clean_numeric_value(val: Any) -> float:
 # 3. COMPONENT PARSERS
 # =====================================================================
 def parse_invoice_pdf(pdf_file) -> Optional[str]:
+    """Rule 3.2: Extracts 'Bill to' customer name from invoice backup PDFs."""
     try:
         reader = PdfReader(pdf_file)
         full_text = ""
@@ -89,41 +90,51 @@ def parse_invoice_pdf(pdf_file) -> Optional[str]:
     return None
 
 def parse_zoho_pdf_safely(pdf_file) -> List[ZohoRecord]:
-    """Scans the lines of the Zoho PDF to capture Gross, Fees, Invoices, and Names contextually."""
+    """Layout-agnostic parser designed to pull individual line entries out of Zoho text blocks."""
     records = []
     try:
         reader = PdfReader(pdf_file)
+        full_text = ""
         for page in reader.pages:
-            text = page.extract_text() or ""
-            lines = text.split("\n")
+            full_text += page.extract_text() or ""
             
-            for line in lines:
-                line_str = line.strip()
-                if not line_str:
-                    continue
+        # Clean whitespaces and line breaks to normalize the stream layout
+        full_text_clean = " ".join(full_text.split())
+        
+        # Pull clean groupings of financial decimals and identifiers sequentially
+        # Pattern handles looking for blocks like "INV-060926000350 $1,000.00 $30.00"
+        item_patterns = re.findall(r"(INV-\d+|[A-Za-z0-9\-]+)\s+\$?([\d\.,]+)\s+\$?([\d\.,]+)", full_text_clean)
+        
+        for match in item_patterns:
+            inv_num = match[0].strip()
+            gross = clean_numeric_value(match[1])
+            fee = clean_numeric_value(match[2])
+            
+            if gross > 0:
+                records.append(ZohoRecord(
+                    customer_name=None, # To be resolved downstream via Invoice Master list routing rules
+                    gross_amount=gross,
+                    merchant_fee=fee,
+                    invoice_number=inv_num
+                ))
                 
-                # Check if this line contains numerical financial data rows
-                all_decimals = re.findall(r"\b\d+[\.,]\d{2}\b", line_str)
-                if len(all_decimals) >= 2:
-                    gross = clean_numeric_value(all_decimals[0])
-                    fee = clean_numeric_value(all_decimals[1])
-                    
-                    # Pull contextual tracking keys from the surrounding text blocks
-                    inv_match = re.search(r"(?:INV-\d+|[A-Za-z0-9\-]+)", line_str)
-                    inv_num = inv_match.group(0).strip() if inv_match else None
-                    
-                    cust_match = re.search(r"(?i)(?:customer|bill to)[:]?\s*([A-Za-z0-9\s\.\,]+)", line_str)
-                    cust_name = cust_match.group(1).strip() if cust_match else None
-                    
-                    if gross > 0:
-                        records.append(ZohoRecord(
-                            customer_name=cust_name,
-                            gross_amount=gross,
-                            merchant_fee=fee,
-                            invoice_number=inv_num
-                        ))
+        # Fallback structural block: if sequential string grouping patterns yield 0 rows, check global number distributions
+        if not records:
+            all_decimals = [clean_numeric_value(n) for n in re.findall(r"\b\d+(?:[\.,]\d{2})+\b", full_text_clean)]
+            unique_decimals = sorted(list(set([num for num in all_decimals if num > 0])), reverse=True)
+            
+            inv_match = re.search(r"(?i)(?:invoice\s*number|invoice\s*#|inv\s*#)[:]?\s*([A-Za-z0-9\-]+)", full_text_clean)
+            inv_num = inv_match.group(1).strip() if inv_match else None
+            
+            if len(unique_decimals) >= 2:
+                records.append(ZohoRecord(
+                    customer_name=None,
+                    gross_amount=unique_decimals[0],
+                    merchant_fee=unique_decimals[-1],
+                    invoice_number=inv_num
+                ))
     except Exception as e:
-        st.error(f"Error executing raw PDF string parsing arrays: {e}")
+        st.error(f"Error executing safe PDF parser engine: {e}")
         
     return records
 
@@ -224,123 +235,4 @@ else:
                 invoice_number=inv_num
             ))
 
-    # Apply manual invoice mapping overrides globally
-    for z_rec in zoho_records:
-        if not z_rec.customer_name or z_rec.customer_name.strip() == "" or "customer" in str(z_rec.customer_name).lower():
-            if z_rec.invoice_number in invoice_cache:
-                z_rec.customer_name = invoice_cache[z_rec.invoice_number]
-            elif invoice_cache:
-                z_rec.customer_name = list(invoice_cache.values())[0]
-
-    # =====================================================================
-    # STEP E: MATCHING ENGINE & INVARIANT ACCURACY VERIFICATION
-    # =====================================================================
-    all_journal_lines = []
-    validation_errors = []
-
-    # Dynamic Batching Pipeline: Processes days with 1, 10, or 30 rows seamlessly
-    for boa_rec in boa_records:
-        # Match Zoho payments to this BOA transaction using mathematical balance checking
-        matched_zoho = []
-        for z_rec in zoho_records:
-            # If this record matches individually or as part of an aggregate balance set, include it
-            if abs((z_rec.gross_amount - z_rec.merchant_fee) - boa_rec.net_amount) <= 0.02 or len(boa_records) == 1:
-                matched_zoho.append(z_rec)
-
-        if not matched_zoho:
-            continue
-
-        total_gross = sum(z.gross_amount for z in matched_zoho)
-        total_fees = sum(z.merchant_fee for z in matched_zoho)
-        calculated_net = total_gross - total_fees
-        
-        if abs(calculated_net - boa_rec.net_amount) > 0.01:
-            validation_errors.append(
-                f"🚨 **Mathematical Balance Discrepancy!** Bank Net: ${boa_rec.net_amount:.2f} | "
-                f"Calculated Target: ${calculated_net:.2f} (Gross Payments: ${total_gross:.2f}, Zoho Fees: ${total_fees:.2f})"
-            )
-            continue
-
-        offset_acct = OFFSET_ACCOUNT_ROUTING.get(boa_rec.source_account)
-        if not offset_acct:
-            validation_errors.append(f"❌ Unmapped Bank of America Routing Target Base Account: {boa_rec.source_account}")
-            continue
-
-        processed_accounts = []
-        
-        # 1. Generate Credit Lines
-        for z_rec in matched_zoho:
-            if not z_rec.customer_name:
-                validation_errors.append(f"❌ Missing Customer Profile Reference for Invoice Tracker ID: {z_rec.invoice_number}")
-                continue
-                
-            name_key = z_rec.customer_name.lower()
-            matched_master_key = next((k for k in master_lookup if k in name_key or name_key in k), None)
-            
-            if not matched_master_key:
-                validation_errors.append(f"❌ Unregistered Entity: '{z_rec.customer_name}' absent from Masterlist database.")
-                continue
-                
-            master_item = master_lookup[matched_master_key]
-            processed_accounts.append(master_item)
-            
-            term_info = CASH_CODE_MAPPING.get(master_item.payment_term, CASH_CODE_MAPPING['fallback'])
-            cash_code = term_info[0]
-            prefix = "MPP " if cash_code == "AR002" else ""
-            
-            current_boa_description = str(boa_rec.description)
-            desc = f"{prefix}{master_item.account_number} {master_item.account_name}_{current_boa_description}"
-            
-            all_journal_lines.append({
-                "Date": boa_rec.date, "Voucher": "", "Account name": master_item.account_name,
-                "Company": "bwa", "Account type": "Customer", "Account": master_item.account_number,
-                "Posting Profile": "AutoPost", "Cash code": cash_code, "Description": desc,
-                "Debit": "", "Credit": z_rec.gross_amount, "Item sales tax group": "", "Sales tax code": "",
-                "Offset company": "bwa", "Bank Account Type": "Bank", "Offset account": offset_acct,
-                "Offset transaction text": "", "Currency": "USD", "Exchange rate": 1.00,
-                "Item sales tax group2": "", "Sales tax group": "AVATAX", "Withholding tax group": "",
-                "Release date": "", "Reversing entry": "No", "Reversing date": ""
-            })
-
-        # 2. Generate Grouped Debit Fee Line (Rule 3.3 Multiple Customer Payments)
-        if total_fees > 0 and len(processed_accounts) > 0:
-            current_boa_description = str(boa_rec.description)
-            if len(processed_accounts) == 1:
-                acc = processed_accounts[0]
-                fee_desc = f"Zoho Merchant Fee {acc.account_number} {acc.account_name}_{current_boa_description}"
-            else:
-                account_strings = ", ".join([f"{a.account_number} {a.account_name}" for a in processed_accounts])
-                fee_desc = f"Zoho Merchant Fee {account_strings}_{current_boa_description}"
-
-            all_journal_lines.append({
-                "Date": boa_rec.date, "Voucher": "", "Account name": "Outside Service (Finance)",
-                "Company": "bwa", "Account type": "Ledger", "Account": "43170111-U26C05001-B735350-UOA003",
-                "Posting Profile": "", "Cash code": "OSF005", "Description": fee_desc,
-                "Debit": total_fees, "Credit": "", "Item sales tax group": "", "Sales tax code": "",
-                "Offset company": "bwa", "Bank Account Type": "Bank", "Offset account": offset_acct,
-                "Offset transaction text": "", "Currency": "USD", "Exchange rate": 1.00,
-                "Item sales tax group2": "", "Sales tax group": "AVATAX", "Withholding tax group": "",
-                "Release date": "", "Reversing entry": "No", "Reversing date": ""
-            })
-
-    # STEP F: DISPLAY INTERACTIVE METRICS & EXPORT DOWNLOADS
-    if validation_errors:
-        st.error("### Pipeline Validation Discrepancies Checked")
-        for error in validation_errors:
-            st.markdown(error)
-
-    if all_journal_lines:
-        st.success(f"### Transformed {len(all_journal_lines)} Journal Lines Successfully!")
-        output_df = pd.DataFrame(all_journal_lines, columns=D365_TEMPLATE_COLUMNS)
-        st.dataframe(output_df)
-        
-        buffer = io.BytesIO()
-        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-            output_df.to_excel(writer, index=False, sheet_name="Journal Lines")
-        
-        st.download_button(
-            label="📥 Download Generated D365 Journal Import Sheet",
-            data=buffer.getvalue(),
-            file_name="D365_General_Journal_Import.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+    # Apply manual invoice mapping overrides globally to
