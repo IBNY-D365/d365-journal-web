@@ -92,6 +92,7 @@ def normalize_name(name: str) -> str:
     return n
 
 def map_form_term_to_cash_code(term_str: str) -> str:
+    """Translates the 'Invoice Sent' column from Form DB into standardized Cash Code keys."""
     t = str(term_str).lower().strip()
     if "ap" in t or "due on receipt" in t: return "due-on-receipt"
     if "mpp" in t or "monthly" in t: return "monthly"
@@ -367,7 +368,6 @@ else:
     if not raw_zoho_pool or sum(r.gross_amount for r in raw_zoho_pool) == 0:
         raw_zoho_pool = invoice_sources_list
 
-    # FIX: Deduplication that preserves identical dollar amounts missing an invoice number!
     zoho_records: List[ZohoRecord] = []
     seen_invoices = set()
     
@@ -377,9 +377,10 @@ else:
                 zoho_records.append(r)
                 seen_invoices.add(r.invoice_number)
         else:
-            # Always append distinct non-invoiced payments (e.g. multiple $10.00 payments)
+            # Safely appends missing invoice entries without overwriting identical dollar amounts
             zoho_records.append(r)
 
+    # 100% Safe Cache Mapping - Avoids KeyErrors by using safe .get() handlers
     for z_rec in zoho_records:
         inv_key = z_rec.invoice_number if z_rec.invoice_number else z_rec.customer_name
         if inv_key and inv_key in invoice_cache:
