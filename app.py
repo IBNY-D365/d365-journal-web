@@ -82,6 +82,7 @@ def clean_numeric_value(val: Any) -> float:
         return 0.0
 
 def normalize_name(name: str) -> str:
+    """Removes LLC, INC, spaces, dots, and punctuation to guarantee exact cross-matching."""
     if not name or pd.isna(name):
         return ""
     n = str(name).lower()
@@ -184,13 +185,12 @@ def parse_zoho_summary_pdf_bulletproof(pdf_file) -> List[ZohoRecord]:
                 cust_name = re.sub(r'\.\.\.$', '', cust_name).strip() 
                 if cust_name and len(cust_name) < 2: cust_name = None
                 
-                if gross > 0 and not any((r.invoice_number == inv_id and inv_id is not None) or (r.gross_amount == gross and r.customer_name == cust_name) for r in records):
-                    records.append(ZohoRecord(
-                        customer_name=cust_name,
-                        gross_amount=gross,
-                        merchant_fee=fee,
-                        invoice_number=inv_id
-                    ))
+                records.append(ZohoRecord(
+                    customer_name=cust_name,
+                    gross_amount=gross,
+                    merchant_fee=fee,
+                    invoice_number=inv_id
+                ))
     except Exception as e:
         st.error(f"Error executing summary parser: {e}")
     return records
@@ -288,18 +288,18 @@ else:
     if uploaded_invoices:
         for inv in uploaded_invoices:
             meta = extract_invoice_metadata_intelligent(inv)
-            if meta["invoice_number"] or meta["customer_name"]:
-                inv_key = meta["invoice_number"] if meta["invoice_number"] else meta["customer_name"]
+            inv_key = meta.get("invoice_number") if meta.get("invoice_number") else meta.get("customer_name")
+            if inv_key:
                 invoice_cache[inv_key] = {
-                    "resolved_name": meta["customer_name"],
-                    "fallback_personal_name": meta["fallback_personal_name"]
+                    "resolved_name": meta.get("customer_name"),
+                    "fallback_personal_name": meta.get("fallback_personal_name")
                 }
                 invoice_sources_list.append(ZohoRecord(
-                    customer_name=meta["customer_name"],
-                    gross_amount=meta["gross_amount"],
+                    customer_name=meta.get("customer_name"),
+                    gross_amount=meta.get("gross_amount", 0.0),
                     merchant_fee=0.0,
-                    invoice_number=meta["invoice_number"],
-                    fallback_personal_name=meta["fallback_personal_name"]
+                    invoice_number=meta.get("invoice_number"),
+                    fallback_personal_name=meta.get("fallback_personal_name")
                 ))
 
     # -----------------------------------------------------------------
@@ -367,19 +367,26 @@ else:
     if not raw_zoho_pool or sum(r.gross_amount for r in raw_zoho_pool) == 0:
         raw_zoho_pool = invoice_sources_list
 
-    zoho_deduped_dict = {}
+    # FIX: Deduplication that preserves identical dollar amounts missing an invoice number!
+    zoho_records: List[ZohoRecord] = []
+    seen_invoices = set()
+    
     for r in raw_zoho_pool:
-        key = r.invoice_number if r.invoice_number else f"{r.customer_name}_{r.gross_amount}"
-        if key not in zoho_deduped_dict:
-            zoho_deduped_dict[key] = r
-            
-    zoho_records = list(zoho_deduped_dict.values())
+        if r.invoice_number:
+            if r.invoice_number not in seen_invoices:
+                zoho_records.append(r)
+                seen_invoices.add(r.invoice_number)
+        else:
+            # Always append distinct non-invoiced payments (e.g. multiple $10.00 payments)
+            zoho_records.append(r)
 
     for z_rec in zoho_records:
-        if z_rec.invoice_number in invoice_cache:
-            cache_hit = invoice_cache[z_rec.invoice_number]
-            z_rec.customer_name = cache_hit["resolved_name"] if cache_hit["resolved_name"] else z_rec.customer_name
-            z_rec.fallback_personal_name = cache_hit["fallback_personal_name"]
+        inv_key = z_rec.invoice_number if z_rec.invoice_number else z_rec.customer_name
+        if inv_key and inv_key in invoice_cache:
+            cache_hit = invoice_cache[inv_key]
+            if isinstance(cache_hit, dict):
+                z_rec.customer_name = cache_hit.get("resolved_name") or z_rec.customer_name
+                z_rec.fallback_personal_name = cache_hit.get("fallback_personal_name") or z_rec.fallback_personal_name
 
     # =====================================================================
     # STEP F: TRANSACTION PROCESSING & ONE-TO-ONE BOA ANCHORING
