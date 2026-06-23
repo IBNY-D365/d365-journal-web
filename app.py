@@ -185,4 +185,166 @@ else:
     
     desc_target = next((c for c in ['description', 'transaction description', 'payee', 'memo'] if c in boa_df.columns), None)
     date_target = next((c for c in ['posting date', 'date', 'transaction date'] if c in boa_df.columns), None)
-    amount_target = next((c for c in ['net amount', 'amount', 'net_amount'] if c in boa_df
+    amount_target = next((c for c in ['net amount', 'amount', 'net_amount'] if c in boa_df.columns), None)
+    account_target = next((c for c in ['source account', 'account', 'account number', 'account_number'] if c in boa_df.columns), None)
+            
+    if desc_target is None:
+        st.error("❌ Could not find a transaction 'Description' column variant in your Bank of America report. Please check file headers.")
+        st.stop()
+
+    boa_records: List[BOARecord] = []
+    for _, row in boa_df.iterrows():
+        row_description = str(row.get(desc_target, ''))
+        
+        if "ZOHO" in row_description.upper():  # Rule 3.1 Filtering Logic
+            parsed_date = datetime.today().date()
+            if date_target and pd.notna(row[date_target]):
+                try:
+                    parsed_date = pd.to_datetime(row[date_target]).date()
+                except Exception:
+                    pass
+                    
+            boa_records.append(BOARecord(
+                date=parsed_date,
+                description=row_description,
+                net_amount=clean_numeric_value(row.get(amount_target, 0.0)),
+                source_account=str(row.get(account_target, '')).strip() if account_target else ""
+            ))
+
+    # -----------------------------------------------------------------
+    # STEP D: DYNAMIC PARSING FOR ZOHO SUMMARY (PDF, EXCEL & CSV SUPPORT)
+    # -----------------------------------------------------------------
+    zoho_records: List[ZohoRecord] = []
+    
+    if zoho_file.name.endswith('.pdf'):
+        zoho_records = parse_zoho_pdf(zoho_file)
+    else:
+        if zoho_file.name.endswith('.csv'):
+            zoho_df = pd.read_csv(zoho_file)
+        else:
+            zoho_df = pd.read_excel(zoho_file)
+            
+        zoho_df.columns = [str(c).strip() for c in zoho_df.columns]
+        
+        for _, row in zoho_df.iterrows():
+            cust_name = str(row['Customer']).strip() if pd.notna(row.get('Customer')) else None
+            inv_num = str(row['Invoice Number']).strip() if pd.notna(row.get('Invoice Number')) else None
+            
+            if not cust_name and inv_num in invoice_cache:
+                cust_name = invoice_cache[inv_num]
+                
+            zoho_records.append(ZohoRecord(
+                customer_name=cust_name,
+                gross_amount=clean_numeric_value(row.get('Gross Amount', 0.0)),
+                merchant_fee=clean_numeric_value(row.get('Merchant Fee', 0.0)),
+                invoice_number=inv_num
+            ))
+
+    # -----------------------------------------------------------------
+    # STEP E: PROCESSING EXECUTION & VALIDATION MATRIX
+    # -----------------------------------------------------------------
+    all_journal_lines = []
+    validation_errors = []
+
+    for boa_rec in boa_records:
+        matched_zoho = zoho_records  
+        
+        total_gross = sum(z.gross_amount for z in matched_zoho)
+        total_fees = sum(z.merchant_fee for z in matched_zoho)
+        calculated_net = total_gross - total_fees
+        
+        # If the text parsing pulled a row with zeroes, bypass verification and prompt for file checking
+        if total_gross == 0 and total_fees == 0:
+            validation_errors.append("⚠️ **Data Ingestion Alert:** No financial entries found in Zoho PDF. Please check the format or upload customer invoices to verify names.")
+            continue
+            
+        if abs(calculated_net - boa_rec.net_amount) > 0.01:
+            validation_errors.append(
+                f"🚨 **Mathematical Balance Discrepancy!** Bank Net: ${boa_rec.net_amount:.2f} | "
+                f"Calculated Target: ${calculated_net:.2f} (Gross Payments: ${total_gross:.2f}, Zoho Fees: ${total_fees:.2f})"
+            )
+            continue
+
+        offset_acct = OFFSET_ACCOUNT_ROUTING.get(boa_rec.source_account)
+        if not offset_acct:
+            validation_errors.append(f"❌ Unmapped Bank of America Routing Target Base Account: {boa_rec.source_account}")
+            continue
+
+        processed_accounts = []
+        
+        # 1. Generate Credit Lines
+        for z_rec in matched_zoho:
+            if not z_rec.customer_name:
+                validation_errors.append(f"❌ Missing Customer Profile Reference for Invoice Tracker ID: {z_rec.invoice_number}")
+                continue
+                
+            name_key = z_rec.customer_name.lower()
+            if name_key not in master_lookup:
+                validation_errors.append(f"❌ Unregistered Entity: '{z_rec.customer_name}' absent from Masterlist database.")
+                continue
+                
+            master_item = master_lookup[name_key]
+            processed_accounts.append(master_item)
+            
+            term_info = CASH_CODE_MAPPING.get(master_item.payment_term, CASH_CODE_MAPPING['fallback'])
+            cash_code = term_info[0] # Fixed Tuple index access mapping pattern safely
+            prefix = "MPP " if cash_code == "AR002" else ""
+            
+            current_boa_description = str(boa_rec.description)
+            desc = f"{prefix}{master_item.account_number} {master_item.account_name}_{current_boa_description}"
+            
+            all_journal_lines.append({
+                "Date": boa_rec.date, "Voucher": "", "Account name": master_item.account_name,
+                "Company": "bwa", "Account type": "Customer", "Account": master_item.account_number,
+                "Posting Profile": "AutoPost", "Cash code": cash_code, "Description": desc,
+                "Debit": "", "Credit": z_rec.gross_amount, "Item sales tax group": "", "Sales tax code": "",
+                "Offset company": "bwa", "Bank Account Type": "Bank", "Offset account": offset_acct,
+                "Offset transaction text": "", "Currency": "USD", "Exchange rate": 1.00,
+                "Item sales tax group2": "", "Sales group": "AVATAX", "Withholding tax group": "",
+                "Release date": "", "Reversing entry": "No", "Reversing date": ""
+            })
+
+        # 2. Generate Grouped Debit Fee Line (Rule 3.3 Multiple Customer Payments)
+        if total_fees > 0 and len(processed_accounts) > 0:
+            current_boa_description = str(boa_rec.description)
+            if len(processed_accounts) == 1:
+                acc = processed_accounts[0]
+                fee_desc = f"Zoho Merchant Fee {acc.account_number} {acc.account_name}_{current_boa_description}"
+            else:
+                account_strings = ", ".join([f"{a.account_number} {a.account_name}" for a in processed_accounts])
+                fee_desc = f"Zoho Merchant Fee {account_strings}_{current_boa_description}"
+
+            all_journal_lines.append({
+                "Date": boa_rec.date, "Voucher": "", "Account name": "Outside Service (Finance)",
+                "Company": "bwa", "Account type": "Ledger", "Account": "43170111-U26C05001-B735350-UOA003",
+                "Posting Profile": "", "Cash code": "OSF005", "Description": fee_desc,
+                "Debit": total_fees, "Credit": "", "Item sales tax group": "", "Sales tax code": "",
+                "Offset company": "bwa", "Bank Account Type": "Bank", "Offset account": offset_acct,
+                "Offset transaction text": "", "Currency": "USD", "Exchange rate": 1.00,
+                "Item sales tax group2": "", "Sales group": "AVATAX", "Withholding tax group": "",
+                "Release date": "", "Reversing entry": "No", "Reversing date": ""
+            })
+
+    # -----------------------------------------------------------------
+    # STEP F: DISPLAY INTERACTIVE METRICS & EXPORT DOWNLOADS
+    # -----------------------------------------------------------------
+    if validation_errors:
+        st.error("### Pipeline Validation Discrepancies Checked")
+        for error in validation_errors:
+            st.markdown(error)
+
+    if all_journal_lines:
+        st.success(f"### Transformed {len(all_journal_lines)} Journal Lines Successfully!")
+        output_df = pd.DataFrame(all_journal_lines, columns=D365_TEMPLATE_COLUMNS)
+        st.dataframe(output_df)
+        
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+            output_df.to_excel(writer, index=False, sheet_name="Journal Lines")
+        
+        st.download_button(
+            label="📥 Download Generated D365 Journal Import Sheet",
+            data=buffer.getvalue(),
+            file_name="D365_General_Journal_Import.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
