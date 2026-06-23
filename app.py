@@ -61,7 +61,7 @@ class AccountMasterItem(BaseModel):
     account_number: str
     account_name: str
     payment_term: str
-    cs_ps_ticket: Optional[str] = None  # NEW: Added field for ticket matching
+    cs_ps_ticket: Optional[str] = None
 
 def clean_numeric_value(val: Any) -> float:
     if pd.isna(val) or val is None:
@@ -79,11 +79,8 @@ def normalize_entity_name(name: str) -> str:
     if not name or pd.isna(name):
         return ""
     name = str(name).lower()
-    # Strip punctuation
     name = re.sub(r'[.,\-\'"&]', '', name)
-    # Strip corporate suffixes globally (using word boundaries)
     name = re.sub(r'\b(llc|inc|ltd|corp|co|pllc|pc)\b', '', name)
-    # Clean up any leftover double spaces
     return " ".join(name.split())
 
 # =====================================================================
@@ -187,7 +184,6 @@ else:
     master_headers_lower = {str(col).lower(): str(col) for col in master_df.columns}
     
     ml_name_col = next((master_headers_lower[k] for k in ['account name', 'name', 'customer name'] if k in master_headers_lower), None)
-    # Safely target Account Number columns to prevent KeyError
     ml_num_col = next((master_headers_lower[k] for k in ['account', 'account #', 'account number', 'account no'] if k in master_headers_lower), None)
     ml_term_col = next((master_headers_lower[k] for k in ['payment term', 'payment terms', 'terms'] if k in master_headers_lower), None)
     ml_ticket_col = next((master_headers_lower[k] for k in ['cs/ps ticket', 'ticket'] if k in master_headers_lower), None)
@@ -201,12 +197,11 @@ else:
     
     for _, row in master_df.iterrows():
         name_val = str(row[ml_name_col]).strip()
-        name_key = normalize_entity_name(name_val)  # Apply LLC/INC cleanup
+        name_key = normalize_entity_name(name_val)
         
         num_val = str(row[ml_num_col]).strip()
         term_val = str(row.get(ml_term_col, 'due-on-receipt')).strip().lower() if ml_term_col else 'due-on-receipt'
         
-        # Capture CS/PS Ticket
         ticket_val = str(row[ml_ticket_col]).strip() if ml_ticket_col and pd.notna(row[ml_ticket_col]) else ""
         
         item = AccountMasterItem(
@@ -219,35 +214,30 @@ else:
         if name_key:
             master_lookup[name_key] = item
             
-        # Register the CS/PS ticket name for fallback searches
         if ticket_val:
             ticket_key = normalize_entity_name(ticket_val)
             if ticket_key:
                 ticket_lookup[ticket_key] = item
 
+    # FIXED LOGIC: Only parse the explicitly uploaded extra invoices here to build our strict filter.
     invoice_cache = {}
     invoice_sources_list = []
     
-    all_pdf_drops = []
     if uploaded_invoices:
-        all_pdf_drops.extend(uploaded_invoices)
-    if zoho_file.name.endswith('.pdf'):
-        all_pdf_drops.append(zoho_file)
-
-    for inv in all_pdf_drops:
-        meta = extract_invoice_metadata_intelligent(inv)
-        if meta["invoice_number"]:
-            invoice_cache[meta["invoice_number"]] = {
-                "resolved_name": meta["customer_name"],
-                "fallback_personal_name": meta["fallback_personal_name"]
-            }
-            invoice_sources_list.append(ZohoRecord(
-                customer_name=meta["customer_name"],
-                gross_amount=meta["gross_amount"],
-                merchant_fee=0.0,
-                invoice_number=meta["invoice_number"],
-                fallback_personal_name=meta["fallback_personal_name"]
-            ))
+        for inv in uploaded_invoices:
+            meta = extract_invoice_metadata_intelligent(inv)
+            if meta["invoice_number"]:
+                invoice_cache[meta["invoice_number"]] = {
+                    "resolved_name": meta["customer_name"],
+                    "fallback_personal_name": meta["fallback_personal_name"]
+                }
+                invoice_sources_list.append(ZohoRecord(
+                    customer_name=meta["customer_name"],
+                    gross_amount=meta["gross_amount"],
+                    merchant_fee=0.0,
+                    invoice_number=meta["invoice_number"],
+                    fallback_personal_name=meta["fallback_personal_name"]
+                ))
 
     # STEP C: PARSE BANK OF AMERICA REPORT
     if boa_file.name.endswith('.csv'):
@@ -308,6 +298,7 @@ else:
     if not raw_zoho_pool or sum(r.gross_amount for r in raw_zoho_pool) == 0:
         raw_zoho_pool = invoice_sources_list
 
+    # Strict tracking deduplication layer targeting unique invoice strings only
     zoho_records: List[ZohoRecord] = []
     seen_invoices = set()
 
@@ -315,6 +306,24 @@ else:
         if r.invoice_number and r.invoice_number not in seen_invoices:
             zoho_records.append(r)
             seen_invoices.add(r.invoice_number)
+
+    # --- NEW STRICT FILTERING LOGIC ---
+    # If you uploaded specific invoices, filter the Zoho Summary noise out. Only keep exactly what you uploaded.
+    if invoice_cache:
+        filtered_zoho = []
+        target_invoices = set(invoice_cache.keys())
+        
+        for z in zoho_records:
+            if z.invoice_number in target_invoices:
+                filtered_zoho.append(z)
+        
+        # Inject any uploaded invoices that the summary parser completely missed
+        found_invoices = set(z.invoice_number for z in filtered_zoho)
+        for inv_source in invoice_sources_list:
+            if inv_source.invoice_number not in found_invoices:
+                filtered_zoho.append(inv_source)
+                
+        zoho_records = filtered_zoho
 
     for z_rec in zoho_records:
         if z_rec.invoice_number in invoice_cache:
@@ -357,24 +366,20 @@ else:
         # 1. Generate Credit Lines (Customer Segment)
         for z_rec in matched_zoho:
             current_boa_description = str(boa_rec.description)
-            
             master_item = None
             
-            # --- MATCHING LOGIC STAGE 1: Match by Company Name ---
             if z_rec.customer_name:
                 query_key = normalize_entity_name(z_rec.customer_name)
                 matched_master_key = next((k for k in master_lookup if k and (k == query_key or k in query_key or query_key in k)), None)
                 if matched_master_key:
                     master_item = master_lookup[matched_master_key]
             
-            # --- MATCHING LOGIC STAGE 2: Fallback to CS/PS Ticket using Personal Name ---
             if not master_item and z_rec.fallback_personal_name:
                 fallback_key = normalize_entity_name(z_rec.fallback_personal_name)
                 matched_ticket_key = next((k for k in ticket_lookup if k and (k == fallback_key or k in fallback_key or fallback_key in k)), None)
                 if matched_ticket_key:
                     master_item = ticket_lookup[matched_ticket_key]
 
-            # --- PROCESS THE RESULT ---
             if not master_item:
                 account_num = "21040102-B1000002"
                 account_type = "Ledger"
