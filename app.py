@@ -278,10 +278,10 @@ else:
         
         # CRITICAL FIX 1: Blocks negative subscriptions (-$389.40) to prevent the 7-row duplication error
         if "ZOHO PAYMENTS" in row_description.upper() and row_net_amount > 0:
-            parsed_date = datetime.today().date()
+            parsed_date = datetime.today().strftime('%m/%d/%Y')
             if date_target and pd.notna(row[date_target]):
                 try:
-                    parsed_date = pd.to_datetime(row[date_target]).date()
+                    parsed_date = pd.to_datetime(row[date_target]).strftime('%m/%d/%Y')
                 except Exception:
                     pass
             boa_records.append(BOARecord(
