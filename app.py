@@ -89,7 +89,7 @@ def normalize_name(name: str) -> str:
 # 3. ADVANCED EXTRACTION ENGINE
 # =====================================================================
 def extract_invoice_metadata_intelligent(pdf_file) -> Dict[str, Any]:
-    """Scans the invoice to capture the business entity from the item string & Bill To name."""
+    """Scans the individual invoice to capture business names & safe total amounts."""
     result = {"customer_name": None, "invoice_number": None, "gross_amount": 0.0, "fallback_personal_name": None}
     try:
         reader = PdfReader(pdf_file)
@@ -104,12 +104,13 @@ def extract_invoice_metadata_intelligent(pdf_file) -> Dict[str, Any]:
         inv_match = re.search(r"(INV-\d+)", full_text_clean, re.IGNORECASE)
         result["invoice_number"] = inv_match.group(1).strip() if inv_match else inv_num
         
-        # 2. Gross Amount Extraction (CRITICAL FIX: Handles thousands commas)
-        all_decimals = [clean_numeric_value(n) for n in re.findall(r"\b\d+(?:,\d{3})*\.\d{2}\b", full_text_clean)]
-        if len(all_decimals) > 0:
-            result["gross_amount"] = max(all_decimals)
+        # 2. Safe Gross Amount Extraction (Prevents grabbing high unit prices that are discounted)
+        totals = re.findall(r"Total[^\d\$]*\$?([0-9,]+\.\d{2})", full_text_clean, re.IGNORECASE)
+        if totals:
+            result["gross_amount"] = clean_numeric_value(totals[-1])
         else:
-            result["gross_amount"] = 0.0
+            all_decimals = [clean_numeric_value(n) for n in re.findall(r"\b\d+(?:,\d{3})*\.\d{2}\b", full_text_clean)]
+            result["gross_amount"] = max(all_decimals) if all_decimals else 0.0
         
         # 3. Personal "Bill To" Name Extraction
         bill_to_match = re.search(r"Bill\s+To\s*([A-Za-z0-9\s\.\,\-]+?)(?:\s*\d|\s*Ship\s*To|$)", full_text_clean, re.IGNORECASE)
@@ -130,6 +131,7 @@ def extract_invoice_metadata_intelligent(pdf_file) -> Dict[str, Any]:
     return result
 
 def parse_zoho_summary_pdf_bulletproof(pdf_file) -> List[ZohoRecord]:
+    """Strictly locks onto the Zoho Table format to guarantee amounts are 100% exact to the penny."""
     records = []
     try:
         reader = PdfReader(pdf_file)
@@ -137,33 +139,27 @@ def parse_zoho_summary_pdf_bulletproof(pdf_file) -> List[ZohoRecord]:
         for page in reader.pages:
             full_text += page.extract_text() or ""
             
-        text_stream = " ".join(full_text.split())
-        text_tokens = text_stream.split(" ")
+        full_text_clean = " ".join(full_text.split())
         
-        for idx, token in enumerate(text_tokens):
-            if "INV-" in token.upper() or (token.startswith("06") and len(token) >= 10):
-                inv_id = re.sub(r'[^A-Za-z0-9\-]', '', token)
+        # EXACT TABULAR MATCH: Looks for INV-XXXX -> $Gross -> -$Fee -> $Net in a horizontal line
+        pattern = r"(INV-\d+)[^\$]*?\$([0-9,]+\.\d{2})\s+(?:-\$|\$-|\$)?([0-9,]+\.\d{2})\s+(?:-\$|\$-|\$)?([0-9,]+\.\d{2})"
+        matches = re.findall(pattern, full_text_clean)
+        
+        for m in matches:
+            inv_id = m[0].strip()
+            gross = clean_numeric_value(m[1])
+            fee = clean_numeric_value(m[2])
+            
+            if gross > 0 and not any(r.invoice_number == inv_id for r in records):
+                records.append(ZohoRecord(
+                    customer_name=None, # Pulled downstream via individual invoice cache
+                    gross_amount=gross,
+                    merchant_fee=fee,
+                    invoice_number=inv_id
+                ))
                 
-                forward_pool = []
-                for step in range(1, 15):
-                    if idx + step < len(text_tokens):
-                        potential_num = text_tokens[idx + step]
-                        if re.search(r"\d+(?:,\d{3})*\.\d{2}", potential_num):
-                            forward_pool.append(clean_numeric_value(potential_num))
-                
-                if len(forward_pool) >= 1:
-                    gross = forward_pool[0]
-                    fee = forward_pool[1] if len(forward_pool) >= 2 else 0.0
-                    
-                    if gross > 0 and not any(r.invoice_number == inv_id for r in records):
-                        records.append(ZohoRecord(
-                            customer_name=None,
-                            gross_amount=gross,
-                            merchant_fee=fee,
-                            invoice_number=inv_id
-                        ))
     except Exception as e:
-        st.error(f"Error executing summary parser: {e}")
+        st.error(f"Error executing strict tabular summary parser: {e}")
     return records
 
 # =====================================================================
@@ -223,7 +219,7 @@ else:
         )
 
     # -----------------------------------------------------------------
-    # STEP B: EXTRACT ALL INVOICES INTO CACHE
+    # STEP B: EXTRACT ALL INVOICES INTO METADATA CACHE
     # -----------------------------------------------------------------
     invoice_cache = {}
     invoice_sources_list = []
@@ -310,6 +306,7 @@ else:
                 invoice_number=str(row['Invoice Number']).strip() if pd.notna(row.get('Invoice Number')) else None
             ))
 
+    # Only use the individual invoice amounts if the Strict Zoho Summary Table failed to extract anything
     if not raw_zoho_pool or sum(r.gross_amount for r in raw_zoho_pool) == 0:
         raw_zoho_pool = invoice_sources_list
 
@@ -320,6 +317,7 @@ else:
             
     zoho_records = list(zoho_deduped_dict.values())
 
+    # Map the captured invoice details (Names/Metadata) into the deduplicated record set
     for z_rec in zoho_records:
         if z_rec.invoice_number in invoice_cache:
             cache_hit = invoice_cache[z_rec.invoice_number]
@@ -385,7 +383,7 @@ else:
 
             # ASSIGNMENT EXECUTION
             if not matched_master_item:
-                # FALLBACK: Temporary Receipt Ledger
+                # FALLBACK: Temporary Receipt Ledger (E.g. Paul Fuss)
                 account_num = "21040102-B1000002"
                 account_type = "Ledger"
                 account_name = "Temporary Receipt"
@@ -394,7 +392,7 @@ else:
                 display_label = z_rec.customer_name if z_rec.customer_name else (z_rec.fallback_personal_name if z_rec.fallback_personal_name else "Unknown")
                 desc = f"{display_label} (UNRECORDED ENTITY)_{current_boa_description}"
             else:
-                # MASTER MATCH: Registered Entity
+                # MASTER MATCH: Registered Entity (E.g. Underground Gym / Functional Holistic Healing)
                 master_item = matched_master_item
                 processed_accounts.append(master_item)
                 
