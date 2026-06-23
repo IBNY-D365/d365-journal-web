@@ -178,6 +178,7 @@ st.title("D365 General Journal Automation Engine")
 st.subheader("Daily Operational Reconciliations Matrix")
 
 MASTERLIST_PATH = "Account Masterlist.xlsx"
+
 if not os.path.exists(MASTERLIST_PATH):
     st.error(f"❌ Core configuration file {MASTERLIST_PATH} missing from your GitHub repository root folder. Please commit it to your repository.")
     st.stop()
@@ -275,7 +276,6 @@ else:
         row_description = str(row.get(desc_target, ''))
         row_net_amount = clean_numeric_value(row.get(amount_target, 0.0))
         
-        # CRITICAL FIX 1: Blocks negative subscriptions (-$389.40) to prevent the 7-row duplication error
         if "ZOHO PAYMENTS" in row_description.upper() and row_net_amount > 0:
             parsed_date = datetime.today().date()
             if date_target and pd.notna(row[date_target]):
@@ -310,15 +310,15 @@ else:
                 invoice_number=str(row['Invoice Number']).strip() if pd.notna(row.get('Invoice Number')) else None
             ))
 
-    # CRITICAL FIX 2: Priority Merge - Use uploaded invoices as the absolute source of truth for amounts & names
+    if not raw_zoho_pool or sum(r.gross_amount for r in raw_zoho_pool) == 0:
+        raw_zoho_pool = invoice_sources_list
+
     zoho_deduped_dict = {}
 
-    # Priority 1: Direct Invoices
     for inv_rec in invoice_sources_list:
         if inv_rec.invoice_number:
             zoho_deduped_dict[inv_rec.invoice_number] = inv_rec
             
-    # Priority 2: Zoho Summary (fills in any missing lines not uploaded)
     for r in raw_zoho_pool:
         if r.invoice_number and r.invoice_number not in zoho_deduped_dict:
             zoho_deduped_dict[r.invoice_number] = r
@@ -332,3 +332,126 @@ else:
     validation_errors = []
 
     for boa_rec in boa_records:
+        matched_zoho = [z for z in zoho_records if z.gross_amount > 0]
+        if not matched_zoho:
+            continue
+
+        total_gross = sum(z.gross_amount for z in matched_zoho)
+        total_fees = round(total_gross - boa_rec.net_amount, 2)
+        
+        if len(matched_zoho) >= 1:
+            each_fee = round(total_fees / len(matched_zoho), 2)
+            for z in matched_zoho:
+                z.merchant_fee = each_fee
+
+        if total_gross == 0:
+            validation_errors.append("⚠️ **Data Ingestion Alert:** System failed to extract gross amounts. Ensure invoices are uploaded.")
+            continue
+            
+        if total_fees < 0:
+            validation_errors.append(f"🚨 **Mathematical Balance Discrepancy!** Bank Net (${boa_rec.net_amount:.2f}) is greater than Total Gross Payments (${total_gross:.2f}).")
+            continue
+
+        offset_acct = OFFSET_ACCOUNT_ROUTING.get(boa_rec.source_account, "B1000002")
+        processed_accounts = []
+        
+        # 1. Generate Credit Lines (Customer Segment)
+        for z_rec in matched_zoho:
+            current_boa_description = str(boa_rec.description)
+            
+            norm_biz = normalize_name(z_rec.customer_name)
+            norm_per = normalize_name(z_rec.fallback_personal_name)
+            
+            matched_master_item = None
+            
+            for item in master_lookup.values():
+                if norm_biz and (norm_biz == item.norm_name or (len(norm_biz) >= 5 and (norm_biz in item.norm_name or item.norm_name in norm_biz))):
+                    matched_master_item = item
+                    break
+                if norm_per and (norm_per == item.norm_name or (len(norm_per) >= 5 and (norm_per in item.norm_name or item.norm_name in norm_per))):
+                    matched_master_item = item
+                    break
+                if item.norm_ticket:
+                    if norm_per and (norm_per == item.norm_ticket or (len(norm_per) >= 5 and (norm_per in item.norm_ticket or item.norm_ticket in norm_per))):
+                        matched_master_item = item
+                        break
+                    if norm_biz and (norm_biz == item.norm_ticket or (len(norm_biz) >= 5 and (norm_biz in item.norm_ticket or item.norm_ticket in norm_biz))):
+                        matched_master_item = item
+                        break
+
+            # ASSIGNMENT EXECUTION
+            if not matched_master_item:
+                account_num = "21040102-B1000002"
+                account_type = "Ledger"
+                account_name = "Temporary Receipt"
+                cash_code = "AR012"
+                
+                display_label = z_rec.customer_name if z_rec.customer_name else (z_rec.fallback_personal_name if z_rec.fallback_personal_name else "Unknown")
+                desc = f"{display_label} (UNRECORDED ENTITY)_{current_boa_description}"
+            else:
+                master_item = matched_master_item
+                processed_accounts.append(master_item)
+                
+                term_info = CASH_CODE_MAPPING.get(master_item.payment_term, CASH_CODE_MAPPING['fallback'])
+                cash_code = term_info[0]
+                prefix = "MPP " if cash_code == "AR002" else ""
+                
+                account_num = master_item.account_number
+                account_type = "Customer"
+                account_name = master_item.account_name
+                desc = f"{prefix}{account_num} {account_name}_{current_boa_description}"
+            
+            all_journal_lines.append({
+                "Date": boa_rec.date, "Voucher": "", "Account name": account_name,
+                "Company": "bwa", "Account type": account_type, "Account": account_num,
+                "Posting Profile": "AutoPost" if account_type == "Customer" else "", "Cash code": cash_code, "Description": desc,
+                "Debit": "", "Credit": z_rec.gross_amount, "Item sales tax group": "", "Sales tax code": "",
+                "Offset company": "bwa", "Bank Account Type": "Bank", "Offset account": offset_acct,
+                "Offset transaction text": "", "Currency": "USD", "Exchange rate": 1.00,
+                "Item sales tax group2": "", "Sales tax group": "AVATAX", "Withholding tax group": "",
+                "Release date": "", "Reversing entry": "No", "Reversing date": ""
+            })
+
+        # 2. Generate Consolidated Grouped Debit Fee Line
+        if total_fees > 0:
+            current_boa_description = str(boa_rec.description)
+            if len(processed_accounts) == 1:
+                acc = processed_accounts[0]
+                fee_desc = f"Zoho Merchant Fee {acc.account_number} {acc.account_name}_{current_boa_description}"
+            elif len(processed_accounts) > 1:
+                account_strings = ", ".join([f"{a.account_number} {a.account_name}" for a in processed_accounts])
+                fee_desc = f"Zoho Merchant Fee {account_strings}_{current_boa_description}"
+            else:
+                fee_desc = f"Zoho Merchant Fee (Unresolved Suspense Pool Batch)_{current_boa_description}"
+
+            all_journal_lines.append({
+                "Date": boa_rec.date, "Voucher": "", "Account name": "Outside Service (Finance)",
+                "Company": "bwa", "Account type": "Ledger", "Account": "43170111-U26C05001-B735350-UOA003",
+                "Posting Profile": "", "Cash code": "OSF005", "Description": fee_desc,
+                "Debit": total_fees, "Credit": "", "Item sales tax group": "", "Sales tax code": "",
+                "Offset company": "bwa", "Bank Account Type": "Bank", "Offset account": offset_acct,
+                "Offset transaction text": "", "Currency": "USD", "Exchange rate": 1.00,
+                "Item sales tax group2": "", "Sales tax group": "AVATAX", "Withholding tax group": "",
+                "Release date": "", "Reversing entry": "No", "Reversing date": ""
+            })
+
+if validation_errors:
+    st.error("### Pipeline Validation Discrepancies Checked")
+    for error in validation_errors:
+        st.markdown(error)
+
+if all_journal_lines:
+    st.success(f"### Transformed {len(all_journal_lines)} Journal Lines Successfully!")
+    output_df = pd.DataFrame(all_journal_lines, columns=D365_TEMPLATE_COLUMNS)
+    st.dataframe(output_df)
+    
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+        output_df.to_excel(writer, index=False, sheet_name="Journal Lines")
+    
+    st.download_button(
+        label="📥 Download Generated D365 Journal Import Sheet",
+        data=buffer.getvalue(),
+        file_name="D365_General_Journal_Import.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
