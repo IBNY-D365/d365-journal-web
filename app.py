@@ -9,7 +9,7 @@ import io
 import os
 
 # =====================================================================
-# 1. HARDCODED CONFIGURATIONS & MAPPINGS
+# 1. HARDCODED CONFIGURATIONS & MAPPINGS (From Specification Document)
 # =====================================================================
 CASH_CODE_MAPPING = {
     "due-on-receipt": ("AR001", "AR Collection_AP"),
@@ -41,12 +41,6 @@ D365_TEMPLATE_COLUMNS = [
     "Release date", "Reversing entry", "Reversing date"
 ]
 
-# GitHub Repository File Paths
-MASTERLIST_PATH = "Account Masterlist.xlsx"
-MASTERLIST_PATH_CSV = "Account Masterlist.csv"
-FORM_DB_PATH = "Form Master DB.xlsx"
-FORM_DB_PATH_CSV = "Form Master DB.csv"
-
 # =====================================================================
 # 2. DATA UTILITIES & MODELS
 # =====================================================================
@@ -75,7 +69,7 @@ def clean_numeric_value(val: Any) -> float:
         return 0.0
     if isinstance(val, (int, float)):
         return float(val)
-    cleaned_str = str(val).strip().replace('$', '').replace(',', '').replace('-', '')
+    cleaned_str = str(val).strip().replace('$', '').replace(',', '')
     try:
         return float(cleaned_str)
     except ValueError:
@@ -86,25 +80,10 @@ def normalize_name(name: str) -> str:
     if not name or pd.isna(name):
         return ""
     n = str(name).lower()
-    n = re.sub(r'[,.\-&]', ' ', n)
+    n = re.sub(r'[,.-&]', ' ', n)
     n = re.sub(r'\b(inc|llc|corp|ltd|incorporated|company|co|pllc)\b', '', n)
     n = re.sub(r'\s+', '', n)
     return n
-
-def map_form_term_to_cash_code(term_str: str) -> str:
-    t = str(term_str).lower().strip()
-    if "ap" in t or "due on receipt" in t: return "due-on-receipt"
-    if "mpp" in t or "monthly" in t: return "monthly"
-    if "financ" in t: return "financing"
-    if "leas" in t: return "leasing"
-    if "net 1 day" in t: return "net 1 day"
-    if "net 10" in t: return "net 10 days"
-    if "net 25" in t: return "net 25 days"
-    if "net 30" in t: return "net 30 days"
-    if "net 40" in t: return "net 40 days"
-    if "net 45" in t: return "net 45 days"
-    if "net 60" in t: return "net 60 days"
-    return "due-on-receipt"
 
 # =====================================================================
 # 3. ADVANCED EXTRACTION ENGINE
@@ -117,13 +96,15 @@ def extract_invoice_metadata_intelligent(pdf_file) -> Dict[str, Any]:
         full_text = ""
         for page in reader.pages:
             full_text += page.extract_text() or ""
-            
+        
         full_text_clean = " ".join(full_text.split())
         
+        # 1. Invoice Number Extraction
         inv_num = pdf_file.name.replace(".pdf", "")
         inv_match = re.search(r"(INV-\d+)", full_text_clean, re.IGNORECASE)
         result["invoice_number"] = inv_match.group(1).strip() if inv_match else inv_num
         
+        # 2. Source of Truth Gross Amount Extraction (Prioritizes "Payment Made", then "Total")
         pm_match = re.search(r"Payment\s*Made[^\d\$]*\$?([0-9,]+\.\d{2})", full_text_clean, re.IGNORECASE)
         if pm_match:
             result["gross_amount"] = clean_numeric_value(pm_match.group(1))
@@ -135,61 +116,56 @@ def extract_invoice_metadata_intelligent(pdf_file) -> Dict[str, Any]:
                 all_decimals = [clean_numeric_value(n) for n in re.findall(r"\b\d+(?:,\d{3})*\.\d{2}\b", full_text_clean)]
                 result["gross_amount"] = max(all_decimals) if all_decimals else 0.0
         
+        # 3. Personal "Bill To" Name Extraction
         bill_to_match = re.search(r"Bill\s+To\s*([A-Za-z0-9\s\.\,\-]+?)(?:\s*\d|\s*Ship\s*To|$)", full_text_clean, re.IGNORECASE)
         if bill_to_match:
             result["fallback_personal_name"] = bill_to_match.group(1).strip()
             
+        # 4. Deep Target Search: Look specifically for "InBody570 - [Action] - [Name]"
         biz_matches = re.findall(r"InBody\d*\s*-\s*[^-]+?-\s*([A-Za-z0-9\s\.\,\&]+)", full_text_clean, re.IGNORECASE)
         for match in biz_matches:
-            candidate = re.sub(r'\d+\.\d{2}.*', '', match).strip()
+            candidate = re.sub(r'\d+\.\d{2}.*', '', match).strip() # Strips out any trailing receipt quantities
             if candidate and not any(k in candidate.lower() for k in ["malfunction", "check required", "sku", "labor", "board", "cable", "loaner"]):
                 result["customer_name"] = candidate
                 return result
-                    
+                
     except Exception as e:
         st.error(f"Error executing intelligent metadata capture: {e}")
     return result
 
 def parse_zoho_summary_pdf_bulletproof(pdf_file) -> List[ZohoRecord]:
-    """Upgraded line-by-line layout text parser that reads invoiced and non-invoiced rows perfectly."""
     records = []
     try:
         reader = PdfReader(pdf_file)
         full_text = ""
         for page in reader.pages:
             full_text += page.extract_text() or ""
-            
-        text_stream = " ".join(full_text.split())
-        chunks = re.split(r"\bPayment\b", text_stream, flags=re.IGNORECASE)
         
-        for chunk in chunks[1:]:
-            amounts = re.findall(r"[0-9,]+\.\d{2}", chunk)
-            if len(amounts) >= 1:
-                gross = clean_numeric_value(amounts[0])
-                fee = clean_numeric_value(amounts[1]) if len(amounts) >= 2 else 0.0
+        text_stream = full_text.replace("\n", " ").replace("$", " ")
+        text_tokens = text_stream.split()
+        
+        for idx, token in enumerate(text_tokens):
+            if "INV-" in token.upper():
+                inv_id = re.sub(r'[^A-Za-z0-9\-]', '', token.upper())
                 
-                desc_match = re.search(r"(?:AM|PM)\s+(.*?)(?:-\$|\$|-[ ]?\$|\d)", chunk)
-                if not desc_match:
-                    desc_match = re.search(r"\d{4}[, ]+(.*?)(?:-\$|\$|-[ ]?\$|\d)", chunk)
-                desc = desc_match.group(1).strip() if desc_match else chunk[:40]
+                forward_pool = []
+                for step in range(1, 15):
+                    if idx + step < len(text_tokens):
+                        potential_num = text_tokens[idx + step].replace(",", "")
+                        if re.fullmatch(r"[-+]?\d+\.\d{2}", potential_num):
+                            forward_pool.append(abs(float(potential_num)))
                 
-                inv_match = re.search(r'(INV-\d+)', desc, re.IGNORECASE)
-                inv_id = inv_match.group(1).strip() if inv_match else None
-                
-                cust_name = re.sub(r'INV-\d+.*', '', desc, flags=re.IGNORECASE).strip() if inv_id else desc.strip()
-                cust_name = re.sub(r'\.\.\.$', '', cust_name).strip()
-                cust_name = re.sub(r'[^a-zA-Z0-9\s]+$', '', cust_name).strip()
-                
-                if cust_name and len(cust_name) < 2:
-                    cust_name = None
+                if len(forward_pool) >= 1:
+                    gross = forward_pool[0]
+                    fee = forward_pool[1] if len(forward_pool) >= 2 else 0.0
                     
-                if gross > 0:
-                    records.append(ZohoRecord(
-                        customer_name=cust_name,
-                        gross_amount=gross,
-                        merchant_fee=fee,
-                        invoice_number=inv_id
-                    ))
+                    if gross > 0 and not any(r.invoice_number == inv_id for r in records):
+                        records.append(ZohoRecord(
+                            customer_name=None,
+                            gross_amount=gross,
+                            merchant_fee=fee,
+                            invoice_number=inv_id
+                        ))
     except Exception as e:
         st.error(f"Error executing summary parser: {e}")
     return records
@@ -201,9 +177,9 @@ st.set_page_config(page_title="D365 General Journal Automation", layout="wide")
 st.title("D365 General Journal Automation Engine")
 st.subheader("Daily Operational Reconciliations Matrix")
 
-target_masterlist = MASTERLIST_PATH if os.path.exists(MASTERLIST_PATH) else (MASTERLIST_PATH_CSV if os.path.exists(MASTERLIST_PATH_CSV) else None)
-if not target_masterlist:
-    st.error("❌ Core configuration file `Account Masterlist` missing from your GitHub repository root folder.")
+MASTERLIST_PATH = "Account Masterlist.xlsx"
+if not os.path.exists(MASTERLIST_PATH):
+    st.error(f"❌ Core configuration file {MASTERLIST_PATH} missing from your GitHub repository root folder. Please commit it to your repository.")
     st.stop()
 
 st.sidebar.header("📅 Daily Variable Inputs")
@@ -215,29 +191,28 @@ if not (boa_file and zoho_file):
     st.info("💡 Staging required: Please drop today's Bank of America report and matching Zoho summary sheet into the sidebar container panel.")
 else:
     # -----------------------------------------------------------------
-    # STEP A: LOAD MASTERLIST (WITH BLANK ROW KILLER)
+    # STEP A: LOAD MASTERLIST (WITH LLC / TICKET NORMALIZATION)
     # -----------------------------------------------------------------
-    if target_masterlist.endswith('.csv'):
-        master_df = pd.read_csv(target_masterlist)
+    if MASTERLIST_PATH.endswith('.csv'):
+        master_df = pd.read_csv(MASTERLIST_PATH)
     else:
-        master_df = pd.read_excel(target_masterlist)
-        
+        master_df = pd.read_excel(MASTERLIST_PATH)
+
     master_df.columns = [str(col).strip() for col in master_df.columns]
     master_headers_lower = {str(col).lower(): str(col) for col in master_df.columns}
-    
+
     ml_name_col = next((master_headers_lower[k] for k in ['account name', 'name', 'customer name'] if k in master_headers_lower), None)
     ml_num_col = next((master_headers_lower[k] for k in ['account #', 'account number', 'account no', 'account'] if k in master_headers_lower), None)
     ml_term_col = next((master_headers_lower[k] for k in ['payment term', 'payment terms', 'terms'] if k in master_headers_lower), None)
     ml_ticket_col = next((master_headers_lower[k] for k in ['cs/ps ticket', 'ticket', 'cs/ps'] if k in master_headers_lower), None)
-    
+
+    if not ml_name_col or not ml_num_col:
+        st.error("❌ Could not identify definitive baseline 'Account Name' or 'Account #' tracking headers inside Masterlist spreadsheet.")
+        st.stop()
+        
     master_lookup: Dict[str, AccountMasterItem] = {}
     for _, row in master_df.iterrows():
         name_val = str(row[ml_name_col]).strip()
-        
-        # CRITICAL FIX: Destroys hidden blank rows so they can't hijack the matches
-        if not name_val or name_val.lower() == 'nan':
-            continue
-            
         num_val = str(row[ml_num_col]).strip()
         term_val = str(row.get(ml_term_col, 'due-on-receipt')).strip().lower() if ml_term_col else 'due-on-receipt'
         ticket_val = str(row.get(ml_ticket_col, '')).strip() if ml_ticket_col else ''
@@ -251,34 +226,11 @@ else:
         )
 
     # -----------------------------------------------------------------
-    # STEP B: LOAD FORM MASTER DB FROM GITHUB
-    # -----------------------------------------------------------------
-    form_db_lookup = {}
-    target_form_db = FORM_DB_PATH if os.path.exists(FORM_DB_PATH) else (FORM_DB_PATH_CSV if os.path.exists(FORM_DB_PATH_CSV) else None)
-    
-    if target_form_db:
-        fdf = pd.read_csv(target_form_db) if target_form_db.endswith('.csv') else pd.read_excel(target_form_db)
-        fdf.columns = [str(c).strip().lower() for c in fdf.columns]
-        biz_col = next((c for c in fdf.columns if 'business name' in c or 'customer' in c), None)
-        acct_col = next((c for c in fdf.columns if 'customer account' in c or 'account number' in c or 'account' in c), None)
-        term_col = next((c for c in fdf.columns if 'invoice sent' in c or 'term' in c), None)
-        
-        if biz_col and term_col:
-            for _, row in fdf.iterrows():
-                b_name = str(row[biz_col]).strip()
-                if not b_name or b_name.lower() == 'nan':
-                    continue
-                    
-                t_val = str(row[term_col]).strip()
-                a_val = str(row[acct_col]).strip() if acct_col and pd.notna(row[acct_col]) else ""
-                form_db_lookup[normalize_name(b_name)] = {"term": t_val, "account": a_val, "raw_name": b_name}
-
-    # -----------------------------------------------------------------
-    # STEP C: EXTRACT ALL UPLOADED INVOICES INTO CACHE
+    # STEP B: EXTRACT ALL UPLOADED INVOICES INTO CACHE
     # -----------------------------------------------------------------
     invoice_cache = {}
     invoice_sources_list = []
-    
+
     if uploaded_invoices:
         for inv in uploaded_invoices:
             meta = extract_invoice_metadata_intelligent(inv)
@@ -296,12 +248,13 @@ else:
                 ))
 
     # -----------------------------------------------------------------
-    # STEP D: PARSE BANK OF AMERICA REPORT
+    # STEP C: PARSE BANK OF AMERICA REPORT (DUPLICATE PROTECTION)
     # -----------------------------------------------------------------
     if boa_file.name.endswith('.csv'):
         raw_bytes = boa_file.read()
         lines = raw_bytes.decode('utf-8').splitlines()
         boa_file.seek(0)
+        
         skip_count = 0
         for idx, line in enumerate(lines):
             if "date" in line.lower() and "description" in line.lower():
@@ -310,36 +263,44 @@ else:
         boa_df = pd.read_csv(boa_file, skiprows=skip_count)
     else:
         boa_df = pd.read_excel(boa_file)
-        
+
     boa_df.columns = [str(col).strip().lower() for col in boa_df.columns]
     desc_target = next((c for c in ['description', 'transaction description', 'payee', 'memo'] if c in boa_df.columns), None)
     date_target = next((c for c in ['posting date', 'date', 'transaction date'] if c in boa_df.columns), None)
     amount_target = next((c for c in ['net amount', 'amount', 'net_amount'] if c in boa_df.columns), None)
     account_target = next((c for c in ['source account', 'account', 'account number', 'account_number'] if c in boa_df.columns), None)
-    
+
     boa_records: List[BOARecord] = []
     for _, row in boa_df.iterrows():
         row_description = str(row.get(desc_target, ''))
         row_net_amount = clean_numeric_value(row.get(amount_target, 0.0))
         
+        # CRITICAL FIX 1: Blocks negative subscriptions (-$389.40) to prevent the 7-row duplication error
         if "ZOHO PAYMENTS" in row_description.upper() and row_net_amount > 0:
             parsed_date = datetime.today().date()
             if date_target and pd.notna(row[date_target]):
-                try: parsed_date = pd.to_datetime(row[date_target]).date()
-                except Exception: pass
+                try:
+                    parsed_date = pd.to_datetime(row[date_target]).date()
+                except Exception:
+                    pass
             boa_records.append(BOARecord(
-                date=parsed_date, description=row_description, net_amount=row_net_amount,
+                date=parsed_date,
+                description=row_description,
+                net_amount=row_net_amount,
                 source_account=str(row.get(account_target, '')).strip() if account_target else "3371"
             ))
 
     # -----------------------------------------------------------------
-    # STEP E: PARSE PRIMARY ZOHO SUMMARY SHEET & DEDUPLICATE
+    # STEP D: PARSE PRIMARY ZOHO SUMMARY SHEET & DEDUPLICATE
     # -----------------------------------------------------------------
     raw_zoho_pool: List[ZohoRecord] = []
     if zoho_file.name.endswith('.pdf'):
         raw_zoho_pool = parse_zoho_summary_pdf_bulletproof(zoho_file)
     else:
-        zoho_df = pd.read_csv(zoho_file) if zoho_file.name.endswith('.csv') else pd.read_excel(zoho_file)
+        if zoho_file.name.endswith('.csv'):
+            zoho_df = pd.read_csv(zoho_file)
+        else:
+            zoho_df = pd.read_excel(zoho_file)
         zoho_df.columns = [str(c).strip() for c in zoho_df.columns]
         for _, row in zoho_df.iterrows():
             raw_zoho_pool.append(ZohoRecord(
@@ -348,154 +309,26 @@ else:
                 merchant_fee=clean_numeric_value(row.get('Merchant Fee', 0.0)),
                 invoice_number=str(row['Invoice Number']).strip() if pd.notna(row.get('Invoice Number')) else None
             ))
-            
-    if not raw_zoho_pool or sum(r.gross_amount for r in raw_zoho_pool) == 0:
-        raw_zoho_pool = invoice_sources_list
-        
-    zoho_records: List[ZohoRecord] = []
-    seen_signatures = set()
-    for r in raw_zoho_pool:
-        sig = (r.invoice_number, r.customer_name, r.gross_amount)
-        if sig not in seen_signatures:
-            zoho_records.append(r)
-            seen_signatures.add(sig)
 
-    for z_rec in zoho_records:
-        inv_key = z_rec.invoice_number if z_rec.invoice_number else z_rec.customer_name
-        if inv_key and inv_key in invoice_cache:
-            cache_hit = invoice_cache[inv_key]
-            z_rec.customer_name = cache_hit.get("resolved_name") or z_rec.customer_name
-            z_rec.fallback_personal_name = cache_hit.get("fallback_personal_name") or z_rec.fallback_personal_name
+    # CRITICAL FIX 2: Priority Merge - Use uploaded invoices as the absolute source of truth for amounts & names
+    zoho_deduped_dict = {}
+
+    # Priority 1: Direct Invoices
+    for inv_rec in invoice_sources_list:
+        if inv_rec.invoice_number:
+            zoho_deduped_dict[inv_rec.invoice_number] = inv_rec
+            
+    # Priority 2: Zoho Summary (fills in any missing lines not uploaded)
+    for r in raw_zoho_pool:
+        if r.invoice_number and r.invoice_number not in zoho_deduped_dict:
+            zoho_deduped_dict[r.invoice_number] = r
+            
+    zoho_records = list(zoho_deduped_dict.values())
 
     # =====================================================================
-    # STEP F: TRANSACTION PROCESSING & HIERARCHY MATCHING ENGINE
+    # STEP E: TRANSACTION PROCESSING & HIERARCHY MATCHING ENGINE
     # =====================================================================
     all_journal_lines = []
-    
-    # Relaxed BOA Anchor targeting the first valid Zoho deposit
-    matched_boa = boa_records[0] if boa_records else BOARecord(date=datetime.today().date(), description="ZOHO PAYMENTS", net_amount=0.0, source_account="3371")
-    offset_acct = OFFSET_ACCOUNT_ROUTING.get(matched_boa.source_account, "B1000002")
-    
-    total_fees = sum(z.merchant_fee for z in zoho_records)
-    processed_accounts = []
-    
-    for z_rec in zoho_records:
-        current_boa_description = str(matched_boa.description)
-        norm_biz = normalize_name(z_rec.customer_name)
-        norm_per = normalize_name(z_rec.fallback_personal_name)
-        
-        matched_master_item = None
-        form_match = None
-        
-        # 1. Masterlist Search (SAFE: Blank lines are destroyed)
-        for item in master_lookup.values():
-            i_name, i_ticket = str(item.norm_name), str(item.norm_ticket)
-            if i_name and norm_biz and len(norm_biz) >= 4 and (norm_biz in i_name or i_name in norm_biz or i_name.startswith(norm_biz)):
-                matched_master_item = item
-                break
-            if i_name and norm_per and len(norm_per) >= 4 and (norm_per in i_name or i_name in norm_per or i_name.startswith(norm_per)):
-                matched_master_item = item
-                break
-            if i_ticket and norm_biz and len(norm_biz) >= 4 and (norm_biz in i_ticket or i_ticket in norm_biz or i_ticket.startswith(norm_biz)):
-                matched_master_item = item
-                break
-            if i_ticket and norm_per and len(norm_per) >= 4 and (norm_per in i_ticket or i_ticket in norm_per or i_ticket.startswith(norm_per)):
-                matched_master_item = item
-                break
+    validation_errors = []
 
-        # 2. Form DB Search (SAFE: Blank lines are destroyed)
-        if form_db_lookup:
-            for q in [norm_biz, norm_per]:
-                if q and len(q) >= 4:
-                    for k, v in form_db_lookup.items():
-                        k_str = str(k)
-                        if k_str and (q in k_str or k_str in q or k_str.startswith(q)):
-                            form_match = v
-                            break
-                if form_match: break
-
-        # ASSIGNMENT EXECUTION
-        if matched_master_item:
-            final_term = matched_master_item.payment_term
-            if form_match and form_match.get("term") and str(form_match.get("term")).lower() != 'nan':
-                final_term = form_match["term"]
-                
-            term_info = CASH_CODE_MAPPING.get(map_form_term_to_cash_code(final_term), CASH_CODE_MAPPING['fallback'])
-            cash_code = term_info[0]
-            prefix = "MPP " if cash_code == "AR002" else ""
-            
-            account_num = matched_master_item.account_number
-            account_type = "Customer"
-            account_name = matched_master_item.account_name
-            desc = f"{prefix}{account_num} {account_name}_{current_boa_description}"
-            processed_accounts.append(matched_master_item)
-
-        elif form_match and form_match.get("account"):
-            final_term = form_match["term"]
-            term_info = CASH_CODE_MAPPING.get(map_form_term_to_cash_code(final_term), CASH_CODE_MAPPING['fallback'])
-            cash_code = term_info[0]
-            prefix = "MPP " if cash_code == "AR002" else ""
-            
-            account_num = form_match["account"]
-            account_type = "Customer"
-            account_name = form_match.get("raw_name", "Unknown")
-            desc = f"{prefix}{account_num} {account_name}_{current_boa_description}"
-            processed_accounts.append(AccountMasterItem(account_number=account_num, account_name=account_name, payment_term=str(final_term), norm_name="", norm_ticket=""))
-
-        else:
-            account_num = "21040102-B1000002"
-            account_type = "Ledger"
-            account_name = "Temporary Receipt"
-            cash_code = "AR012"
-            
-            display_label = z_rec.customer_name if z_rec.customer_name else (z_rec.fallback_personal_name if z_rec.fallback_personal_name else "Unknown")
-            desc = f"{display_label} (UNRECORDED ENTITY)_{current_boa_description}"
-
-        all_journal_lines.append({
-            "Date": matched_boa.date, "Voucher": "", "Account name": account_name,
-            "Company": "bwa", "Account type": account_type, "Account": account_num,
-            "Posting Profile": "AutoPost" if account_type == "Customer" else "", "Cash code": cash_code, "Description": desc,
-            "Debit": "", "Credit": z_rec.gross_amount, "Item sales tax group": "", "Sales tax code": "",
-            "Offset company": "bwa", "Bank Account Type": "Bank", "Offset account": offset_acct,
-            "Offset transaction text": "", "Currency": "USD", "Exchange rate": 1.00,
-            "Item sales tax group2": "", "Sales tax group": "AVATAX", "Withholding tax group": "",
-            "Release date": "", "Reversing entry": "No", "Reversing date": ""
-        })
-
-    if total_fees > 0:
-        current_boa_description = str(matched_boa.description)
-        if len(processed_accounts) == 1:
-            acc = processed_accounts[0]
-            fee_desc = f"Zoho Merchant Fee {acc.account_number} {acc.account_name}_{current_boa_description}"
-        elif len(processed_accounts) > 1:
-            account_strings = ", ".join([f"{a.account_number} {a.account_name}" for a in processed_accounts])
-            fee_desc = f"Zoho Merchant Fee {account_strings}_{current_boa_description}"
-        else:
-            fee_desc = f"Zoho Merchant Fee (Unresolved Suspense Pool Batch)_{current_boa_description}"
-
-        all_journal_lines.append({
-            "Date": matched_boa.date, "Voucher": "", "Account name": "Outside Service (Finance)",
-            "Company": "bwa", "Account type": "Ledger", "Account": "43170111-U26C05001-B735350-UOA003",
-            "Posting Profile": "", "Cash code": "OSF005", "Description": fee_desc,
-            "Debit": total_fees, "Credit": "", "Item sales tax group": "", "Sales tax code": "",
-            "Offset company": "bwa", "Bank Account Type": "Bank", "Offset account": offset_acct,
-            "Offset transaction text": "", "Currency": "USD", "Exchange rate": 1.00,
-            "Item sales tax group2": "", "Sales tax group": "AVATAX", "Withholding tax group": "",
-            "Release date": "", "Reversing entry": "No", "Reversing date": ""
-        })
-
-    if all_journal_lines:
-        st.success(f"### Transformed {len(all_journal_lines)} Journal Lines Successfully!")
-        output_df = pd.DataFrame(all_journal_lines, columns=D365_TEMPLATE_COLUMNS)
-        st.dataframe(output_df)
-        
-        buffer = io.BytesIO()
-        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-            output_df.to_excel(writer, index=False, sheet_name="Journal Lines")
-        
-        st.download_button(
-            label="📥 Download Generated D365 Journal Import Sheet",
-            data=buffer.getvalue(),
-            file_name="D365_General_Journal_Import.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+    for boa_rec in boa_records:
