@@ -148,7 +148,7 @@ def extract_invoice_metadata_intelligent(pdf_file) -> Dict[str, Any]:
     return result
 
 def parse_zoho_summary_pdf_bulletproof(pdf_file) -> List[ZohoRecord]:
-    """Upgraded line-by-line text splitter that extracts both invoiced and non-invoiced rows perfectly."""
+    """Upgraded line-by-line layout text parser that reads invoiced and non-invoiced rows perfectly."""
     records = []
     try:
         reader = PdfReader(pdf_file)
@@ -396,47 +396,63 @@ else:
                 if norm_biz and (norm_biz in i_name or i_name in norm_biz or i_name.startswith(norm_biz)):
                     matched_master_item = item
                     break
-                if norm_per and (norm_per in i_name or i_name in norm_per or i_name.startswith(norm_per)):
+                if norm_per and (norm_per_val := i_name) and (norm_per in norm_per_val or norm_per_val in norm_per):
                     matched_master_item = item
                     break
-                if i_ticket and (norm_per in i_ticket or i_ticket in norm_per or norm_biz in i_ticket or i_ticket in norm_biz):
-                    matched_master_item = item
-                    break
-                    
+                if i_ticket:
+                    if norm_per and (norm_per in i_ticket or i_ticket in norm_per):
+                        matched_master_item = item
+                        break
+                    if norm_biz and (norm_biz in i_ticket or i_ticket in norm_biz):
+                        matched_master_item = item
+                        break
+
             if form_db_lookup:
                 for q in [norm_biz, norm_per]:
                     if q and len(q) >= 4:
                         for k, v in form_db_lookup.items():
-                            if q in k or k in q or k.startswith(q):
+                            k_str = str(k)
+                            if q in k_str or k_str in q or k_str.startswith(q):
                                 form_match = v
                                 break
                     if form_match: break
 
+            # ASSIGNMENT EXECUTION
             if matched_master_item:
-                final_term = form_match["term"] if form_match and form_match.get("term") and str(form_match.get("term")).lower() != 'nan' else matched_master_item.payment_term
+                final_term = matched_master_item.payment_term
+                if form_match and form_match.get("term") and str(form_match.get("term")).lower() != 'nan':
+                    final_term = form_match["term"]
+                    
                 term_info = CASH_CODE_MAPPING.get(map_form_term_to_cash_code(final_term), CASH_CODE_MAPPING['fallback'])
                 cash_code = term_info[0]
                 prefix = "MPP " if cash_code == "AR002" else ""
+                
                 account_num = matched_master_item.account_number
                 account_type = "Customer"
                 account_name = matched_master_item.account_name
                 desc = f"{prefix}{account_num} {account_name}_{current_boa_description}"
+                
                 processed_accounts.append(matched_master_item)
+
             elif form_match and form_match.get("account"):
-                final_term = form_match["term"]
+                final_term = form_match.get("term")
                 term_info = CASH_CODE_MAPPING.get(map_form_term_to_cash_code(final_term), CASH_CODE_MAPPING['fallback'])
                 cash_code = term_info[0]
                 prefix = "MPP " if cash_code == "AR002" else ""
+                
                 account_num = form_match["account"]
                 account_type = "Customer"
                 account_name = form_match.get("raw_name", "Unknown")
                 desc = f"{prefix}{account_num} {account_name}_{current_boa_description}"
+                
                 processed_accounts.append(AccountMasterItem(account_number=account_num, account_name=account_name, payment_term=str(final_term), norm_name="", norm_ticket=""))
+
             else:
                 account_num = "21040102-B1000002"
                 account_type = "Ledger"
                 account_name = "Temporary Receipt"
                 cash_code = "AR012"
+                
                 display_label = z_rec.customer_name if z_rec.customer_name else (z_rec.fallback_personal_name if z_rec.fallback_personal_name else "Unknown")
                 desc = f"{display_label} (UNRECORDED ENTITY)_{current_boa_description}"
 
