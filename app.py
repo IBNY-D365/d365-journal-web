@@ -199,14 +199,14 @@ else:
             payment_term=term_val
         )
 
-    # STEP B: SCAN DIRECT INVOICE BACKUPS AND POPULATE INTEL CACHE
+    # FIXED: Re-ordered code structure cleanly to eliminate any NameErrors or unresolved loops
     invoice_cache = {}
     invoice_sources_list = []
     
     all_pdf_drops = []
     if uploaded_invoices:
         all_pdf_drops.extend(uploaded_invoices)
-    if zoho_file.name.endswith('.pdf') and zoho_file not in evils: # Avoid duplicate object trace paths
+    if zoho_file.name.endswith('.pdf'):
         all_pdf_drops.append(zoho_file)
 
     for inv in all_pdf_drops:
@@ -280,11 +280,11 @@ else:
                 invoice_number=str(row['Invoice Number']).strip() if pd.notna(row.get('Invoice Number')) else None
             ))
 
-    # INGESTION PROTECTION: Fallback directly to the localized invoice source pool if summary outputs 0 lines
+    # Fallback directly to the unified invoice metadata pool if sheet pulls 0 entries
     if not raw_zoho_pool or sum(r.gross_amount for r in raw_zoho_pool) == 0:
         raw_zoho_pool = invoice_sources_list
 
-    # CRITICAL DEDUPLICATION LAYER: Ensure strict unique matching sets based on invoice id keys
+    # Strict tracking deduplication layer targeting unique invoice strings only
     zoho_records: List[ZohoRecord] = []
     seen_invoices = set()
 
@@ -293,7 +293,7 @@ else:
             zoho_records.append(r)
             seen_invoices.add(r.invoice_number)
 
-    # Cross-reference against invoice metadata cache
+    # Final execution loop across the multi-payment search hierarchy
     for z_rec in zoho_records:
         if z_rec.invoice_number in invoice_cache:
             cache_hit = invoice_cache[z_rec.invoice_number]
@@ -336,14 +336,13 @@ else:
         for z_rec in matched_zoho:
             current_boa_description = str(boa_rec.description)
             
-            # Hierarchical search query string resolution array
             query_name = z_rec.customer_name if z_rec.customer_name else (z_rec.fallback_personal_name if z_rec.fallback_personal_name else "")
             query_key = query_name.lower().strip()
             
             matched_master_key = next((k for k in master_lookup if k in query_key or query_key in k), None) if query_key else None
             
             if not matched_master_key:
-                # Precise Fallback Rule mapping for missing entries
+                # Updated exact specifications for the Ledger Suspense target matching your D365 blueprint screenshots
                 account_num = "21040102-B1000002"
                 account_type = "Ledger"
                 account_name = "Temporary Receipt"
