@@ -90,7 +90,7 @@ def parse_invoice_pdf(pdf_file) -> Optional[str]:
     return None
 
 def extract_invoice_metadata_intelligent(pdf_file) -> Dict[str, Any]:
-    """Scans invoice structure to isolate business entities from line descriptions when needed."""
+    """Extracts business name entries out of the Item & Description table row text."""
     result = {"customer_name": None, "invoice_number": None, "gross_amount": 0.0, "fallback_personal_name": None}
     try:
         reader = PdfReader(pdf_file)
@@ -117,11 +117,13 @@ def extract_invoice_metadata_intelligent(pdf_file) -> Dict[str, Any]:
         
         for line in lines:
             line_lower = line.lower()
-            if "-" in line and ("item" not in line_lower and "description" not in line_lower):
-                biz_match = re.search(r"-\s*([A-Za-z0-9\s\.]+)(?:\s*-|$)", line)
-                if biz_match:
-                    candidate = biz_match.group(1).strip()
-                    if "inbody" not in candidate.lower() and candidate:
+            # If line is part of the items description table row matching pattern
+            if "-" in line and ("item" not in line_lower and "description" not in line_lower and "sku" not in line_lower):
+                # Isolate sub-entities separated by hyphens (e.g., "- Underground Gym" or "- Functional Holistic Healing")
+                parts = line.split("-")
+                if len(parts) >= 2:
+                    candidate = parts[-1].strip() # Get trailing description text
+                    if "inbody" not in candidate.lower() and len(candidate) > 2:
                         detected_business = candidate
                         break
                         
@@ -228,10 +230,10 @@ else:
             meta = extract_invoice_metadata_intelligent(inv)
             inv_id = meta["invoice_number"]
             
-            if meta["customer_name"]:
-                invoice_cache[inv_id] = {"resolved_name": meta["customer_name"], "fallback_personal_name": None}
-            else:
-                invoice_cache[inv_id] = {"resolved_name": None, "fallback_personal_name": meta["fallback_personal_name"]}
+            invoice_cache[inv_id] = {
+                "resolved_name": meta["customer_name"],
+                "fallback_personal_name": meta["fallback_personal_name"]
+            }
                 
             if meta["gross_amount"] > 0 and not any(r.invoice_number == inv_id for r in zoho_records):
                 zoho_records.append(ZohoRecord(
@@ -364,23 +366,22 @@ else:
         for z_rec in matched_zoho:
             current_boa_description = str(boa_rec.description)
             
-            if not z_rec.customer_name and z_rec.fallback_personal_name:
-                account_num = "TEMP-999"
-                account_name = "Temporary Receipt Pool"
+            # Form lookup key query candidate
+            query_name = z_rec.customer_name if z_rec.customer_name else ""
+            query_key = query_name.lower().strip()
+            
+            matched_master_key = next((k for k in master_lookup if k in query_key or query_key in k), None) if query_key else None
+            
+            # Alternate Suspense Routing Layer for Unrecorded Records
+            if not matched_master_key:
+                account_num = "21040102-B1000002"
+                account_type = "Ledger"
+                account_name = "Temporary Receipt"
                 cash_code = "AR012"
-                desc = f"{z_rec.fallback_personal_name} (UNRECORDED ENTITY)_{current_boa_description}"
-            else:
-                if not z_rec.customer_name:
-                    validation_errors.append(f"❌ Missing Customer Profile Reference for Invoice Tracker ID: {z_rec.invoice_number}")
-                    continue
-                    
-                name_key = z_rec.customer_name.lower()
-                matched_master_key = next((k for k in master_lookup if k in name_key or name_key in k), None)
                 
-                if not matched_master_key:
-                    validation_errors.append(f"❌ Unregistered Entity: '{z_rec.customer_name}' absent from Masterlist database.")
-                    continue
-                    
+                display_label = z_rec.fallback_personal_name if z_rec.fallback_personal_name else query_name
+                desc = f"{display_label} (UNRECORDED ENTITY)_{current_boa_description}"
+            else:
                 master_item = master_lookup[matched_master_key]
                 processed_accounts.append(master_item)
                 
@@ -389,13 +390,14 @@ else:
                 prefix = "MPP " if cash_code == "AR002" else ""
                 
                 account_num = master_item.account_number
+                account_type = "Customer"
                 account_name = master_item.account_name
                 desc = f"{prefix}{account_num} {account_name}_{current_boa_description}"
             
             all_journal_lines.append({
                 "Date": boa_rec.date, "Voucher": "", "Account name": account_name,
-                "Company": "bwa", "Account type": "Customer", "Account": account_num,
-                "Posting Profile": "AutoPost", "Cash code": cash_code, "Description": desc,
+                "Company": "bwa", "Account type": account_type, "Account": account_num,
+                "Posting Profile": "AutoPost" if account_type == "Customer" else "", "Cash code": cash_code, "Description": desc,
                 "Debit": "", "Credit": z_rec.gross_amount, "Item sales tax group": "", "Sales tax code": "",
                 "Offset company": "bwa", "Bank Account Type": "Bank", "Offset account": offset_acct,
                 "Offset transaction text": "", "Currency": "USD", "Exchange rate": 1.00,
