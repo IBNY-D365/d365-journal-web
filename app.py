@@ -76,6 +76,7 @@ def clean_numeric_value(val: Any) -> float:
         return 0.0
 
 def normalize_name(name: str) -> str:
+    """Removes LLC, INC, spaces, dots, and punctuation to guarantee exact cross-matching."""
     if not name or pd.isna(name):
         return ""
     n = str(name).lower()
@@ -85,6 +86,7 @@ def normalize_name(name: str) -> str:
     return n
 
 def map_form_term_to_cash_code(term_str: str) -> str:
+    """Translates the 'Invoice Sent' column from Form DB into standardized Cash Code keys."""
     t = str(term_str).lower().strip()
     if "ap" in t or "due on receipt" in t: return "due-on-receipt"
     if "mpp" in t or "monthly" in t: return "monthly"
@@ -143,7 +145,7 @@ def extract_invoice_metadata_intelligent(pdf_file) -> Dict[str, Any]:
     return result
 
 def parse_zoho_summary_pdf_bulletproof(pdf_file) -> List[ZohoRecord]:
-    """Bulletproof tabular parser anchored to USD values, guaranteeing 100% extraction."""
+    """Surgical chunking parser that splits by Zoho's exact Date/Time format to catch all rows unconditionally."""
     records = []
     try:
         reader = PdfReader(pdf_file)
@@ -151,7 +153,6 @@ def parse_zoho_summary_pdf_bulletproof(pdf_file) -> List[ZohoRecord]:
         for page in reader.pages:
             full_text += page.extract_text() or ""
             
-        # Strip summary headers so we only read real transactions
         if "All Transactions" in full_text:
             transactions_text = full_text.split("All Transactions")[-1]
         elif "Export" in full_text:
@@ -161,39 +162,45 @@ def parse_zoho_summary_pdf_bulletproof(pdf_file) -> List[ZohoRecord]:
             
         transactions_text = " ".join(transactions_text.split())
         
-        # Matches any prefix text followed by 3 numbers ending in USD
-        pattern = r"(.*?)\$?([0-9,]+\.\d{2})\s+(?:-\$|\$-|\$)?([0-9,]+\.\d{2})\s+(?:-\$|\$-|\$)?([0-9,]+\.\d{2})\s*USD"
-        matches = re.findall(pattern, transactions_text)
+        # Splits the text stream exactly at every timestamp (e.g. "Jun 3, 2026, 03:42 PM")
+        date_pattern = r"[A-Z][a-z]{2}\s\d{1,2},\s\d{4},\s\d{2}:\d{2}\s(?:AM|PM)"
+        chunks = re.split(date_pattern, transactions_text)
         
-        for m in matches:
-            prefix_text = m[0].strip()
-            gross = clean_numeric_value(m[1])
-            fee = clean_numeric_value(m[2])
+        for i in range(1, len(chunks)):
+            chunk = chunks[i].strip()
             
-            # Split off the time stamp (AM/PM) to grab purely the customer name description
-            time_split = re.split(r"\b(?:AM|PM)\b", prefix_text)
-            desc = time_split[-1].strip() if len(time_split) > 1 else prefix_text.strip()
-            
-            inv_match = re.search(r'(INV-\d+)', desc, re.IGNORECASE)
-            inv_id = inv_match.group(1).strip() if inv_match else None
-            
-            cust_name = re.sub(r'INV-\d+.*', '', desc, flags=re.IGNORECASE).strip()
-            cust_name = re.sub(r'\.\.\.$', '', cust_name).strip() # Fixes truncated names
-            
-            if not cust_name and not inv_id:
-                cust_name = desc
-            if cust_name and len(cust_name) < 2:
-                cust_name = None
+            # Find all monetary values in this block
+            amounts = re.findall(r"[-]?\$?[0-9,]+\.\d{2}", chunk)
+            if len(amounts) >= 3:
+                gross = clean_numeric_value(amounts[0])
+                fee = clean_numeric_value(amounts[1])
                 
-            if gross > 0 and not any((r.invoice_number == inv_id and inv_id is not None) or (r.gross_amount == gross and r.customer_name == cust_name) for r in records):
-                records.append(ZohoRecord(
-                    customer_name=cust_name,
-                    gross_amount=gross,
-                    merchant_fee=fee,
-                    invoice_number=inv_id
-                ))
+                # Extract the description string (everything before the first dollar amount)
+                desc_match = re.search(r"^(.*?)(?:-\$|\$|-[ ]?\$|[0-9])", chunk)
+                desc = desc_match.group(1).strip() if desc_match else ""
+                
+                inv_match = re.search(r'(INV-\d+)', desc, re.IGNORECASE)
+                inv_id = inv_match.group(1).strip() if inv_match else None
+                
+                if inv_id:
+                    cust_name = re.sub(r'INV-\d+.*', '', desc, flags=re.IGNORECASE).strip()
+                else:
+                    cust_name = desc.strip()
+                    
+                # Remove trailing truncation dots (e.g., "InBody New Yo...")
+                cust_name = re.sub(r'\.\.\.$', '', cust_name).strip() if cust_name else None
+                if cust_name and len(cust_name) < 2:
+                    cust_name = None
+                    
+                if gross > 0 and not any((r.invoice_number == inv_id and inv_id is not None) or (r.gross_amount == gross and r.customer_name == cust_name) for r in records):
+                    records.append(ZohoRecord(
+                        customer_name=cust_name,
+                        gross_amount=gross,
+                        merchant_fee=fee,
+                        invoice_number=inv_id
+                    ))
     except Exception as e:
-        st.error(f"Error executing tabular summary parser: {e}")
+        st.error(f"Error executing summary parser: {e}")
     return records
 
 # =====================================================================
@@ -411,16 +418,13 @@ else:
             
             matched_master_item = None
             
-            # Fuzzy match to handle truncated names perfectly
             for item in master_lookup.values():
-                if norm_biz and len(norm_biz) >= 5:
-                    if norm_biz in item.norm_name or item.norm_name in norm_biz or item.norm_name.startswith(norm_biz):
-                        matched_master_item = item
-                        break
-                if norm_per and len(norm_per) >= 5:
-                    if norm_per in item.norm_name or item.norm_name in norm_per or item.norm_name.startswith(norm_per):
-                        matched_master_item = item
-                        break
+                if norm_biz and (norm_biz == item.norm_name or (len(norm_biz) >= 5 and (norm_biz in item.norm_name or item.norm_name in norm_biz or item.norm_name.startswith(norm_biz)))):
+                    matched_master_item = item
+                    break
+                if norm_per and (norm_per == item.norm_name or (len(norm_per) >= 5 and (norm_per in item.norm_name or item.norm_name in norm_per or item.norm_name.startswith(norm_per)))):
+                    matched_master_item = item
+                    break
                 if item.norm_ticket:
                     if norm_per and len(norm_per) >= 5 and (norm_per in item.norm_ticket or item.norm_ticket in norm_per or item.norm_ticket.startswith(norm_per)):
                         matched_master_item = item
