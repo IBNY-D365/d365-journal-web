@@ -9,7 +9,7 @@ import io
 import os
 
 # =====================================================================
-# 1. HARDCODED CONFIGURATIONS & MAPPINGS (From Specification Document)
+# 1. HARDCODED CONFIGURATIONS & MAPPINGS
 # =====================================================================
 CASH_CODE_MAPPING = {
     "due-on-receipt": ("AR001", "AR Collection_AP"),
@@ -37,7 +37,7 @@ D365_TEMPLATE_COLUMNS = [
     "Posting Profile", "Cash code", "Description", "Debit", "Credit",
     "Item sales tax group", "Sales tax code", "Offset company", "Bank Account Type",
     "Offset account", "Offset transaction text", "Currency", "Exchange rate",
-    "Item sales tax group2", "Sales group", "Withholding tax group",
+    "Item sales tax group2", "Sales tax group", "Withholding tax group",
     "Release date", "Reversing entry", "Reversing date"
 ]
 
@@ -79,7 +79,6 @@ def clean_numeric_value(val: Any) -> float:
         return 0.0
 
 def normalize_name(name: str) -> str:
-    """Removes LLC, INC, spaces, and punctuation to guarantee exact cross-matching."""
     if not name or pd.isna(name):
         return ""
     n = str(name).lower()
@@ -103,11 +102,43 @@ def map_form_term_to_cash_code(term_str: str) -> str:
     if "net 60" in t: return "net 60 days"
     return "due-on-receipt"
 
+# --- BULLETPROOF ENTITY MATCHING ENGINES ---
+def find_master_match(norm_biz, norm_per, master_lookup):
+    if not norm_biz and not norm_per: return None
+    
+    # 1. Exact Match Only
+    for item in master_lookup.values():
+        i_name, i_ticket = str(item.norm_name), str(item.norm_ticket)
+        if i_name and norm_biz and norm_biz == i_name: return item
+        if i_name and norm_per and norm_per == i_name: return item
+        if i_ticket and norm_biz and norm_biz == i_ticket: return item
+        if i_ticket and norm_per and norm_per == i_ticket: return item
+        
+    # 2. Starts-With Match (Prevents empty-string sabotage)
+    for item in master_lookup.values():
+        i_name = str(item.norm_name)
+        if i_name and norm_biz and len(norm_biz) >= 5 and i_name.startswith(norm_biz): return item
+        if i_name and norm_per and len(norm_per) >= 5 and i_name.startswith(norm_per): return item
+        
+    return None
+
+def find_form_match(norm_biz, norm_per, form_db_lookup):
+    if not norm_biz and not norm_per: return None
+    
+    if norm_biz and norm_biz in form_db_lookup: return form_db_lookup[norm_biz]
+    if norm_per and norm_per in form_db_lookup: return form_db_lookup[norm_per]
+    
+    for k, v in form_db_lookup.items():
+        k_str = str(k)
+        if k_str and norm_biz and len(norm_biz) >= 5 and k_str.startswith(norm_biz): return v
+        if k_str and norm_per and len(norm_per) >= 5 and k_str.startswith(norm_per): return v
+        
+    return None
+
 # =====================================================================
 # 3. ADVANCED EXTRACTION ENGINE
 # =====================================================================
 def extract_invoice_metadata_intelligent(pdf_file) -> Dict[str, Any]:
-    """Scans the invoice to capture the precise Paid Amount and business entity."""
     result = {"customer_name": None, "invoice_number": None, "gross_amount": 0.0, "fallback_personal_name": None}
     try:
         reader = PdfReader(pdf_file)
@@ -148,7 +179,6 @@ def extract_invoice_metadata_intelligent(pdf_file) -> Dict[str, Any]:
     return result
 
 def parse_zoho_summary_pdf_bulletproof(pdf_file) -> List[ZohoRecord]:
-    """Upgraded line-by-line layout text parser that reads invoiced and non-invoiced rows perfectly."""
     records = []
     try:
         reader = PdfReader(pdf_file)
@@ -212,7 +242,7 @@ if not (boa_file and zoho_file):
     st.info("💡 Staging required: Please drop today's Bank of America report and matching Zoho summary sheet into the sidebar container panel.")
 else:
     # -----------------------------------------------------------------
-    # STEP A: LOAD MASTERLIST (WITH LLC / TICKET NORMALIZATION)
+    # STEP A: LOAD MASTERLIST
     # -----------------------------------------------------------------
     if MASTERLIST_PATH.endswith('.csv'):
         master_df = pd.read_csv(MASTERLIST_PATH)
@@ -227,10 +257,6 @@ else:
     ml_term_col = next((master_headers_lower[k] for k in ['payment term', 'payment terms', 'terms'] if k in master_headers_lower), None)
     ml_ticket_col = next((master_headers_lower[k] for k in ['cs/ps ticket', 'ticket', 'cs/ps'] if k in master_headers_lower), None)
     
-    if not ml_name_col or not ml_num_col:
-        st.error("❌ Could not identify definitive baseline 'Account Name' or 'Account #' tracking headers inside Masterlist spreadsheet.")
-        st.stop()
-        
     master_lookup: Dict[str, AccountMasterItem] = {}
     for _, row in master_df.iterrows():
         name_val = str(row[ml_name_col]).strip()
@@ -268,7 +294,7 @@ else:
                     form_db_lookup[normalize_name(b_name)] = {"term": t_val, "account": a_val, "raw_name": b_name}
 
     # -----------------------------------------------------------------
-    # STEP C: EXTRACT ALL UPLOADED INVOICES INTO CACHE
+    # STEP C: EXTRACT UPLOADED INVOICES
     # -----------------------------------------------------------------
     invoice_cache = {}
     invoice_sources_list = []
@@ -388,41 +414,13 @@ else:
             norm_biz = normalize_name(z_rec.customer_name)
             norm_per = normalize_name(z_rec.fallback_personal_name)
             
-            matched_master_item = None
-            form_match = None
-            
-            for item in master_lookup.values():
-                i_name, i_ticket = str(item.norm_name), str(item.norm_ticket)
-                if norm_biz and (norm_biz in i_name or i_name in norm_biz or i_name.startswith(norm_biz)):
-                    matched_master_item = item
-                    break
-                if norm_per and (norm_per_val := i_name) and (norm_per in norm_per_val or norm_per_val in norm_per):
-                    matched_master_item = item
-                    break
-                if i_ticket:
-                    if norm_per and (norm_per in i_ticket or i_ticket in norm_per):
-                        matched_master_item = item
-                        break
-                    if norm_biz and (norm_biz in i_ticket or i_ticket in norm_biz):
-                        matched_master_item = item
-                        break
-
-            if form_db_lookup:
-                for q in [norm_biz, norm_per]:
-                    if q and len(q) >= 4:
-                        for k, v in form_db_lookup.items():
-                            k_str = str(k)
-                            if q in k_str or k_str in q or k_str.startswith(q):
-                                form_match = v
-                                break
-                    if form_match: break
+            # Secure Matches Using Hardened Engine
+            matched_master_item = find_master_match(norm_biz, norm_per, master_lookup)
+            form_match = find_form_match(norm_biz, norm_per, form_db_lookup)
 
             # ASSIGNMENT EXECUTION
             if matched_master_item:
-                final_term = matched_master_item.payment_term
-                if form_match and form_match.get("term") and str(form_match.get("term")).lower() != 'nan':
-                    final_term = form_match["term"]
-                    
+                final_term = form_match["term"] if form_match and form_match.get("term") and str(form_match.get("term")).lower() != 'nan' else matched_master_item.payment_term
                 term_info = CASH_CODE_MAPPING.get(map_form_term_to_cash_code(final_term), CASH_CODE_MAPPING['fallback'])
                 cash_code = term_info[0]
                 prefix = "MPP " if cash_code == "AR002" else ""
@@ -431,11 +429,10 @@ else:
                 account_type = "Customer"
                 account_name = matched_master_item.account_name
                 desc = f"{prefix}{account_num} {account_name}_{current_boa_description}"
-                
                 processed_accounts.append(matched_master_item)
 
             elif form_match and form_match.get("account"):
-                final_term = form_match.get("term")
+                final_term = form_match["term"]
                 term_info = CASH_CODE_MAPPING.get(map_form_term_to_cash_code(final_term), CASH_CODE_MAPPING['fallback'])
                 cash_code = term_info[0]
                 prefix = "MPP " if cash_code == "AR002" else ""
@@ -444,7 +441,6 @@ else:
                 account_type = "Customer"
                 account_name = form_match.get("raw_name", "Unknown")
                 desc = f"{prefix}{account_num} {account_name}_{current_boa_description}"
-                
                 processed_accounts.append(AccountMasterItem(account_number=account_num, account_name=account_name, payment_term=str(final_term), norm_name="", norm_ticket=""))
 
             else:
@@ -463,7 +459,7 @@ else:
                 "Debit": "", "Credit": z_rec.gross_amount, "Item sales tax group": "", "Sales tax code": "",
                 "Offset company": "bwa", "Bank Account Type": "Bank", "Offset account": offset_acct,
                 "Offset transaction text": "", "Currency": "USD", "Exchange rate": 1.00,
-                "Item sales tax group2": "", "Sales group": "AVATAX", "Withholding tax group": "",
+                "Item sales tax group2": "", "Sales tax group": "AVATAX", "Withholding tax group": "",
                 "Release date": "", "Reversing entry": "No", "Reversing date": ""
             })
 
@@ -485,7 +481,7 @@ else:
                 "Debit": total_fees, "Credit": "", "Item sales tax group": "", "Sales tax code": "",
                 "Offset company": "bwa", "Bank Account Type": "Bank", "Offset account": offset_acct,
                 "Offset transaction text": "", "Currency": "USD", "Exchange rate": 1.00,
-                "Item sales tax group2": "", "Sales group": "AVATAX", "Withholding tax group": "",
+                "Item sales tax group2": "", "Sales tax group": "AVATAX", "Withholding tax group": "",
                 "Release date": "", "Reversing entry": "No", "Reversing date": ""
             })
 
